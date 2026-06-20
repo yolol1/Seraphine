@@ -6,7 +6,7 @@ from app.common.qfluentwidgets import (FluentIconBase, ExpandGroupSettingCard,
                                        ConfigItem, qconfig, PushButton, SpinBox,
                                        ColorDialog, LineEdit, SwitchButton,
                                        IndicatorPosition, setCustomStyleSheet, SwitchSettingCard, TransparentToolButton, FluentIcon, setThemeColor,
-                                       PillPushButton)
+                                       PillPushButton, BodyLabel)
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QIcon, QColor
 from PyQt5.QtWidgets import (QWidget, QLabel, QHBoxLayout, QGridLayout, QFrame, QPushButton,
@@ -29,14 +29,14 @@ class LineEditSettingCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
 
-        self.hintLabel = QLabel(hintContent)
+        self.hintLabel = BodyLabel(hintContent)
         self.lineEdit = SpinBox(self)
 
         self.buttonWidget = QWidget(self.view)
         self.buttonLayout = QHBoxLayout(self.buttonWidget)
         self.pushButton = PushButton(self.tr("Apply"))
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.__initLayout()
         self.__initWidget(step, min, max)
@@ -88,14 +88,14 @@ class GameTabColorSettingCard(ExpandGroupSettingCard):
                  parent=None):
         super().__init__(Icon.BACKGROUNDCOLOR, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.winHintLabel = QLabel(self.tr("Color of wins:"))
-        self.loseHintLabel = QLabel(self.tr("Color of losses:"))
-        self.remakeHintLabel = QLabel(self.tr("Color of remakes:"))
+        self.winHintLabel = BodyLabel(self.tr("Color of wins:"))
+        self.loseHintLabel = BodyLabel(self.tr("Color of losses:"))
+        self.remakeHintLabel = BodyLabel(self.tr("Color of remakes:"))
 
         self.winSettingButton = ColorAnimationFrame(type='win')
         self.loseSettingButton = ColorAnimationFrame(type='lose')
@@ -228,13 +228,13 @@ class DeathsNumberColorSettingCard(ExpandGroupSettingCard):
                  darkConfigItem: ConfigItem = None, parent=None):
         super().__init__(Icon.TEXTCOLOR, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.lightHintLabel = QLabel(self.tr("Color in Light theme:"))
-        self.darkHintLabel = QLabel(self.tr("Color in Dark theme:"))
+        self.lightHintLabel = BodyLabel(self.tr("Color in Light theme:"))
+        self.darkHintLabel = BodyLabel(self.tr("Color in Dark theme:"))
 
         self.lightSettingButton = ColorAnimationFrame(type='deathsLight')
         self.darkSettingButton = ColorAnimationFrame(type='deathsDark')
@@ -349,12 +349,12 @@ class ThemeColorSettingCard(ExpandGroupSettingCard):
                  parent=None):
         super().__init__(Icon.PALETTE, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.colorHintLabel = QLabel(self.tr("Theme color:"))
+        self.colorHintLabel = BodyLabel(self.tr("Theme color:"))
 
         self.colorSettingButton = ColorAnimationFrame(type='theme')
 
@@ -436,12 +436,12 @@ class ProxySettingCard(ExpandGroupSettingCard):
                  addrConfigItem: ConfigItem = None, parent=None):
         super().__init__(Icon.PLANE, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
 
-        self.secondsLabel = QLabel(self.tr("HTTP proxy:"))
+        self.secondsLabel = BodyLabel(self.tr("HTTP proxy:"))
         self.lineEdit = LineEdit()
 
         self.switchButtonWidget = QWidget(self.view)
@@ -667,11 +667,11 @@ class QueueFilterCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.normalHintLabel = QLabel(self.tr("Normal:"))
-        self.quickHintLabel = QLabel(self.tr("Quickplay:"))
-        self.soloDuoHintLabel = QLabel(self.tr("Ranked Solo / Duo:"))
-        self.flexHintLabel = QLabel(self.tr("Ranked Flex:"))
-        self.aramHintLabel = QLabel(self.tr("A.R.A.M.:"))
+        self.normalHintLabel = BodyLabel(self.tr("Normal:"))
+        self.quickHintLabel = BodyLabel(self.tr("Quickplay:"))
+        self.soloDuoHintLabel = BodyLabel(self.tr("Ranked Solo / Duo:"))
+        self.flexHintLabel = BodyLabel(self.tr("Ranked Flex:"))
+        self.aramHintLabel = BodyLabel(self.tr("A.R.A.M.:"))
 
         self.normalButtonsGroup = ModeCheckButtonsGroup()
         self.quickButtonsGroup = ModeCheckButtonsGroup()

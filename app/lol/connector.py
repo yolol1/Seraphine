@@ -433,7 +433,7 @@ class LolClientConnector(QObject):
             return "app/resource/images/rune-0.png"
 
         icon = f"app/resource/game/rune icons/{runeId}.png"
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getRuneIconPath(runeId)
             res = await self.__get(path)
 
@@ -461,7 +461,7 @@ class LolClientConnector(QObject):
     async def getProfileIcon(self, iconId):
         icon = f"./app/resource/game/profile icons/{iconId}.jpg"
 
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getSummonerProfileIconPath(iconId)
             res = await self.__get(path)
 
@@ -477,7 +477,7 @@ class LolClientConnector(QObject):
 
         icon = f"app/resource/game/item icons/{iconId}.png"
 
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getItemIconPath(iconId)
             res = await self.__get(path)
 
@@ -490,7 +490,7 @@ class LolClientConnector(QObject):
     async def getAugmentIcon(self, augmentId):
         icon = f"app/resource/game/augment icons/{augmentId}.png"
 
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getAugmentsIconPath(augmentId)
             res = await self.__get(path)
 
@@ -536,7 +536,7 @@ class LolClientConnector(QObject):
     async def getSummonerSpellIcon(self, spellId):
         icon = f"app/resource/game/summoner spell icons/{spellId}.png"
 
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getSummonerSpellIconPath(spellId)
             res = await self.__get(path)
 
@@ -558,7 +558,7 @@ class LolClientConnector(QObject):
 
         icon = f"app/resource/game/champion icons/{championId}.png"
 
-        if not os.path.exists(icon):
+        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
             path = self.manager.getChampionIconPath(championId)
             res = await self.__get(path)
 

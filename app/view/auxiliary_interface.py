@@ -7,7 +7,7 @@ from PyQt5.QtCore import Qt, pyqtSignal, QEvent, QSize, QObject
 from PyQt5.QtWidgets import (QWidget, QLabel, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QFrame, QSpacerItem, QSizePolicy, QCompleter)
 from qasync import asyncSlot
-from qfluentwidgets import EditableComboBox
+from qfluentwidgets import EditableComboBox, BodyLabel, StrongBodyLabel
 
 from app.common.config import cfg
 from app.common.icons import Icon
@@ -37,7 +37,7 @@ class AuxiliaryInterface(SeraphineInterface):
         self.scrollWidget = QWidget()
         self.expandLayout = ExpandLayout(self.scrollWidget)
 
-        self.titleLabel = QLabel(self.tr("Auxiliary Functions"), self)
+        self.titleLabel = BodyLabel(self.tr("Auxiliary Functions"), self)
 
         self.profileGroup = SettingCardGroup(self.tr("Profile"),
                                              self.scrollWidget)
@@ -220,7 +220,7 @@ class OnlineStatusCard(ExpandGroupSettingCard):
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
-        self.statusLabel = QLabel(
+        self.statusLabel = BodyLabel(
             self.tr("Online status you want to change to:"))
         self.lineEdit = LineEdit()
 
@@ -274,10 +274,10 @@ class ProfileBackgroundCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.championLabel = QLabel(self.tr("Champion's name: "))
+        self.championLabel = BodyLabel(self.tr("Champion's name: "))
         self.championButton = PushButton(self.tr("Select champion"), self)
 
-        self.skinLabel = QLabel(self.tr("Skin's name: "))
+        self.skinLabel = BodyLabel(self.tr("Skin's name: "))
         self.skinButton = PushButton(self.tr("Select Skin"), self)
 
         self.buttonWidget = QWidget(self.view)
@@ -422,11 +422,11 @@ class ProfileTierCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.rankModeLabel = QLabel(self.tr("Game mode:"))
+        self.rankModeLabel = BodyLabel(self.tr("Game mode:"))
         self.rankModeBox = ComboBox()
-        self.tierLabel = QLabel(self.tr("Tier:"))
+        self.tierLabel = BodyLabel(self.tr("Tier:"))
         self.tierBox = ComboBox()
-        self.divisionLabel = QLabel(self.tr("Division:"))
+        self.divisionLabel = BodyLabel(self.tr("Division:"))
         self.divisionBox = ComboBox()
 
         self.buttonWidget = QWidget(self.view)
@@ -620,7 +620,7 @@ class OnlineAvailabilityCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
 
-        self.availabilityLabel = QLabel(
+        self.availabilityLabel = BodyLabel(
             self.tr("Your online availability will be shown:"))
         self.comboBox = ComboBox()
 
@@ -763,11 +763,11 @@ class CreatePracticeLobbyCard(ExpandGroupSettingCard):
         self.inputLayout = QVBoxLayout(self.inputWidget)
 
         self.nameLayout = QHBoxLayout()
-        self.nameLabel = QLabel(self.tr("Lobby's name: (cannot be empty)"))
+        self.nameLabel = BodyLabel(self.tr("Lobby's name: (cannot be empty)"))
         self.nameLineEdit = LineEdit()
 
         self.passwordLayout = QHBoxLayout()
-        self.passwordLabel = QLabel(
+        self.passwordLabel = BodyLabel(
             self.tr("Password: (password will NOT be set if it's empty)"))
         self.passwordLineEdit = LineEdit()
 
@@ -847,11 +847,11 @@ class SpectateCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QGridLayout(self.inputWidget)
 
-        self.summonerNameLabel = QLabel(
+        self.summonerNameLabel = BodyLabel(
             self.tr("Summoner's name you want to spectate:"))
         self.spectateNameComboBox = EditableComboBox()
 
-        self.spectateTypeLabel = QLabel(self.tr("Method:"))
+        self.spectateTypeLabel = BodyLabel(self.tr("Method:"))
         self.spectateTypeComboBox = ComboBox()
 
         self.buttonWidget = QWidget(self.view)
@@ -956,12 +956,12 @@ class AutoAcceptMatchingCard(ExpandGroupSettingCard):
                  delayConfigItem: ConfigItem = None, parent=None):
         super().__init__(Icon.CIRCLEMARK, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
 
-        self.secondsLabel = QLabel(self.tr("Delay seconds after match made:"))
+        self.secondsLabel = BodyLabel(self.tr("Delay seconds after match made:"))
         self.lineEdit = SpinBox()
 
         self.switchButtonWidget = QWidget(self.view)
@@ -1035,13 +1035,13 @@ class AutoAcceptSwapingCard(ExpandGroupSettingCard):
                  enableChampSwapItem: ConfigItem = None, parent=None):
         super().__init__(Icon.TEXTCHECK, title, content, parent)
 
-        self.statusLabel = QLabel(self)
+        self.statusLabel = BodyLabel(self)
 
         self.switchButtonWidget = QWidget(self.view)
         self.switchButtonLayout = QGridLayout(self.switchButtonWidget)
 
-        self.label1 = QLabel(self.tr("Enable auto accept cail swap request:"))
-        self.label2 = QLabel(
+        self.label1 = BodyLabel(self.tr("Enable auto accept cail swap request:"))
+        self.label2 = BodyLabel(
             self.tr("Enable auto accept champion trade request:"))
 
         self.switchButton1 = SwitchButton(indicatorPos=IndicatorPosition.RIGHT)
@@ -1189,7 +1189,7 @@ class FriendRequestCard(ExpandGroupSettingCard):
         self.inputWidget = QWidget(self.view)
         self.inputLayout = QHBoxLayout(self.inputWidget)
 
-        self.summonerNameLabel = QLabel(
+        self.summonerNameLabel = BodyLabel(
             self.tr("Summoners's name you want to send friend request to:"))
         self.lineEdit = LineEdit()
 
@@ -1277,27 +1277,27 @@ class AutoSelectChampionCard(ExpandGroupSettingCard):
         self.supChampionsConfigItem = supChampionsConfigItem
         self.enableTimeoutCompleteCfgItem = enableTimeoutCompleteCfgItem
 
-        self.statusLabel = QLabel()
+        self.statusLabel = BodyLabel()
 
         self.defaultCfgWidget = QWidget(self.view)
         self.defaultCfgLayout = QGridLayout(self.defaultCfgWidget)
-        self.defaultHintLabel = QLabel(self.tr("Default Configurations"))
+        self.defaultHintLabel = BodyLabel(self.tr("Default Configurations"))
         self.helpLayout = QHBoxLayout()
         self.helpButotn = TransparentToolButton(Icon.QUESTION_CIRCLE)
 
-        self.defaultLabel = QLabel(self.tr("Default champions: "))
+        self.defaultLabel = BodyLabel(self.tr("Default champions: "))
         self.defaultChampions = ChampionsCard()
         self.defaultSelectButton = PushButton(self.tr("Choose"))
 
         self.rankCfgWidget = QWidget(self.view)
         self.rankCfgLayout = QGridLayout(self.rankCfgWidget)
-        self.rankLabel = QLabel(self.tr("Rank Configurations"))
+        self.rankLabel = BodyLabel(self.tr("Rank Configurations"))
 
-        self.topLabel = QLabel(self.tr("Top: "))
-        self.jugLabel = QLabel(self.tr("Juggle: "))
-        self.midLabel = QLabel(self.tr("Mid: "))
-        self.botLabel = QLabel(self.tr("Bottom: "))
-        self.supLabel = QLabel(self.tr("Support: "))
+        self.topLabel = BodyLabel(self.tr("Top: "))
+        self.jugLabel = BodyLabel(self.tr("Juggle: "))
+        self.midLabel = BodyLabel(self.tr("Mid: "))
+        self.botLabel = BodyLabel(self.tr("Bottom: "))
+        self.supLabel = BodyLabel(self.tr("Support: "))
         self.topChampions = ChampionsCard()
         self.jugChampions = ChampionsCard()
         self.midChampions = ChampionsCard()
@@ -1311,10 +1311,10 @@ class AutoSelectChampionCard(ExpandGroupSettingCard):
 
         self.buttonsWidget = QWidget(self.view)
         self.buttonsLayout = QGridLayout(self.buttonsWidget)
-        self.enableLabel = QLabel(self.tr("Enable:"))
+        self.enableLabel = BodyLabel(self.tr("Enable:"))
         self.enableSwitchButton = SwitchButton(
             indicatorPos=IndicatorPosition.RIGHT)
-        self.enableTimeoutCompleteLabel = QLabel(
+        self.enableTimeoutCompleteLabel = BodyLabel(
             self.tr("Completed before timeout:"))
         self.enableTimeoutSwtichButton = SwitchButton(
             indicatorPos=IndicatorPosition.RIGHT)
@@ -1541,27 +1541,27 @@ class AutoBanChampionCard(ExpandGroupSettingCard):
         self.friendlyConfigItem = friendlyConfigItem
         self.delayTimeConfigItem = delayTimeConfigItem
 
-        self.statusLabel = QLabel()
+        self.statusLabel = BodyLabel()
 
         self.defaultCfgWidget = QWidget(self.view)
         self.defaultCfgLayout = QGridLayout(self.defaultCfgWidget)
-        self.defaultHintLabel = QLabel(self.tr("Default Configurations"))
+        self.defaultHintLabel = BodyLabel(self.tr("Default Configurations"))
         self.helpLayout = QHBoxLayout()
         self.helpButotn = TransparentToolButton(Icon.QUESTION_CIRCLE)
 
-        self.defaultLabel = QLabel(self.tr("Default champions: "))
+        self.defaultLabel = BodyLabel(self.tr("Default champions: "))
         self.defaultChampions = ChampionsCard()
         self.defaultSelectButton = PushButton(self.tr("Choose"))
 
         self.rankCfgWidget = QWidget(self.view)
         self.rankCfgLayout = QGridLayout(self.rankCfgWidget)
-        self.rankLabel = QLabel(self.tr("Rank Configurations"))
+        self.rankLabel = BodyLabel(self.tr("Rank Configurations"))
 
-        self.topLabel = QLabel(self.tr("Top: "))
-        self.jugLabel = QLabel(self.tr("Juggle: "))
-        self.midLabel = QLabel(self.tr("Mid: "))
-        self.botLabel = QLabel(self.tr("Bottom: "))
-        self.supLabel = QLabel(self.tr("Support: "))
+        self.topLabel = BodyLabel(self.tr("Top: "))
+        self.jugLabel = BodyLabel(self.tr("Juggle: "))
+        self.midLabel = BodyLabel(self.tr("Mid: "))
+        self.botLabel = BodyLabel(self.tr("Bottom: "))
+        self.supLabel = BodyLabel(self.tr("Support: "))
         self.topChampions = ChampionsCard()
         self.jugChampions = ChampionsCard()
         self.midChampions = ChampionsCard()
@@ -1575,12 +1575,12 @@ class AutoBanChampionCard(ExpandGroupSettingCard):
 
         self.buttonsCfgWidget = QWidget(self.view)
         self.buttonsCfgLayout = QGridLayout(self.buttonsCfgWidget)
-        self.delayLabel = QLabel(self.tr("Ban after a delay of seconds:"))
+        self.delayLabel = BodyLabel(self.tr("Ban after a delay of seconds:"))
         self.delaySpinBox = SpinBox()
-        self.enableLabel = QLabel(self.tr("Enable:"))
+        self.enableLabel = BodyLabel(self.tr("Enable:"))
         self.enableSwitchButton = SwitchButton(
             indicatorPos=IndicatorPosition.RIGHT)
-        self.friendlyLabel = QLabel(
+        self.friendlyLabel = BodyLabel(
             self.tr("Prevent banning champions picked by teammates:"))
         self.friendlySwitchButton = SwitchButton(
             indicatorPos=IndicatorPosition.RIGHT)
@@ -1897,26 +1897,26 @@ class AutoSetSummonerSpellCard(ExpandGroupSettingCard):
         self.botSpellConfigItem = botSpellConfigItem
         self.supSpellConfigItem = supSpellConfigItem
 
-        self.statusLabel = QLabel()
+        self.statusLabel = BodyLabel()
 
         self.defaultCfgWidget = QWidget(self.view)
         self.defaultCfgLayout = QGridLayout(self.defaultCfgWidget)
-        self.defaultHintLabel = QLabel(self.tr("Default Configurations"))
+        self.defaultHintLabel = BodyLabel(self.tr("Default Configurations"))
 
-        self.defaultLabel = QLabel(self.tr("Default summoner spells: "))
+        self.defaultLabel = BodyLabel(self.tr("Default summoner spells: "))
         self.defaultButtonLayout = QHBoxLayout()
         self.defaultSelectButton1 = SummonerSpellButton()
         self.defaultSelectButton2 = SummonerSpellButton()
 
         self.rankCfgWidget = QWidget(self.view)
         self.rankCfgLayout = QGridLayout(self.rankCfgWidget)
-        self.rankLabel = QLabel(self.tr("Rank Configurations"))
+        self.rankLabel = BodyLabel(self.tr("Rank Configurations"))
 
-        self.topLabel = QLabel(self.tr("Top: "))
-        self.jugLabel = QLabel(self.tr("Juggle: "))
-        self.midLabel = QLabel(self.tr("Mid: "))
-        self.botLabel = QLabel(self.tr("Bottom: "))
-        self.supLabel = QLabel(self.tr("Support: "))
+        self.topLabel = BodyLabel(self.tr("Top: "))
+        self.jugLabel = BodyLabel(self.tr("Juggle: "))
+        self.midLabel = BodyLabel(self.tr("Mid: "))
+        self.botLabel = BodyLabel(self.tr("Bottom: "))
+        self.supLabel = BodyLabel(self.tr("Support: "))
 
         self.topButtonLayout = QHBoxLayout()
         self.topSelectButton1 = SummonerSpellButton()
@@ -1936,7 +1936,7 @@ class AutoSetSummonerSpellCard(ExpandGroupSettingCard):
 
         self.buttonsWidget = QWidget(self.view)
         self.buttonsLayout = QGridLayout(self.buttonsWidget)
-        self.enableHintLabel = QLabel(self.tr("Enable:"))
+        self.enableHintLabel = BodyLabel(self.tr("Enable:"))
         self.enableSwitchButton = SwitchButton(
             indicatorPos=IndicatorPosition.RIGHT)
         self.resetButton = PushButton(self.tr("Reset"))

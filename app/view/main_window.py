@@ -423,7 +423,10 @@ class MainWindow(FluentWindow):
 
         def quit():
             self.isTrayExit = True
-            self.close()
+            self.__terminateListeners()
+            self.opggWindow.close()
+            cfg.set(cfg.windowSize, self.windowSize)
+            QApplication.instance().quit()
 
         careerAction.triggered.connect(
             lambda: showAndSwitch(self.careerInterface))
@@ -437,7 +440,7 @@ class MainWindow(FluentWindow):
             lambda: showAndSwitch(self.settingInterface))
         quitAction.triggered.connect(quit)
 
-        self.trayMenu = TmpSystemTrayMenu(self)
+        self.trayMenu = TmpSystemTrayMenu(parent=self)
 
         self.trayMenu.addAction(careerAction)
         self.trayMenu.addAction(searchAction)
@@ -1045,6 +1048,19 @@ class MainWindow(FluentWindow):
         content = "".join(tracebackFormat)
 
         if ty in [ConnectionRefusedError, ClientConnectorError]:
+            return
+
+        if issubclass(ty, OSError) and getattr(value, 'errno', None) == 28:
+            if not getattr(self, "_diskFullWarned", False):
+                self._diskFullWarned = True
+                InfoBar.warning(
+                    self.tr("Insufficient disk space"),
+                    self.tr("Your disk is full. Please clear some space to ensure Seraphine runs properly."),
+                    duration=5000,
+                    orient=Qt.Vertical,
+                    parent=self,
+                    position=InfoBarPosition.BOTTOM_RIGHT
+                )
             return
 
         logger.error(f"Exception occurred:\n{content}", "Crash")

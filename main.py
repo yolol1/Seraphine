@@ -1,6 +1,11 @@
 # coding:utf-8
 import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+import sys
+
+if getattr(sys, 'frozen', False):
+    os.chdir(os.path.dirname(sys.executable))
+else:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt, QTranslator
@@ -27,13 +32,11 @@ def main():
         os.environ["QT_SCALE_FACTOR"] = str(cfg.get(cfg.dpiScale))
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
 
-    font = QFont()
-    font.setStyleStrategy(QFont.PreferAntialias)
-    font.setHintingPreference(QFont.PreferFullHinting)
-    QApplication.setFont(font)
-
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_DontCreateNativeWidgetSiblings)
+
+    from qfluentwidgets import setFont
+    setFont(app)
 
     eventLoop = QEventLoop(app)
     asyncio.set_event_loop(eventLoop)

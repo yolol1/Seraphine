@@ -22,7 +22,7 @@ if ($dbg -and (Test-Path .\dist)) {
     rm -r -Force .\dist
 }
 
-pyinstaller -w -i .\app\resource\images\logo.ico main.py
+python -m PyInstaller -w -i .\app\resource\images\logo.ico main.py
 rm -r -fo .\build
 rm -r -fo .\main.spec
 rni -path .\dist\main -newName Seraphine
