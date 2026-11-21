@@ -8,51 +8,145 @@ on:
   workflow_dispatch:
 
 jobs:
+  lint-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest ruff
+      - name: Lint with ruff
+        run: |
+          ruff check app/ tests/ --output-format=github
+      - name: Run tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m pytest tests/ -v
+
   build-seraphine:
+    needs: lint-and-test
     runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       - name: Install dependencies
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.8'
           cache: 'pip'
       - name: Pack Seraphine
         run: |
+          $ErrorActionPreference = 'Stop'
           pip install -r requirements.txt
-          pip install pyinstaller==5.13
+          pip install pyinstaller==6.21
           .\make.ps1
-          echo "SUCCESS=true" >> $GITHUB_ENV
-      - name: Upload artifact
+      - name: Upload 7z artifact
         uses: actions/upload-artifact@v4
-        if: ${{ env.SUCCESS }} == 'true'
         with:
           name: Seraphine
-          path: .\Seraphine.7z
+          path: .\dist\Seraphine.7z
+      - name: Upload dist artifact (for tufup)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Seraphine-dist
+          path: .\dist\Seraphine
+
+  # 构建 Windows 安装包 (Inno Setup).
+  # 复用 build-seraphine 的 dist/Seraphine 产物，不做二次打包。
+  build-installer:
+    needs: build-seraphine
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    - name: Download dist artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: Seraphine-dist
+        path: ./dist/Seraphine
+    - name: Install Inno Setup
+      run: choco install innosetup --no-progress --confirm
+    - name: Get version
+      id: ver
+      shell: pwsh
+      run: |
+        $v = Select-String -Path app/common/config.py -Pattern '^VERSION.*"(\d+\.\d+\.\d+)"' | ForEach-Object { $_.Matches.Groups[1].Value } | Select-Object -Last 1
+        echo "version=$v" >> $env:GITHUB_OUTPUT
+    - name: Compile installer
+      run: |
+        & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" packaging\installer\Seraphine.iss /DMyAppVersion=${{ steps.ver.outputs.version }} /Q
+        copy packaging\installer\SeraphineSetup-*.exe .
+    - name: Generate SHA256
+      run: |
+        sha256sum SeraphineSetup-*.exe > SeraphineSetup-${{ steps.ver.outputs.version }}.exe.sha256
+        cat SeraphineSetup-${{ steps.ver.outputs.version }}.exe.sha256
+    - name: Upload installer artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: SeraphineSetup-${{ steps.ver.outputs.version }}
+        path: |
+          SeraphineSetup-*.exe
+          SeraphineSetup-*.exe.sha256
 
   release:
-    needs: build-seraphine
+    needs: [build-seraphine, build-installer]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # 暴露 UPDATED/VERSION 给 publish-tufup job, 避免重复计算 VERSION 检测逻辑
+    outputs:
+      updated: ${{ steps.detect.outputs.updated }}
+      version: ${{ steps.detect.outputs.version }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         fetch-depth: 0
     - name: Setup environment variables
+      id: detect
       run: |
-        export VERSION_CHANGED_COMMIT_HASH=$(git blame app/common/config.py --root -l | grep -Po "([\w]+) (?=\(.*\) VERSION = )")
-        export HEAD_COMMIT_HASH=$(git log -1 --format='%H')
-        export UPDATED=$(python -c "import os; UPDATED = 'true' if os.environ['HEAD_COMMIT_HASH'].strip() == os.environ['VERSION_CHANGED_COMMIT_HASH'].strip() else 'false'; print(UPDATED)")
-        export VERSION=$(cat app/common/config.py | grep -Po "(?<=VERSION = \")(.*[^\"])")
-        echo "VERSION=v$VERSION" >> $GITHUB_ENV
+        # ponytail: 比较 VERSION 与最新 git tag, 而非 git diff HEAD~1.
+        # git diff HEAD~1 HEAD 在 merge commit / 多 commit push 时漏检.
+        # 标签对比对所有提交结构都可靠.
+        CURRENT_VERSION=$(grep '^VERSION' app/common/config.py | grep -oP '"\K\d+\.\d+\.\d+' | tail -1)
+        LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname 2>/dev/null | head -1)
+        if [ -z "$LATEST_TAG" ] || [ "v$CURRENT_VERSION" != "$LATEST_TAG" ]; then
+          UPDATED='true'
+        else
+          UPDATED='false'
+        fi
+        echo "VERSION=v$CURRENT_VERSION" >> $GITHUB_ENV
         echo "UPDATED=$UPDATED" >> $GITHUB_ENV
-    - name: Download artifact
+        echo "updated=$UPDATED" >> "$GITHUB_OUTPUT"
+        echo "version=v$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+        echo "Detected VERSION=$CURRENT_VERSION, latest tag=$LATEST_TAG, UPDATED=$UPDATED"
+    - name: Download artifact (7z)
       uses: actions/download-artifact@v4
       if: env.UPDATED == 'true'
       with:
         name: Seraphine
         path: ./
+    - name: Download artifact (installer)
+      uses: actions/download-artifact@v4
+      if: env.UPDATED == 'true'
+      with:
+        name: SeraphineSetup-${{ needs.build-installer.outputs.version }}
+        path: ./
+    - name: Generate SHA256 checksum (7z)
+      if: env.UPDATED == 'true'
+      run: |
+        sha256sum Seraphine.7z > Seraphine.7z.sha256
+        cat Seraphine.7z.sha256
     - name: Push to release
       uses: ncipollo/release-action@v1
       if: env.UPDATED == 'true'
@@ -60,16 +154,124 @@ jobs:
         name: ${{ env.VERSION }}
         tag: ${{ env.VERSION }}
         token: ${{ secrets.GITHUB_TOKEN }}
-        replacesArtifacts: false
-        artifacts: Seraphine.7z
-    - name: Sync to Gitee
-      if: env.UPDATED == 'true'
+        # replacesArtifacts: true 让重复发版时覆盖旧资产 (含 .sha256),
+        # 旧实现 false 会导致重发失败.
+        replacesArtifacts: true
+        artifacts: |
+          Seraphine.7z
+          Seraphine.7z.sha256
+          SeraphineSetup-*.exe
+          SeraphineSetup-*.exe.sha256
+    - name: Sync to Gitee (domestic mirror)
+      if: env.UPDATED == 'true' && env.GITEE_OWNER != ''
       env:
-        GITEE_OWNER: Zzaphkiel
-        GITEE_REPO: seraphine
+        GITEE_OWNER: ${{ secrets.GITEE_OWNER }}
+        GITEE_REPO: ${{ secrets.GITEE_REPO }}
         GITEE_USERNAME: ${{ secrets.GITEE_USERNAME }}
         GITEE_PASSWORD: ${{ secrets.GITEE_PASSWORD }}
         GITEE_CLIENT_ID: ${{ secrets.GITEE_CLIENT_ID }}
         GITEE_CLIENT_SECRET: ${{ secrets.GITEE_CLIENT_SECRET }}
       run: |
-        python3 sync.py --tag "$VERSION"
+        # sync.py 同时上传 Seraphine.7z 和 Seraphine.7z.sha256,
+        # 幂等 (tag 已存在则复用 release), 失败不阻塞 workflow (best effort 镜像).
+        python sync.py -t "${{ env.VERSION }}" || echo "Gitee sync failed (non-blocking)"
+
+  # 发布 tufup 仓库 (metadata + targets) 到 gh-pages 分支, 供客户端增量更新.
+  # 仅在 VERSION 变更时运行. 首次运行 (无 TUFUP_KEYS_B64 secret) 会生成密钥并
+  # 输出到 step summary, 需开发者手动保存为 secret; root.json 作为 artifact
+  # 上传, 需开发者下载并提交到 app/resource/tufup/metadata/ (见 tufup_repo.py).
+  publish-tufup:
+    needs: [build-seraphine, release]
+    # ponytail: always run. add-bundle 对已存在的版本跳过, publish_changes 幂等,
+    # gh-pages deploy 无变更时不产生额外 commit. 确保 CI 失败重跑后 tufup targets
+    # 也能发布, 不受 git tag 状态影响.
+    if: always() && !cancelled() && needs.build-seraphine.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # job 级 env: 让 step 的 if 条件也能读到 TUFUP_KEYS_B64 是否为空
+    env:
+      TUFUP_KEYS_B64: ${{ secrets.TUFUP_KEYS_B64 }}
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - name: Install tufup
+      run: pip install "tufup>=0.10.0"
+    - name: Download dist artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: Seraphine-dist
+        path: ./dist/Seraphine
+    - name: Checkout existing gh-pages (for prior tufup repo state)
+      uses: actions/checkout@v4
+      with:
+        ref: gh-pages
+        path: gh-pages-existing
+      continue-on-error: true
+      id: ghpages
+    - name: Restore existing tufup repo
+      run: |
+        mkdir -p tufup_repo
+        if [ "${{ steps.ghpages.outcome }}" = "success" ] && [ -d gh-pages-existing/tufup ]; then
+          cp -r gh-pages-existing/tufup/metadata tufup_repo/ 2>/dev/null || true
+          cp -r gh-pages-existing/tufup/targets tufup_repo/ 2>/dev/null || true
+          echo "Restored existing tufup repo from gh-pages"
+        else
+          echo "First run: no existing tufup repo on gh-pages"
+        fi
+        ls -R tufup_repo || true
+    - name: Restore or create TUF signing keys
+      run: |
+        if [ -n "$TUFUP_KEYS_B64" ]; then
+          python tufup_repo.py unpack-keys -b "$TUFUP_KEYS_B64" -k keys
+          echo "Restored keys from secret"
+        else
+          mkdir -p keys
+          echo "No TUFUP_KEYS_B64 secret (first run). New keys will be generated."
+        fi
+    - name: Init tufup repo
+      run: python tufup_repo.py init -r tufup_repo -k keys
+    - name: Add new bundle
+      run: |
+        # ponytail: 从 config.py 直接读 VERSION, 不依赖 release job output
+        VER=$(grep '^VERSION' app/common/config.py | grep -oP '"\K\d+\.\d+\.\d+' | tail -1)
+        python tufup_repo.py add-bundle -v "$VER" -d dist/Seraphine -r tufup_repo -k keys
+    - name: "Bootstrap: export keys for first-run secret"
+      if: env.TUFUP_KEYS_B64 == ''
+      run: |
+        # 首次运行生成的密钥需开发者手动存为 secret TUFUP_KEYS_B64
+        python tufup_repo.py pack-keys -k keys > /tmp/keys.b64
+        {
+          echo "## tufup bootstrap"
+          echo ""
+          echo "首次运行: 已生成新签名密钥. 请将下面内容存为仓库 secret"
+          echo "\`TUFUP_KEYS_B64\` 以便后续发布能复用同一密钥:"
+          echo ""
+          echo '```'
+          cat /tmp/keys.b64
+          echo '```'
+          echo ""
+          echo "同时请下载下方 tufup-root-json artifact, 将 root.json 提交到"
+          echo "\`app/resource/tufup/metadata/root.json\` 后重新发版, 客户端才能校验更新."
+        } >> "$GITHUB_STEP_SUMMARY"
+        echo "::warning::First tufup run — save TUFUP_KEYS_B64 secret and commit root.json (see step summary)"
+    - name: Upload root.json artifact (for bundling into app)
+      uses: actions/upload-artifact@v4
+      with:
+        name: tufup-root-json
+        path: tufup_repo/metadata/root.json
+    - name: Deploy tufup repo to gh-pages
+      uses: peaceiris/actions-gh-pages@v4
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        # 只发布 tufup_repo/ 内容到 gh-pages 的 tufup/ 子目录,
+        # keep_files 保留 gh-pages 上其他文件及历史 targets (patch 链需要).
+        publish_dir: tufup_repo
+        destination_dir: tufup
+        keep_files: true
