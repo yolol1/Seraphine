@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 
 import aiohttp
 
@@ -30,7 +31,7 @@ class ChampionAlias:
             async with aiohttp.ClientSession() as session:
                 res = await session.get(self.URL, proxy=None, ssl=False)
 
-                # Don't know why this doesn't work:
+                # 不知道为什么这样子不行：
                 # res = await res.json()
 
                 s = str(await res.read(), encoding='utf-8')
@@ -53,14 +54,14 @@ class ChampionAlias:
 
             with open(self.CHAMPION_CFG_PATH, 'w') as f:
                 json.dump(ChampionAlias.data, f)
-        except:
+        except Exception:
             logger.info("Update champions alias FAILED", self.TAG)
             ChampionAlias.data = None
 
     def __needUpdate(self):
         try:
             lolVersion = getLolClientVersion()
-        except:
+        except (OSError, subprocess.SubprocessError):
             return True
 
         if not os.path.exists(self.CHAMPION_CFG_PATH):
@@ -69,7 +70,7 @@ class ChampionAlias:
         with open(self.CHAMPION_CFG_PATH, 'r') as f:
             try:
                 ChampionAlias.data = json.loads(f.read())
-            except:
+            except json.JSONDecodeError:
                 return True
 
         return ChampionAlias.getDataVersion() != lolVersion
@@ -81,15 +82,15 @@ class ChampionAlias:
     @classmethod
     def getChampionsAlias(cls) -> dict:
         champions = ChampionAlias.data['champions']
-        cls.computeDict(champions, "901", lambda x, y: y + ",小火龙")# Smolder
-        cls.computeDict(champions, "950", lambda x, y: y + ",狗")# Naafiri
-        cls.computeDict(champions, "902", lambda x, y: y + ",丁真")# Milio
-        cls.computeDict(champions, "897", lambda x, y: y + ",黑龙,n-word")# K'Sante
+        cls.computeDict(champions, "901", lambda x, y: y + ",小火龙")# 斯莫德
+        cls.computeDict(champions, "950", lambda x, y: y + ",狗")# 纳亚菲利
+        cls.computeDict(champions, "902", lambda x, y: y + ",丁真")# 米利欧
+        cls.computeDict(champions, "897", lambda x, y: y + ",黑龙,n-word")# 奎桑提
         return champions
 
     @classmethod
     def isAvailable(cls) -> bool:
-        return ChampionAlias.data != None
+        return ChampionAlias.data is not None
 
     @classmethod
     def getDataVersion(cls) -> str:

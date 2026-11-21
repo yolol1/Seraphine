@@ -8,8 +8,12 @@ import requests
 import base64
 import subprocess
 import psutil
+import ctypes
+import time
 import win32api
+import win32con
 import win32gui
+import win32process
 
 from PyQt5.QtCore import QRectF
 
@@ -21,63 +25,175 @@ TAG = "Util"
 
 
 class Github:
-    def __init__(self, user="Zzaphkiel", repositories="Seraphine"):
-        self.githubApi = "http://api.github.com"
-        self.giteeApi = "http://gitee.com/api"
-
-        self.proxyApi = 'https://ghproxy.net'
+    # 二次开发: 默认指向当前维护者的 fork 仓库, 用于 Release / 公告 / ver.json 拉取
+    def __init__(self, user="Li-Qifeng", repositories="Seraphine"):
+        self.githubApi = "https://api.github.com"
 
         self.user = user
         self.repositories = repositories
         self.sess = requests.session()
+        self._release_info = None
+        self._ver_info = None
 
-    def getReleasesInfo(self):
-        url = f"{self.githubApi}/repos/{self.user}/{self.repositories}/releases/latest"
-
-        if cfg.get(cfg.enableGithubProxy):
-            proxy = {'https': cfg.get(cfg.githubProxyAddr)}
-        else:
-            proxy = None
-
-        return self.sess.get(url, proxies=proxy).json()
-
-    def checkUpdate(self):
+    def __proxy(self):
         """
-        检查版本更新
-        @return: 有更新 -> info, 无更新 -> None
+        构建代理字典。开启代理时同时为 http/https 两种协议注入
+        (旧代码只设了 'https' 键，对当时的 http:// 地址其实从未生效)
         """
-        info = self.getReleasesInfo()
-
-        ver_info = self.__getVersionInfo()
-        info["forbidden"] = ver_info.get("forbidden", False)
-
-        if info.get("tag_name")[1:] != VERSION:
-            return info
+        if cfg.get(cfg.enableProxy):
+            addr = cfg.get(cfg.proxyAddr)
+            return {'http': addr, 'https': addr}
         return None
 
-    def __getVersionInfo(self):
+    def __headers(self):
+        # GitHub API 要求带 User-Agent，匿名 UA 偶发被拒
+        return {'User-Agent': f'Seraphine/{VERSION}'}
+
+    def getReleasesInfo(self):
+        if self._release_info is not None:
+            return self._release_info
+        url = f"{self.githubApi}/repos/{self.user}/{self.repositories}/releases/latest"
+        # debug
+        logger.info(f"getReleasesInfo: GET {url}", TAG)
+        resp = self.sess.get(url, proxies=self.__proxy(),
+                             headers=self.__headers(),
+                             timeout=15)
+        # debug
+        logger.info(f"getReleasesInfo: status={resp.status_code} url={resp.url}", TAG)
+        data = resp.json()
+        # ponytail: 无认证 GitHub API 60 req/h 限流, 检测到限流 response 时
+        # log warning 并返回空 dict, 避免静默按"无更新"处理.
+        # 不缓存失败响应 — 否则首次限流后所有后续 checkUpdate 都命中缓存 {}
+        # 永远返回"已是最新", 用户手动点检查也看不到更新.
+        if isinstance(data, dict) and "message" in data and "rate limit" in data["message"].lower():
+            logger.warning(f"GitHub API rate limited: {data['message']}", TAG)
+            return {}
+        # debug
+        logger.info(f"getReleasesInfo: result_type={type(data).__name__} keys={list(data.keys()) if isinstance(data, dict) else 'not-dict'}", TAG)
+        # 只缓存有效 release 数据 (含 tag_name), 避免错误响应被缓存
+        if isinstance(data, dict) and "tag_name" in data:
+            self._release_info = data
+        return data
+
+    def checkUpdate(self, force_refresh=False):
+        """
+        检查版本更新 (基于 tufup 增量更新框架).
+
+        流程:
+        1. tufup_updater.check_update() 从 GitHub Pages 拉取 tufup metadata,
+           做语义化版本比较 (有更新可走增量 patch 下载).
+        2. tufup 检测成功时直接返回; tufup 检测为无更新或失败时, **总是**回退到
+           GitHub Releases API 做权威判定.
+           背景: tufup metadata 可能滞后 (CI 发布失败), raw.githubusercontent 国内
+           不可达, root.json 过期等都会导致 tufup 漏检. GitHub Releases API 是
+           新版本发布的权威来源, 且 api.github.com 国内可达性更好. 不能让 tufup
+           失败静默吞掉更新通知.
+        3. GitHub API 回退也确认无更新 -> 返回 None.
+
+        @param force_refresh: True 时清除 release/ver 缓存, 强制重新拉取.
+            手动点击检查更新时应传 True, 避免启动时限流缓存的空 dict 毒化后续结果.
+        @return: 有更新 -> info dict (含 tag_name/body/forbidden/new_version),
+                 无更新 / 失败 -> None
+        """
+        from app.common.tufup_updater import check_update as tufup_check
+
+        if force_refresh:
+            self._release_info = None
+            self._ver_info = None
+
+        # debug
+        logger.info("checkUpdate: tufup_check() start", TAG)
+        has_update, new_version = tufup_check()
+        # debug
+        logger.info(f"checkUpdate: tufup has_update={has_update} new_version={new_version}", TAG)
+        if has_update and new_version:
+            return self._make_update_info(new_version)
+
+        # debug
+        logger.info("checkUpdate: tufup gave no update, falling back to GitHub API", TAG)
+        # GitHub Releases API 权威回退: tufup 漏检时由 GitHub API 兜底.
+        # 这是修复生产环境更新不可见的根因 — 旧代码仅 dev mode 走此分支,
+        # 生产模式 tufup 任何失败都会静默返回 None, 用户收不到更新通知.
+        try:
+            release_info = self.getReleasesInfo()
+            # debug
+            logger.info(f"checkUpdate: release_info keys={list(release_info.keys()) if isinstance(release_info, dict) else 'not-dict'}", TAG)
+            latest_tag = release_info.get("tag_name", "").lstrip('v')
+            # debug
+            logger.info(f"checkUpdate: latest_tag='{latest_tag}' VERSION='{VERSION}'", TAG)
+            if latest_tag and latest_tag != VERSION:
+                from app.common.version_utils import coerce_version
+                c1 = coerce_version(latest_tag)
+                c2 = coerce_version(VERSION)
+                # debug
+                logger.info(f"checkUpdate: coerce {latest_tag} -> {c1}, {VERSION} -> {c2}, {c1} > {c2} = {c1 > c2}", TAG)
+                if c1 > c2:
+                    logger.info(
+                        f"update available (GitHub API fallback): "
+                        f"{VERSION} -> {latest_tag}", TAG)
+                    return self._make_update_info(latest_tag)
+        except Exception as e:
+            logger.warning(f"GitHub API fallback update check failed: {e}",
+                           TAG)
+
+        logger.info("no update available", TAG)
+        return None
+
+    def _make_update_info(self, new_version: str) -> dict:
+        """构建 info dict 供 UpdateMessageBox 显示."""
+        # debug
+        logger.info(f"_make_update_info: new_version={new_version}", TAG)
+        info = {
+            "tag_name": f"v{new_version}",
+            "new_version": new_version,
+            "body": "",
+            "forbidden": False,
+        }
+
+        try:
+            release_info = self.getReleasesInfo()
+            matched = release_info.get("tag_name", "").lstrip('v') == new_version
+            # debug
+            logger.info(f"_make_update_info: matched_tag={matched} body_len={len(release_info.get('body', ''))} has_assets={'assets' in release_info}", TAG)
+            if matched:
+                info["body"] = release_info.get("body", "")
+                if "assets" in release_info:
+                    info["assets"] = release_info["assets"]
+        except Exception as e:
+            logger.warning(f"failed to fetch release info for body: {e}", TAG)
+
+        try:
+            ver_info = self.__get_ver_info()
+            info["forbidden"] = ver_info.get("forbidden", False)
+            # debug
+            logger.info(f"_make_update_info: forbidden={info['forbidden']}", TAG)
+        except Exception as e:
+            logger.warning(f"failed to fetch ver.json kill-switch: {e}", TAG)
+
+        return info
+
+    def __get_ver_info(self):
+        if self._ver_info is not None:
+            return self._ver_info.get(VERSION, {})
         url = f'{self.githubApi}/repos/{self.user}/{self.repositories}/contents/document/ver.json'
-        if cfg.get(cfg.enableGithubProxy):
-            proxy = {'https': cfg.get(cfg.githubProxyAddr)}
-        else:
-            proxy = None
-
-        res = self.sess.get(url, proxies=proxy).json()
-
-        json_data = json.loads(
+        # debug
+        logger.info(f"__get_ver_info: GET {url}", TAG)
+        res = self.sess.get(url, proxies=self.__proxy(),
+                            headers=self.__headers(),
+                            timeout=15).json()
+        # debug
+        logger.info(f"__get_ver_info: response_keys={list(res.keys()) if isinstance(res, dict) else 'not-dict'}", TAG)
+        raw = json.loads(
             str(base64.b64decode(res['content']), encoding='utf-8'))
-
-        return json_data.get(VERSION, {})
+        self._ver_info = raw
+        return raw.get(VERSION, {})
 
     def getNotice(self):
         url = f'{self.githubApi}/repos/{self.user}/{self.repositories}/contents/document/notice.md'
 
-        if cfg.get(cfg.enableGithubProxy):
-            proxy = {'https': cfg.get(cfg.githubProxyAddr)}
-        else:
-            proxy = None
-
-        res = self.sess.get(url, proxies=proxy).json()
+        res = self.sess.get(url, proxies=self.__proxy(),
+                            headers=self.__headers(),
+                            timeout=15).json()
 
         content = str(base64.b64decode(res['content']), encoding='utf-8')
 
@@ -99,13 +215,13 @@ def getLoLPathByRegistry() -> str:
     无法获取时返回空串
     """
     mainKey = winreg.HKEY_CURRENT_USER
-    subKey = "SOFTWARE\Tencent\LOL"
+    subKey = r"SOFTWARE\Tencent\LOL"
     valueName = "InstallPath"
 
     try:
         with winreg.OpenKey(mainKey, subKey) as k:
             installPath, _ = winreg.QueryValueEx(k, valueName)
-            path = str(Path(f"{installPath}\TCLS").absolute()
+            path = str(Path(rf"{installPath}\TCLS").absolute()
                        ).replace("\\", "/")
             return f"{path[:1].upper()}{path[1:]}"
     except FileNotFoundError:
@@ -125,7 +241,7 @@ def getTasklistPath():
             cmd = f'{path} /FI "imagename eq LeagueClientUx.exe" /NH'
             _ = subprocess.check_output(cmd, shell=True)
             return path
-        except:
+        except (subprocess.CalledProcessError, OSError):
             pass
 
     return None
@@ -155,6 +271,12 @@ def getLolClientPid(path):
 
 
 def getLolClientPids(path):
+    """
+    获取所有 LeagueClientUx.exe 进程的 pid 列表。
+
+    tasklist 通过 shell 起子进程时偶尔会抛 PermissionError / OSError
+    (见 issue #367), 这里捕获后回退到 psutil 慢速枚举, 避免监听线程整个崩溃。
+    """
     try:
         processes = subprocess.check_output(
             f'{path} /FI "imagename eq LeagueClientUx.exe" /NH',
@@ -162,15 +284,21 @@ def getLolClientPids(path):
             stderr=subprocess.STDOUT
         )
     except subprocess.CalledProcessError as e:
-        logger.error(
+        # 客户端退出瞬间 tasklist 可能以 0xC0000142 退出, 已回退 psutil, 非致命
+        logger.warning(
             'an error occurred when calling tasklist command, '
-            f'original output: {e.output.decode()}'
+            f'original output: {e.output.decode() if e.output else ""}'
         )
-        raise e
+        return getLolClientPidsSlowly()
+    except (PermissionError, OSError, FileNotFoundError) as e:
+        # tasklist 子进程启动失败 (Windows 上 fork/exec 偶发), 回退 psutil
+        logger.warning(
+            f'tasklist subprocess failed, fallback to psutil: {e}', TAG)
+        return getLolClientPidsSlowly()
 
     pids = []
 
-    if not b'LeagueClientUx.exe' in processes:
+    if b'LeagueClientUx.exe' not in processes:
         return pids
 
     arr = processes.split()
@@ -193,8 +321,27 @@ def getLolClientPidsSlowly():
 
 
 def isLolGameProcessExist(path):
-    processes = subprocess.check_output(
-        f'{path} /FI "imagename eq League of Legends.exe" /NH', shell=True)
+    """
+    判断游戏主程序 (League of Legends.exe) 是否在运行。
+
+    tasklist 子进程可能间歇性失败 (issue #367), 失败时回退 psutil,
+    宁可误判也不会让监听线程崩溃退出。
+    """
+    try:
+        processes = subprocess.check_output(
+            f'{path} /FI "imagename eq League of Legends.exe" /NH',
+            shell=True, stderr=subprocess.STDOUT)
+    except (PermissionError, OSError, FileNotFoundError,
+            subprocess.CalledProcessError) as e:
+        logger.warning(
+            f'tasklist subprocess failed, fallback to psutil: {e}', TAG)
+        for process in psutil.process_iter():
+            try:
+                if process.name() == 'League of Legends.exe':
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return False
 
     return b'League of Legends.exe' in processes
 
@@ -226,7 +373,9 @@ def getPortTokenServerByPidViaPsutil(pid):
 
 
 def getPortTokenServerByPidViaWmic():
-    # Requires administrator privileges
+    '''
+    ### 需要管理员权限
+    '''
     command = "wmic process WHERE name='LeagueClientUx.exe' GET commandline"
     output = subprocess.check_output(command, shell=True).decode("gbk")
 
@@ -239,18 +388,18 @@ def getPortTokenServerByPidViaWmic():
 
 def getPortTokenServerByPid(pid):
     '''
-    Obtain the port, token, and login server from the command-line arguments of a process using its process ID.
+    通过进程 id 获得启动命令行参数中的 port、token 以及登录服务器
     '''
 
     try:
         return getPortTokenServerByPidViaPsutil(pid)
-    except:
+    except Exception:
         return getPortTokenServerByPidViaWmic()
 
 
 def getFileProperties(fname):
     """
-    Read all attributes of the given file and return them as a dictionary.
+    读取给定文件的所有属性, 返回一个字典.
 
     returns : {'FixedFileInfo': {'Signature': -17890115, 'StrucVersion': 65536, 'FileVersionMS': 917513, 'FileVersionLS':
     38012988, 'ProductVersionMS': 917513, 'ProductVersionLS': 38012988, 'FileFlagsMask': 23, 'FileFlags': 0,
@@ -292,7 +441,7 @@ def getFileProperties(fname):
             strInfo[propName] = win32api.GetFileVersionInfo(fname, strInfoPath)
 
         props['StringFileInfo'] = strInfo
-    except:
+    except (win32api.error, KeyError):
         return {}
     else:
         return props
@@ -301,13 +450,13 @@ def getFileProperties(fname):
 def getLolClientVersion():
     gamePath = cfg.get(cfg.lolFolder)[0]
 
-    assert gamePath  # Must exist, otherwise, there is a logical issue in the call -- By Hpero4
+    assert gamePath  # 必须有, 否则就是调用逻辑有问题 -- By Hpero4
 
-    # Special handling for the Chinese server -- By Hpero4
+    # 特判一下国服 -- By Hpero4
     gamePath = gamePath.replace("/TCLS", "")
 
     lolExe = f"{gamePath}/Game/League of Legends.exe"
-    # Check if the client is special? Why is the main LOL program missing? -- By Hpero4
+    # 判断一下, 客户端特殊? 为啥会没有LOL的主程序 -- By Hpero4
     if not os.path.exists(lolExe):
         raise FileNotFoundError(lolExe)
 
@@ -316,19 +465,19 @@ def getLolClientVersion():
 
     assert lolVer
 
-    # Shorten to the major version number
+    # 缩短至大版本号
     return re.search(r"\d+\.\d+", lolVer).group(0)
 
 
 def getLolClientWindowPos() -> QRectF:
-    # Get the client window handle
+    # 获取客户端窗口句柄
     hwnd = win32gui.FindWindow("RCLIENT", "League of Legends")
 
-    # If there is no client, return None directly
+    # 如果没客户端，就直接 return 一个 None
     if not hwnd:
         return None
 
-    # Get the client window position
+    # 获取客户端窗口位置
     # struct RECT {
     #     LONG left;
     #     LONG top;
@@ -337,8 +486,189 @@ def getLolClientWindowPos() -> QRectF:
     # }
     rect = win32gui.GetWindowRect(hwnd)
 
-    # When the window is minimized, the aspect ratio is not 16:9, return None directly
-    if (rect[3] - rect[1]) / (rect[2] - rect[0]) != 0.5625:
+    # 窗口最小化的时候，比例不是 16:9，直接 return 一个 None
+    # (侧边栏每 500ms 轮询一次, 宽度为 0 的异常矩形不能触发 ZeroDivisionError)
+    width = rect[2] - rect[0]
+    if width <= 0 or (rect[3] - rect[1]) / width != 0.5625:
         return None
 
-    return QRectF(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1])
+    return QRectF(rect[0], rect[1], width, rect[3] - rect[1])
+
+
+def isLolClientForeground() -> bool:
+    """客户端窗口当前是否在前台 (供置顶的侧边栏判断显隐)."""
+    try:
+        hwnd = win32gui.FindWindow("RCLIENT", "League of Legends")
+        return bool(hwnd) and win32gui.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+
+def _enumWindowsFilter(hwnd, exe_name):
+    """辅助: 检查窗口是否属于指定 exe 且可见"""
+    if not win32gui.IsWindowVisible(hwnd):
+        return False
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        return psutil.Process(pid).name().lower() == exe_name.lower()
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return False
+
+
+def _enumHwnds():
+    hwnds = []
+    win32gui.EnumWindows(lambda h, _: hwnds.append(h) or True, None)
+    return hwnds
+
+
+def findGameWindowHwnd():
+    """找到 LoL 游戏窗口 (League of Legends.exe) 句柄, 返回 0 表示未找到"""
+    for hwnd in _enumHwnds():
+        if not win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd):
+            continue
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            try:
+                if psutil.Process(pid).name().lower() == 'league of legends.exe':
+                    return hwnd
+            except psutil.AccessDenied:
+                # ponytail: Vanguard blocks psutil; fallback to window title
+                title = win32gui.GetWindowText(hwnd)
+                if title and 'League of Legends' in title:
+                    logger.info(f"findGameWindowHwnd: matched by title hwnd={hwnd}", TAG)
+                    return hwnd
+        except (psutil.NoSuchProcess, Exception):
+            continue
+    return 0
+
+
+def findProcessWindowHwnd(exe_name):
+    """按 exe 名称找到主窗口句柄 (选标题最长的可见窗口), 返回 0 表示未找到"""
+    if not exe_name:
+        return 0
+    best_hwnd = 0
+    best_len = 0
+    for hwnd in _enumHwnds():
+        if not _enumWindowsFilter(hwnd, exe_name):
+            continue
+        title = win32gui.GetWindowText(hwnd) or ''
+        if len(title) > best_len:
+            best_hwnd = hwnd
+            best_len = len(title)
+    if best_hwnd:
+        logger.info(f"DeathSwitch: found '{exe_name}' hwnd={best_hwnd} title='{win32gui.GetWindowText(best_hwnd)[:80]}'", TAG)
+    return best_hwnd
+
+
+def forceForegroundWindow(hwnd):
+    """强制将窗口带到前台 (绕过 Windows 前台窗口限制)"""
+    if not hwnd:
+        logger.warning("DeathSwitch: forceForegroundWindow called with hwnd=0", TAG)
+        return
+    try:
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE if win32gui.IsIconic(hwnd) else win32con.SW_SHOW)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_TOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+        win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0,
+                              win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_SHOWWINDOW)
+        # 双 AttachThreadInput: 同时绑前台线程和目标线程, 再 SetForegroundWindow
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        fg_hwnd = user32.GetForegroundWindow()
+        cur_tid = kernel32.GetCurrentThreadId()
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        fg_tid = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else None
+        if fg_tid and fg_tid != cur_tid:
+            user32.AttachThreadInput(fg_tid, cur_tid, True)
+        if target_tid and target_tid != cur_tid:
+            user32.AttachThreadInput(target_tid, cur_tid, True)
+        user32.SetForegroundWindow(hwnd)
+        user32.BringWindowToTop(hwnd)
+        if target_tid and target_tid != cur_tid:
+            user32.AttachThreadInput(target_tid, cur_tid, False)
+        if fg_tid and fg_tid != cur_tid:
+            user32.AttachThreadInput(fg_tid, cur_tid, False)
+        logger.info(f"DeathSwitch: forceForegroundWindow(hwnd={hwnd}) done", TAG)
+    except Exception as e:
+        logger.warning(f"DeathSwitch: forceForegroundWindow failed: {e}", TAG)
+
+
+def sendMediaPlayPause(hwnd: int = 0):
+    """发送播放/暂停命令。
+
+    使用 SendInput 发送媒体键, 优先 VK_MEDIA_PLAY_PAUSE, 失败后尝试 scan code 兜底.
+    结构体使用完整 INPUT union, 确保 sizeof 在 x64 上正确 (40 字节).
+    """
+    try:
+        user32 = ctypes.windll.user32
+        VK_MEDIA_PLAY_PAUSE = 0xB3
+        SCAN_MEDIA_PLAY_PAUSE = 0x22
+        INPUT_KEYBOARD = 1
+        KEYEVENTF_KEYUP = 0x0002
+        KEYEVENTF_SCANCODE = 0x0008
+        KEYEVENTF_EXTENDEDKEY = 0x0001
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_void_p),
+            ]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", ctypes.c_long),
+                ("dy", ctypes.c_long),
+                ("mouseData", ctypes.c_ulong),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.c_void_p),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", ctypes.c_ulong),
+                ("wParamL", ctypes.c_ushort),
+                ("wParamH", ctypes.c_ushort),
+            ]
+
+        class INPUT_UNION(ctypes.Union):
+            _fields_ = [
+                ("mi", MOUSEINPUT),
+                ("ki", KEYBDINPUT),
+                ("hi", HARDWAREINPUT),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_ulong),
+                ("u", INPUT_UNION),
+            ]
+
+        def _send(wVk, wScan, dwFlags):
+            inp = INPUT()
+            inp.type = INPUT_KEYBOARD
+            inp.u.ki = KEYBDINPUT(wVk, wScan, dwFlags, 0, 0)
+            return user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+        # 等窗口切换落地
+        time.sleep(0.03)
+
+        ret = _send(VK_MEDIA_PLAY_PAUSE, 0, 0)
+        ret += _send(VK_MEDIA_PLAY_PAUSE, 0, KEYEVENTF_KEYUP)
+        if ret == 2:
+            logger.info("sendMediaPlayPause: VK succeeded", TAG)
+            return
+
+        logger.warning(f"sendMediaPlayPause: VK returned {ret}/2, trying scan code", TAG)
+        flags = KEYEVENTF_SCANCODE | KEYEVENTF_EXTENDEDKEY
+        ret = _send(0, SCAN_MEDIA_PLAY_PAUSE, flags)
+        ret += _send(0, SCAN_MEDIA_PLAY_PAUSE, flags | KEYEVENTF_KEYUP)
+        if ret == 2:
+            logger.info("sendMediaPlayPause: scan code succeeded", TAG)
+        else:
+            logger.warning(f"sendMediaPlayPause: scan code also failed ({ret}/2)", TAG)
+    except Exception as e:
+        logger.warning(f"sendMediaPlayPause failed: {e}", TAG)

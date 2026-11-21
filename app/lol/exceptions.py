@@ -1,18 +1,22 @@
-class SummonerNotFound(BaseException):
+class RateLimited(Exception):
+    """LCU/SGP returned 429. args = (retry_after_seconds,)."""
+
+
+class SummonerNotFound(Exception):
     pass
 
 
-class SummonerGamesNotFound(BaseException):
+class SummonerGamesNotFound(Exception):
     pass
 
 
-class SummonerRankInfoNotFound(BaseException):
+class SummonerRankInfoNotFound(Exception):
     pass
 
 
-class SummonerNotInGame(BaseException):
+class SummonerNotInGame(Exception):
     pass
 
 
-class RetryMaximumAttempts(BaseException):
+class RetryMaximumAttempts(Exception):
     pass

@@ -9,9 +9,11 @@ import time
 import traceback
 from asyncio import CancelledError
 from collections import deque
+from typing import Optional, Union
+from urllib.parse import urlencode
 
 import aiohttp
-import requests
+from contextlib import asynccontextmanager
 from PyQt5.QtCore import QObject
 
 from app.common.config import cfg, Language
@@ -19,10 +21,10 @@ from app.common.logger import logger
 from app.common.signals import signalBus
 from app.common.util import getPortTokenServerByPid, getTasklistPath, getLolClientPid
 from app.lol.exceptions import *
-
-requests.packages.urllib3.disable_warnings()
+from app.lol.persistent_cache import cache as sqlite_cache
 
 TAG = "Connector"
+MANAGER_CACHE_PATH = "app/resource/game/manager_data_cache.json"
 
 
 class PastRequest:
@@ -53,24 +55,52 @@ def needLcu():
     return decorator
 
 
+def _parse_retry_after(value):
+    if not value:
+        return 5
+    try:
+        # LCU/SGP 正常返回整数秒, 但需兼容浮点字符串 (如 "0.1");
+        # 按服务端指示的原值 sleep, 上下限截断防异常值
+        v = float(value)
+        return max(0, min(v, 60))
+    except (ValueError, TypeError):
+        return 5
+
+
+@asynccontextmanager
+async def _concurrency_limit():
+    """并发许可: 只包住真正的 HTTP 请求.
+
+    2026-10-19: 原先 @retry 在方法外层抢许可, 方法内部的重试睡眠 (3×2s)
+    与 SGP 兜底期间会一直攥着许可; 5 个许可被少数慢请求占满后, 上层
+    asyncio.gather 退化为串行 (生涯页加载不出来). 下沉到 HTTP 层后,
+    睡眠/重试期间不再占用许可, 只有实际发请求时才限流.
+
+    connector.close() 会把 semaphore 重置为 None (客户端已断开), 此时
+    跳过限流直接执行.
+    """
+    sem = connector.semaphore
+    if sem is None:
+        yield
+        return
+    async with sem:
+        yield
+
+
 def retry(count=5, retry_sep=0):
     def decorator(func):
+        # 装饰时缓存一次参数签名, 避免每次调用重复 inspect
+        _param_names = list(inspect.signature(func).parameters.keys())
+        _has_self = bool(_param_names) and _param_names[0] == "self"
+        if _has_self:
+            _param_names = _param_names[1:]
+
         async def wrapper(*args, **kwargs):
-            logger.info(f"call %s" % func.__name__, TAG)
-
-            # 获取函数的参数信息
-            func_params = inspect.signature(func).parameters
-            param_names = list(func_params.keys())
-
-            tmp_args = args
-            if param_names[0] == "self":
-                # args[0] 是 self(connector) 的实例, 兼容静态方法
-                param_names = param_names[1:]
-                tmp_args = args[1:]
+            logger.debug("call %s" % func.__name__, TAG)
 
             # 构建参数字典，将参数名与对应的实参值一一对应
             params_dict = {param: arg for param,
-                           arg in zip(param_names, tmp_args)}
+                           arg in zip(_param_names, args[1:] if _has_self else args)}
 
             logger.debug(f"args = {params_dict}|kwargs = {kwargs}", TAG)
             # logger.debug(f"args = {args[1:]}|kwargs = {kwargs}", TAG)
@@ -86,20 +116,33 @@ def retry(count=5, retry_sep=0):
             exce = None
             for _ in range(count):
                 try:
-                    async with connector.semaphore:
-                        res = await func(*args, **kwargs)
+                    # 并发许可已下沉到 HTTP 层 (见 _concurrency_limit):
+                    # 方法内部的重试睡眠 / SGP 兜底不再占用许可, 避免少量慢
+                    # 请求占满 semaphore 导致 gather 串行 (2026-10-19)
+                    res = await func(*args, **kwargs)
                 except CancelledError:
                     # Fix: 使用 task.cancel() 偶尔会停不下 task -- By Hpero4
                     #   在调用 cancel() 时, 会从调用栈的最底抛出 CancelledError, 最终传递到 loop 终止 task;
-                    #   由于 CancelledError 是 BaseException 的子类,
-                    #   若 task 恰好跑到被 retry 装饰的函数中, 会被 retry 中的 BaseException 捕获并吞掉, 从而无事发生
+                    #   CancelledError 是 BaseException 的子类, 必须在 except Exception 之前单独 raise,
+                    #   否则会被吞掉导致 cancel 无效
                     raise
-                except BaseException as e:
-                    time.sleep(retry_sep)
+                except RateLimited as e:
+                    # LCU/SGP 429: sleep Retry-After 秒后重试, 不放大嵌套重试
+                    wait = e.args[0] if e.args else 5
+                    logger.warning(f"429 rate-limited, sleeping {wait}s", TAG)
+                    await asyncio.sleep(wait)
+                    exce = e
+                    continue
+                except Exception as e:
+                    await asyncio.sleep(retry_sep)
                     exce = e
 
                     # SummonerNotFound 再重试会报 429 (限流)
-                    if isinstance(e, SummonerNotFound):
+                    # SummonerGamesNotFound: 方法内部已做退避重试 + SGP 兜底,
+                    # 再叠加 @retry 会把它放大 5 倍. 2026-10-12 实测: 客户端启动/
+                    # 对局中 LCU 与 SGP 同时无数据时, 单次调用耗时 55s,
+                    # 生涯页轮询叠加后卡数分钟 (重试只保留单层)
+                    if isinstance(e, (SummonerNotFound, SummonerGamesNotFound)):
                         raise e
 
                     continue
@@ -110,11 +153,20 @@ def retry(count=5, retry_sep=0):
                 exce = exce if exce else RetryMaximumAttempts(
                     "Exceeded maximum retry attempts.")
 
-                # ReferenceError 为 LCU 未就绪仍有请求发送时抛出, 直接吞掉不用提示
+                # ReferenceError: LCU 未就绪 (lcuSess is None) 仍有请求发送时抛出,
+                # 统一发射 lcuNotConnected 信号通知 UI 层显示"客户端未连接"提示,
+                # 不再 raise 给上层 (避免 qasync 弹错误对话框), 直接返回 None
+                if type(exce) is ReferenceError:
+                    with connector.dqLock:
+                        req_obj.response = exce
+                    logger.warning(
+                        f"LCU not ready, skip {func.__name__}", TAG)
+                    signalBus.lcuNotConnected.emit()
+                    return None
+
                 # 其余异常弹一个提示
-                if type(exce) is not ReferenceError:
-                    signalBus.lcuApiExceptionRaised.emit(
-                        func.__name__, exce)
+                signalBus.lcuApiExceptionRaised.emit(
+                    func.__name__, exce)
 
                 with connector.dqLock:
                     req_obj.response = exce
@@ -126,7 +178,7 @@ def retry(count=5, retry_sep=0):
             with connector.dqLock:
                 req_obj.response = res
 
-            logger.info(f"exit {func.__name__}", TAG)
+            logger.debug(f"exit {func.__name__}", TAG)
             logger.debug(f"result = {res}", TAG)
 
             return res
@@ -227,6 +279,27 @@ class LolClientConnector(QObject):
         self.dqLock = threading.Lock()
         self.callStack = deque(maxlen=10)
 
+        # match-history 快速缓存: 避免 Lobby 阶段多个调用方重复请求
+        # 格式: (puuid, begIndex, endIndex, data, timestamp)
+        self._gamesFastCache = None
+        self._gamesCacheTTL = 5.0  # 秒
+
+        # LCU 冷启动 stale cache 后台恢复任务注册表: {puuid: asyncio.Task}
+        # 防止同一 puuid 重复调度恢复循环
+        self._staleRecoveryTasks = {}
+
+        # LCU 连接建立时刻 (start() 成功时刷新): 冷启动窗口起点.
+        # 0 表示未连接, 视为窗口已过 (测试/离线环境小账号仍可正常停止)
+        self._lcuStartedAt = 0.0
+
+        # 状态锁: 保护 start/close 临界区, 防止多客户端切换时
+        # close 与 start 并发执行 (例如 lolClientEnded 与 lolClientChanged
+        # 信号触发的 task 在 asyncio 事件循环中交错).
+        # 用 hasattr 守卫, 使 close() 末尾的 self.__init__() 不会重置此锁,
+        # 否则等待旧锁的 task 会永远阻塞.
+        if not hasattr(self, '_stateLock'):
+            self._stateLock = asyncio.Lock()
+
     async def autoStart(self):
         '''
         只是为了 debug 的时候省事罢了
@@ -237,24 +310,26 @@ class LolClientConnector(QObject):
         await self.start(pid)
 
     async def start(self, pid):
-        self.pid = pid
+        async with self._stateLock:
+            self.pid = pid
 
-        try:
-            self.port, self.token, self.server = getPortTokenServerByPid(pid)
-        except:
-            signalBus.getCmdlineError.emit()
-            return
+            try:
+                self.port, self.token, self.server = getPortTokenServerByPid(pid)
+            except Exception:
+                signalBus.getCmdlineError.emit()
+                return
 
-        self.semaphore = asyncio.Semaphore(self.maxRefCnt)
+            self.semaphore = asyncio.Semaphore(self.maxRefCnt)
 
-        await self.__initSessions()
-        self.__initPlatformInfo()
-        await self.__initManager()
-        self.__initFolder()
-        await self.__runListener()
-        await self.__initRuneStyle()
+            await self.__initSessions()
+            self.__initPlatformInfo()
+            await self.__initManager()
+            self.__initFolder()
+            await self.__runListener()
+            await self.__initRuneStyle()
 
-        logger.critical(f"connector started, server: {self.server}", TAG)
+            self._lcuStartedAt = time.time()
+            logger.critical(f"connector started, server: {self.server}", TAG)
 
     async def __runListener(self):
         self.listener = LcuWebSocket(self.port, self.token)
@@ -263,13 +338,15 @@ class LolClientConnector(QObject):
                                  uri='/lol-summoner/v1/current-summoner',
                                  type=('Update',))
         async def onCurrentSummonerProfileChanged(event):
-            signalBus.currentSummonerProfileChanged.emit(event['data'])
+            # 防御: WS 事件 payload 可能缺失 data (与 myTeam KeyError 同类竞态)
+            signalBus.currentSummonerProfileChanged.emit(event.get('data') or {})
 
         @self.listener.subscribe(event='OnJsonApiEvent_lol-gameflow_v1_gameflow-phase',
                                  uri='/lol-gameflow/v1/gameflow-phase',
                                  type=('Update',))
         async def onGameFlowPhaseChanged(event):
-            signalBus.gameStatusChanged.emit(event['data'])
+            # 防御: WS 事件 payload 可能缺失 data, 缺失时按空串处理
+            signalBus.gameStatusChanged.emit(event.get('data') or '')
 
         @self.listener.subscribe(event='OnJsonApiEvent_lol-champ-select_v1_session',
                                  uri='/lol-champ-select/v1/session',
@@ -281,7 +358,17 @@ class LolClientConnector(QObject):
                                  uri='/entitlements/v1/token',
                                  type=("Update",))
         async def onSGPTokenChanged(event):
-            self.sgpToken = event['data']['accessToken']
+            # 防御: WS 事件 payload 可能缺失 data/accessToken, 仅在拿到时更新
+            token = ((event.get('data') or {}).get('accessToken'))
+            if token:
+                self.sgpToken = token
+
+        @self.listener.subscribe(event='OnJsonApiEvent_lol-matchmaking_v1_ready-check',
+                                 uri='/lol-matchmaking/v1/ready-check',
+                                 type=('Update',))
+        async def onReadyCheckChanged(event):
+            # 防御: WS 事件 payload 可能缺失 data, 缺失时按空 dict 处理
+            signalBus.readyCheckChanged.emit(event.get('data') or {})
 
         # @self.listener.subscribe(event='OnJsonApiEvent', type=())
         # async def onDebugListen(event):
@@ -290,18 +377,23 @@ class LolClientConnector(QObject):
         await self.listener.start()
 
     async def close(self):
-        try:
-            await self.listener.close()
-        except:
-            pass
+        async with self._stateLock:
+            try:
+                await self.listener.close()
+            except (AttributeError, RuntimeError) as e:
+                logger.debug(f"listener close skipped: {e}", TAG)
 
-        if self.lcuSess:
-            await self.lcuSess.close()
+            if self.lcuSess:
+                await self.lcuSess.close()
 
-        if self.sgpSess:
-            await self.sgpSess.close()
+            if self.sgpSess:
+                await self.sgpSess.close()
 
-        self.__init__()
+            # 取消未完成的 stale cache 后台恢复任务
+            for task in self._staleRecoveryTasks.values():
+                task.cancel()
+
+            self.__init__()
 
     async def __initSessions(self):
         self.lcuSess = aiohttp.ClientSession(
@@ -317,15 +409,17 @@ class LolClientConnector(QObject):
         else:
             url = f'https://{self.server.lower()}-sgp.lol.qq.com:21019'
 
+        # 10s 总超时: SGP 无响应时快速失败, 避免单个挂死请求长时间占用
+        # 并发 semaphore 许可, 拖住生涯/搜索页
         self.sgpSess = aiohttp.ClientSession(
-            base_url=url
+            base_url=url,
+            timeout=aiohttp.ClientTimeout(total=10)
         )
 
         self.sgpToken = await self.getSGPtoken()
 
     def __initFolder(self):
-        if not os.path.exists("app/resource/game"):
-            os.mkdir("app/resource/game")
+        os.makedirs("app/resource/game", exist_ok=True)
 
         for folder in [
             "champion icons",
@@ -336,21 +430,43 @@ class LolClientConnector(QObject):
             "augment icons",
             "splashes",
         ]:
-            p = f"app/resource/game/{folder}"
-            if not os.path.exists(p):
-                os.mkdir(p)
+            os.makedirs(f"app/resource/game/{folder}", exist_ok=True)
+
+    def _tryLoadManagerCache(self):
+        if not os.path.exists(MANAGER_CACHE_PATH):
+            return None
+        try:
+            with open(MANAGER_CACHE_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load manager cache: {e}", TAG)
+            return None
+
+    def _saveManagerCache(self, data):
+        try:
+            os.makedirs(os.path.dirname(MANAGER_CACHE_PATH), exist_ok=True)
+            with open(MANAGER_CACHE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+        except Exception as e:
+            logger.warning(f"Failed to save manager cache: {e}", TAG)
 
     async def __initManager(self):
-        items = await self.__json_retry_get("/lol-game-data/assets/v1/items.json")
-        spells = await self.__json_retry_get(
-            "/lol-game-data/assets/v1/summoner-spells.json")
-        runes = await self.__json_retry_get("/lol-game-data/assets/v1/perks.json")
-        perks = await self.__json_retry_get("/lol-game-data/assets/v1/perkstyles.json")
-        queues = await self.__json_retry_get("/lol-game-queues/v1/queues")
-        champions = await self.__json_retry_get(
-            "/lol-game-data/assets/v1/champion-summary.json")
-        skins = await self.__json_retry_get("/lol-game-data/assets/v1/skins.json")
-        augments = await self.__json_retry_get("/lol-game-data/assets/v1/cherry-augments.json")
+        cached = self._tryLoadManagerCache()
+        if cached is not None:
+            items, spells, runes, queues, champions, skins, perks, augments = cached
+            logger.info("Loaded manager data from cache, skipping LCU fetch", TAG)
+        else:
+            items = await self.__json_retry_get("/lol-game-data/assets/v1/items.json")
+            spells = await self.__json_retry_get(
+                "/lol-game-data/assets/v1/summoner-spells.json")
+            runes = await self.__json_retry_get("/lol-game-data/assets/v1/perks.json")
+            perks = await self.__json_retry_get("/lol-game-data/assets/v1/perkstyles.json")
+            queues = await self.__json_retry_get("/lol-game-queues/v1/queues")
+            champions = await self.__json_retry_get(
+                "/lol-game-data/assets/v1/champion-summary.json")
+            skins = await self.__json_retry_get("/lol-game-data/assets/v1/skins.json")
+            augments = await self.__json_retry_get("/lol-game-data/assets/v1/cherry-augments.json")
+            self._saveManagerCache([items, spells, runes, queues, champions, skins, perks, augments])
 
         self.manager = JsonManager(
             items, spells, runes, queues, champions, skins, perks, augments)
@@ -390,7 +506,7 @@ class LolClientConnector(QObject):
 
         self.manager.perkStyles = res
 
-    async def __json_retry_get(self, url, max_retries=5):
+    async def __json_retry_get(self, url, max_retries=5) -> Union[dict, list]:
         """
         根据 httpStatus 字段值, retry 获取数据
 
@@ -428,79 +544,82 @@ class LolClientConnector(QObject):
         raise RetryMaximumAttempts("Exceeded maximum retry attempts.")
 
     @retry()
-    async def getRuneIcon(self, runeId):
+    async def _downloadAsset(self, url: str, dest: str) -> Optional[str]:
+        """通用资源下载 (带重试/限流). 磁盘已命中的路径不要走这里."""
+        res = await self.__get(url)
+
+        with open(dest, "wb") as f:
+            f.write(await res.read())
+
+        return dest
+
+    async def getRuneIcon(self, runeId) -> str:
         if runeId == 0:
             return "app/resource/images/rune-0.png"
 
         icon = f"app/resource/game/rune icons/{runeId}.png"
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getRuneIconPath(runeId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            return await self._downloadAsset(
+                self.manager.getRuneIconPath(runeId), icon)
 
         return icon
 
     @retry()
-    async def getCurrentSummoner(self):
+    async def getCurrentSummoner(self) -> dict:
         res = await self.__get("/lol-summoner/v1/current-summoner")
         res = await res.json()
 
-        if not "summonerId" in res:
+        if "summonerId" not in res:
             raise ReferenceError()
 
         return res
 
     @retry()
-    async def getInstallFolder(self):
+    async def getInstallFolder(self) -> str:
         res = await self.__get("/data-store/v1/install-dir")
         return await res.json()
 
-    @retry()
-    async def getProfileIcon(self, iconId):
+    async def getProfileIcon(self, iconId) -> str:
         icon = f"./app/resource/game/profile icons/{iconId}.jpg"
 
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getSummonerProfileIconPath(iconId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            # manager 可能在 LCU 刚启动时尚未初始化 (None), 兜底用 LCU 端点直接拉取
+            if self.manager is not None:
+                path = self.manager.getSummonerProfileIconPath(iconId)
+            else:
+                path = f"/lol-game-data/assets/v1/profile-icons/{iconId}.jpg"
+            return await self._downloadAsset(path, icon)
 
         return icon
 
-    @retry()
-    async def getItemIcon(self, iconId):
+    async def getItemIcon(self, iconId) -> str:
         if iconId == 0:
             return "app/resource/images/item-0.png"
 
         icon = f"app/resource/game/item icons/{iconId}.png"
 
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getItemIconPath(iconId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            if self.manager is not None:
+                path = self.manager.getItemIconPath(iconId)
+            else:
+                path = f"/lol-game-data/assets/v1/items/{iconId}.png"
+            return await self._downloadAsset(path, icon)
 
         return icon
 
-    @retry()
-    async def getAugmentIcon(self, augmentId):
+    async def getAugmentIcon(self, augmentId) -> str:
         icon = f"app/resource/game/augment icons/{augmentId}.png"
 
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getAugmentsIconPath(augmentId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            if self.manager is not None:
+                path = self.manager.getAugmentsIconPath(augmentId)
+            else:
+                path = f"/lol-game-data/assets/v1/cherry-augments/{augmentId}/icon.png"
+            return await self._downloadAsset(path, icon)
 
         return icon
 
-    @retry()
-    async def getChampionSplashes(self, skinInfo, isCentered: bool):
+    async def getChampionSplashes(self, skinInfo, isCentered: bool) -> str:
         """
         :param skinInfo:
             {
@@ -525,27 +644,22 @@ class LolClientConnector(QObject):
             url = skinInfo["uncenteredSplashPath"]
 
         if not os.path.exists(image):
-            res = await self.__get(url)
-
-            with open(image, "wb") as f:
-                f.write(await res.read())
+            return await self._downloadAsset(url, image)
 
         return image
 
-    @retry()
-    async def getSummonerSpellIcon(self, spellId):
+    async def getSummonerSpellIcon(self, spellId) -> str:
         icon = f"app/resource/game/summoner spell icons/{spellId}.png"
 
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getSummonerSpellIconPath(spellId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            if self.manager is not None:
+                path = self.manager.getSummonerSpellIconPath(spellId)
+            else:
+                path = f"/lol-game-data/assets/v1/summoner-spells/{spellId}.png"
+            return await self._downloadAsset(path, icon)
 
         return icon
 
-    @retry()
     async def getChampionIcon(self, championId) -> str:
         """
         @param championId:
@@ -558,25 +672,25 @@ class LolClientConnector(QObject):
 
         icon = f"app/resource/game/champion icons/{championId}.png"
 
-        if not os.path.exists(icon) or os.path.getsize(icon) == 0:
-            path = self.manager.getChampionIconPath(championId)
-            res = await self.__get(path)
-
-            with open(icon, "wb") as f:
-                f.write(await res.read())
+        if not os.path.exists(icon):
+            if self.manager is not None:
+                path = self.manager.getChampionIconPath(championId)
+            else:
+                path = f"/lol-game-data/assets/v1/champion-icons/{championId}.png"
+            return await self._downloadAsset(path, icon)
 
         return icon
 
     @retry()
-    async def getSummonerByName(self, name):
+    async def getSummonerByName(self, name) -> dict:
         params = {"name": name}
-        res = await self.__get(f"/lol-summoner/v1/summoners", params)
+        res = await self.__get("/lol-summoner/v1/summoners", params)
         res = await res.json()
 
         return res
 
     @retry()
-    async def getSummonerByPuuid(self, puuid):
+    async def getSummonerByPuuid(self, puuid) -> dict:
         res = await self.__get(f"/lol-summoner/v2/summoners/puuid/{puuid}")
         res = await res.json()
 
@@ -586,7 +700,7 @@ class LolClientConnector(QObject):
         return res
 
     @retry(5, 1)
-    async def getSummonerGamesByPuuidSlowly(self, puuid, begIndex=0, endIndex=4):
+    async def getSummonerGamesByPuuidSlowly(self, puuid, begIndex=0, endIndex=4) -> list:
         """
         Retrieves a list of summoner games by puuid using a slow and retry mechanism.
 
@@ -612,8 +726,53 @@ class LolClientConnector(QObject):
 
         return res["games"]
 
+    async def __fetchGamesViaSGPFallback(self, puuid, begIndex, endIndex):
+        """LCU match-history 不可用或数据明显偏少时的 SGP 兜底 (仅国服).
+
+        返回 LCU 格式容器 {"gameCount": N, "games": [...]}; SGP 不可用、
+        失败或无数据时返回 None, 调用方保持原有行为.
+        """
+        if not self.inTencent:
+            return None
+        if self.sgpToken is None:
+            # SGP token 未就绪 (客户端刚启动, WS entitlement 未到): 直接跳过,
+            # 避免每个 puuid 都白等一次注定失败的 SGP 请求
+            return None
+        try:
+            res = await self.getSummonerGamesByPuuidViaSGP(
+                puuid, begIndex, endIndex)
+            sgpGames = res.get("games") or []
+            # SGP SUMMARY 条目结构 {"json": <LCU 格式对局>, ...}
+            gameList = [g["json"] for g in sgpGames
+                        if isinstance(g, dict) and g.get("json")]
+            if not gameList:
+                # SGP 也无数据 (如游戏刚结束的服务端薄窗口): 保持原有行为.
+                # 记录响应结构, 区分"真无数据"与"响应格式变化/错误体"
+                # (2026-10-24: 此前一律记 no usable games, 服务故障被掩盖)
+                topKeys = (list(res.keys()) if isinstance(res, dict)
+                           else type(res).__name__)
+                entryKeys = (list(sgpGames[0].keys())
+                             if sgpGames and isinstance(sgpGames[0], dict)
+                             else None)
+                logger.warning(
+                    f"SGP games fallback: no usable games for {puuid} "
+                    f"(topKeys={topKeys}, games_len={len(sgpGames)}, "
+                    f"entryKeys={entryKeys})", TAG)
+                return None
+            return {
+                "gameCount": res.get("totalGames") or len(gameList),
+                "games": gameList,
+            }
+        except (aiohttp.ClientError, asyncio.TimeoutError, RateLimited,
+                SummonerGamesNotFound, AssertionError, ReferenceError,
+                AttributeError, TypeError, ValueError, KeyError) as e:
+            logger.warning(
+                f"SGP games fallback failed for {puuid} "
+                f"({type(e).__name__}: {e})", TAG)
+            return None
+
     @retry()
-    async def getSummonerGamesByPuuid(self, puuid, begIndex=0, endIndex=4):
+    async def getSummonerGamesByPuuid(self, puuid, begIndex=0, endIndex=4) -> list:
         """
         Retrieves a list of summoner games by PUUID.
 
@@ -627,26 +786,278 @@ class LolClientConnector(QObject):
 
         Raises:
             SummonerGamesNotFound: If the summoner games are not found.
+
+        Notes:
+            LCU `/lol-match-history/v1/products/lol/{puuid}/matches` 端点在游戏
+            刚结束时可能返回过期的缓存数据 (例如只有 2 条), 需要等待后端刷新.
+            这里在返回条数明显少于请求数 (gameCount >> 实际返回数) 时重试最多
+            3 次, 每次间隔 2 秒.
+
+            LCU 冷启动 (客户端刚启动) 时 match-history 缓存同步可能需要数十秒
+            到数分钟, 快速重试也无济于事. 此时先返回部分数据让 UI 渲染,
+            同时调度后台恢复循环 (见 __recoverStaleMatchHistory), 数据恢复后
+            通过 signalBus.matchHistoryRecovered 广播, 生涯/搜索页自动重刷.
+
+            注意: LCU 返回空但无异常 (gameCount=0) 时直接返回, 不做额外重试.
+            因为 LCU 的 match-history 可能持续为空 (如服务端问题), 在 API 层
+            无限重试会导致与 @retry 装饰器形成嵌套爆炸, 阻塞 UI 转圈.
+
+            LCU 响应无 "games" 字段或数据明显偏少时, 国服 (isInTencent)
+            走 SGP SUMMARY 兜底 (见 __fetchGamesViaSGPFallback), 兜底成功
+            时返回 SGP 数据, 失败时保持原有行为.
         """
-        params = {"begIndex": begIndex, "endIndex": endIndex}
-        res = await self.__get(
-            f"/lol-match-history/v1/products/lol/{puuid}/matches", params
-        )
-        res = await res.json()
+        # 快速缓存命中: Lobby 阶段多个调用方 (战犯诊断/生涯/搜索)
+        # 共享同一份预取结果, 避免重复请求互相阻塞
+        if self._gamesFastCache is not None:
+            c_puuid, c_beg, c_end, c_data, c_ts = self._gamesFastCache
+            if (c_puuid == puuid
+                    and c_beg <= begIndex
+                    and c_end >= endIndex
+                    and time.time() - c_ts < self._gamesCacheTTL):
+                logger.debug(
+                    f"getSummonerGamesByPuuid: fast cache hit for "
+                    f"{puuid} [{begIndex}-{endIndex}] (cached [{c_beg}-{c_end}])",
+                    TAG)
+                return c_data
 
-        if "games" not in res:
-            raise SummonerGamesNotFound()
+        expected = endIndex - begIndex + 1
+        last_exc = None
+        for attempt in range(4):  # 0,1,2,3 共 4 次
+            try:
+                params = {"begIndex": begIndex, "endIndex": endIndex}
+                res = await self.__get(
+                    f"/lol-match-history/v1/products/lol/{puuid}/matches",
+                    params
+                )
+                res = await res.json()
 
-        return res["games"]
+                if "games" not in res:
+                    # LCU 上游 match-history 服务故障时返回
+                    # {"errorCode":"RPC_ERROR","httpStatus":503/500,...},
+                    # 把服务错误详情带进异常与日志, 避免被误当成"无数据"
+                    # (2026-10-24 排查: 腾讯 match-history 后端 503 故障期间
+                    # 日志完全看不出真实原因)
+                    detail = ""
+                    if isinstance(res, dict) and "errorCode" in res:
+                        detail = (f" [{res.get('errorCode')} "
+                                  f"{res.get('httpStatus')}: "
+                                  f"{res.get('message')}]")
+                        logger.warning(
+                            f"getSummonerGamesByPuuid: LCU match-history "
+                            f"service error for {puuid}{detail}", TAG)
+                    raise SummonerGamesNotFound(detail)
+
+                # LCU 响应结构: res["games"] 是容器 dict
+                # {"gameCount": N, "games": [game1, ...], "gameBeginDate": ...}
+                # 注意 gameCount/games 都在 res["games"] 内部, 不在 res 顶层
+                games = res["games"]
+
+                # 防御性: 正常为 dict, 异常时可能为 list
+                if isinstance(games, dict):
+                    gameList = games.get("games") or []
+                    gameCount = games.get("gameCount", len(gameList))
+                elif isinstance(games, list):
+                    gameList = games
+                    gameCount = len(gameList)
+                else:
+                    gameList = []
+                    gameCount = 0
+
+                # 若返回条数充足, 直接返回
+                if len(gameList) >= expected:
+                    self._gamesFastCache = (puuid, begIndex, endIndex,
+                                            games, time.time())
+                    return games
+
+                # LCU 缓存过期: gameCount 远大于实际返回条数, 等待重试
+                # 典型场景: 游戏刚结束, LCU 还没刷新 match-history
+                if attempt < 3 and len(gameList) < expected \
+                        and gameCount > len(gameList) + 2:
+                    logger.warning(
+                        f"getSummonerGamesByPuuid: stale cache detected "
+                        f"(attempt={attempt}, got={len(gameList)}, "
+                        f"gameCount={gameCount}, expected={expected}), "
+                        f"retrying in 2s", TAG)
+                    await asyncio.sleep(2)
+                    continue
+
+                # 空响应或数据不足但无 stale 迹象, 直接返回
+                # 不在此处重试空响应: LCU 可能持续为空, 与 @retry 形成嵌套爆炸
+                #
+                # 数据明显偏少 (LCU 冷启动缓存未同步, 典型表现: 只返回 2 条):
+                # 不做阻塞重试 -- 冷启动同步需数十秒, 快速重试无意义;
+                # 先返回部分数据让 UI 渲染, 同时调度后台恢复,
+                # 恢复成功后经 signalBus.matchHistoryRecovered 通知页面重刷
+                if 0 < len(gameList) < expected \
+                        and (gameCount > len(gameList) or len(gameList) < 5):
+                    # 立即返回部分数据, 不在此处同步等 SGP:
+                    # aa8469d 曾把 SGP 兜底搬进热路径, 导致 LCU 偏少时前台每次
+                    # 多阻塞 ~5s, 生涯/搜索页转圈 (2026-10-13 回归定位).
+                    # 恢复 v1.3.1 行为: 先返回让 UI 渲染, 由后台恢复循环补齐 --
+                    # __recoverStaleMatchHistory 自身会试 SGP (见下方循环)
+                    self.__scheduleStaleRecovery(puuid, begIndex, endIndex)
+
+                if gameList:
+                    self._gamesFastCache = (puuid, begIndex, endIndex,
+                                            games, time.time())
+                return games
+            except SummonerGamesNotFound as e:
+                last_exc = e
+                # LCU match-history 无 "games" 字段 (选人阶段常见) -- 该状态下
+                # LCU 短时间内不会自愈, 原先的 3×2s 同步退避只会拖慢面板,
+                # 且与 SGP 兜底重复. 2026-10-19: 去掉退避, 首次失败即走 SGP 兜底.
+                sgpGames = await self.__fetchGamesViaSGPFallback(
+                    puuid, begIndex, endIndex)
+                if sgpGames is not None:
+                    logger.info(
+                        f"getSummonerGamesByPuuid: LCU has no games for "
+                        f"{puuid}, using SGP fallback "
+                        f"({len(sgpGames['games'])} games)", TAG)
+                    self._gamesFastCache = (puuid, begIndex, endIndex,
+                                            sgpGames, time.time())
+                    return sgpGames
+                # SGP 也无数据: 调度后台恢复循环补齐, 再抛给调用方
+                self.__scheduleStaleRecovery(puuid, begIndex, endIndex)
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_exc = e
+                if attempt < 3:
+                    await asyncio.sleep(2)
+                    continue
+                raise
+
+        if last_exc:
+            raise last_exc
+        return []
+
+    # LCU 冷启动 stale cache 后台恢复参数 (测试可 patch)
+    _STALE_RECOVERY_INTERVAL = 30  # 秒
+    _STALE_RECOVERY_ATTEMPTS = 10  # 最多探测 10 次, 约 5 分钟
+    # 冷启动窗口: 窗口内 LCU 自报的 gameCount 不可信 (真实故障: 返回 2 条
+    # 且 gameCount=2 假自洽, 30 秒后仍如此; 2026-09-06 日志), 恢复循环
+    # 不得据自洽信号提前停止, 只能探测耗尽; 窗口外信任自洽信号
+    _COLD_START_SECONDS = 300      # 5 分钟
+
+    def __scheduleStaleRecovery(self, puuid, begIndex, endIndex):
+        """返回 stale 部分数据后调度后台恢复循环 (同一 puuid 去重)."""
+        existing = self._staleRecoveryTasks.get(puuid)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self.__recoverStaleMatchHistory(puuid, begIndex, endIndex))
+        self._staleRecoveryTasks[puuid] = task
+        logger.info(
+            f"stale match history: background recovery scheduled "
+            f"for {puuid} [{begIndex}-{endIndex}]", TAG)
+
+    async def __recoverStaleMatchHistory(self, puuid, begIndex, endIndex):
+        """LCU 冷启动缓存同步的后台恢复循环.
+
+        每 _STALE_RECOVERY_INTERVAL 秒重查一次 match-history:
+        - 拿到足量数据: 刷新 fast cache, 广播 matchHistoryRecovered (puuid)
+        - gameCount 与返回条数一致且条数 >=5: 账号确实只有少量对局, 提前停止
+          (条数 <5 时 gameCount 可能是假自洽, 继续探测)
+        - LCU 断开 (ReferenceError): 放弃恢复
+        - 探测耗尽: 清除 fast cache 中的残缺数据, 便于下次调用重新调度
+        """
+        expected = endIndex - begIndex + 1
+        try:
+            for attempt in range(self._STALE_RECOVERY_ATTEMPTS):
+                await asyncio.sleep(self._STALE_RECOVERY_INTERVAL)
+                try:
+                    params = {"begIndex": begIndex, "endIndex": endIndex}
+                    res = await self.__get(
+                        f"/lol-match-history/v1/products/lol/{puuid}/matches",
+                        params)
+                    res = await res.json()
+                except ReferenceError:
+                    # LCU 已断开, 放弃恢复
+                    return
+                except Exception as e:
+                    logger.debug(
+                        f"stale recovery probe {attempt} failed: {e}", TAG)
+                    continue
+
+                games = res.get("games") if isinstance(res, dict) else None
+                if isinstance(games, dict):
+                    gameList = games.get("games") or []
+                    gameCount = games.get("gameCount", len(gameList))
+                elif isinstance(games, list):
+                    gameList = games
+                    gameCount = len(gameList)
+                else:
+                    gameList = []
+                    gameCount = 0
+
+                if not gameList:
+                    # LCU 仍无 "games" (与加载失败同源): 国服用 SGP 兜底探测
+                    sgpGames = await self.__fetchGamesViaSGPFallback(
+                        puuid, begIndex, endIndex)
+                    if sgpGames is None:
+                        continue
+                    games = sgpGames
+                    gameList = sgpGames["games"]
+                    gameCount = sgpGames.get("gameCount", len(gameList))
+
+                if len(gameList) >= expected:
+                    self._gamesFastCache = (puuid, begIndex, endIndex,
+                                            games, time.time())
+                    logger.info(
+                        f"match history recovered: {puuid} "
+                        f"got={len(gameList)}/{expected}", TAG)
+                    signalBus.matchHistoryRecovered.emit(puuid)
+                    return
+
+                # gameCount 与条数一致: LCU 自报自洽, 两种可能:
+                # a) 账号确实只有这么多对局 -> 停止
+                # b) 冷启动缓存未同步, gameCount 本身是假的 ->
+                #    窗口内不可信, 继续探测
+                # 条数极少 (<5) 时 gameCount 同样不可信 (2026-10-11 真实
+                # 故障: 只返回 2 条且 gameCount=2, 冷启动窗口外仍假自洽),
+                # 只有条数达到 5 才认可自洽信号
+                if gameCount <= len(gameList):
+                    in_cold_start = (
+                        time.time() - self._lcuStartedAt
+                        < self._COLD_START_SECONDS)
+                    if not in_cold_start and len(gameList) >= 5:
+                        logger.debug(
+                            f"stale recovery stop: {puuid} has only "
+                            f"{gameCount} games", TAG)
+                        return
+                    # 冷启动窗口内或假自洽: LCU 缓存可能仍未同步, 继续探测
+                    continue
+
+            logger.warning(
+                f"stale recovery gave up: {puuid} still incomplete after "
+                f"{self._STALE_RECOVERY_ATTEMPTS} probes", TAG)
+            # 清掉 fast cache 中的残缺数据, 下次调用重新拉取并重新调度恢复
+            cached = self._gamesFastCache
+            if cached is not None and cached[0] == puuid:
+                self._gamesFastCache = None
+        except CancelledError:
+            # close() 主动取消, 静默退出
+            pass
+        finally:
+            self._staleRecoveryTasks.pop(puuid, None)
 
     @retry()
-    async def getGameDetailByGameId(self, gameId):
+    async def getGameDetailByGameId(self, gameId) -> dict:
         res = await self.__get(f"/lol-match-history/v1/games/{gameId}")
 
         return await res.json()
 
+    async def getGameDetailCached(self, gameId) -> Optional[dict]:
+        """Get game detail from SQLite cache (offline fallback)."""
+        return await asyncio.get_running_loop().run_in_executor(
+            None, sqlite_cache.get_game_detail, gameId)
+
+    async def getSummonerGamesCached(self, puuid: str, limit: int = 20, offset: int = 0) -> Optional[list]:
+        """Get parsed GameSummary list from SQLite cache (offline fallback)."""
+        return await asyncio.get_running_loop().run_in_executor(
+            None, sqlite_cache.get_games, puuid, limit, offset)
+
     @retry()
-    async def getRankedStatsByPuuid(self, puuid):
+    async def getRankedStatsByPuuid(self, puuid) -> dict:
         res = await self.__get(f"/lol-ranked/v1/ranked-stats/{puuid}")
 
         res = await res.json()
@@ -657,7 +1068,7 @@ class LolClientConnector(QObject):
         return res
 
     @retry()
-    async def setProfileBackground(self, skinId):
+    async def setProfileBackground(self, skinId) -> dict:
         data = {
             "key": "backgroundSkinId",
             "value": skinId,
@@ -670,7 +1081,7 @@ class LolClientConnector(QObject):
         return await res.json()
 
     @retry()
-    async def setProfileBackgroundAugments(self, contentId):
+    async def setProfileBackgroundAugments(self, contentId) -> dict:
         data = {
             'key': 'backgroundSkinAugments',
             'value': contentId
@@ -683,14 +1094,14 @@ class LolClientConnector(QObject):
         return await res.json()
 
     @retry()
-    async def setOnlineStatus(self, message):
+    async def setOnlineStatus(self, message) -> dict:
         data = {"statusMessage": message}
         res = await self.__put("/lol-chat/v1/me", data=data)
 
         return await res.json()
 
     @retry()
-    async def setTierShowed(self, queue, tier, division):
+    async def setTierShowed(self, queue, tier, division) -> dict:
         data = {
             "lol": {
                 "rankedLeagueQueue": queue,
@@ -704,11 +1115,11 @@ class LolClientConnector(QObject):
         return await res.json()
 
     @retry()
-    async def reconnect(self):
+    async def reconnect(self) -> aiohttp.ClientResponse:
         return await self.__post("/lol-gameflow/v1/reconnect")
 
     @retry()
-    async def removeTokens(self):
+    async def removeTokens(self) -> bytes:
         reference = await self.__get("/lol-chat/v1/me")
         reference = await reference.json()
 
@@ -726,27 +1137,7 @@ class LolClientConnector(QObject):
         return await res.read()
 
     @retry()
-    async def setProfileIcon(self, iconId):
-        data = {"profileIconId": iconId}
-        url = "/lol-summoner/v1/current-summoner/icon"
-
-        res = await self.__put(url, data)
-        return await res.json()
-
-    @retry()
-    async def getChatMe(self):
-        res = await self.__get("/lol-chat/v1/me")
-        return await res.json()
-
-    @retry()
-    async def getCurrentSummonerProfile(self):
-        url = "/lol-summoner/v1/current-summoner/summoner-profile"
-
-        res = await self.__get(url)
-        return await res.json()
-
-    @retry()
-    async def removePrestigeCrest(self):
+    async def removePrestigeCrest(self) -> dict:
         ref = await self.__get('/lol-regalia/v2/current-summoner/regalia')
         ref = await ref.json()
         bannerType = ref.get("preferredBannerType")
@@ -761,7 +1152,7 @@ class LolClientConnector(QObject):
         return await res.json()
 
     @retry()
-    async def create5v5PracticeLobby(self, lobbyName, password):
+    async def create5v5PracticeLobby(self, lobbyName, password) -> dict:
         data = {
             "customGameLobby": {
                 "configuration": {
@@ -782,67 +1173,147 @@ class LolClientConnector(QObject):
         return await res.json()
 
     @retry()
-    async def setOnlineAvailability(self, availability):
+    async def setOnlineAvailability(self, availability) -> aiohttp.ClientResponse:
         data = {"availability": availability}
 
         res = await self.__put("/lol-chat/v1/me", data=data)
         return res
 
     @retry()
-    async def acceptMatchMaking(self):
+    async def acceptMatchMaking(self) -> aiohttp.ClientResponse:
         res = await self.__post("/lol-matchmaking/v1/ready-check/accept")
         return res
 
     @retry()
-    async def getGameflowSession(self):
-        # FIXME
-        # 若刚进行完一场对局, 随后开启一盘自定义, 玩家在红色方且蓝色方没人时,
-        # 该接口会返回上一局中蓝色方的队员信息 (teamOne or teamTwo)
+    async def declineMatchMaking(self) -> aiohttp.ClientResponse:
+        res = await self.__post("/lol-matchmaking/v1/ready-check/decline")
+        return res
+
+    async def getLobbyStatus(self) -> Optional[dict]:
+        try:
+            res = await self.__get("/lol-lobby/v2/lobby")
+            return await res.json()
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError) as e:
+            logger.debug(f"getLobbyStatus failed: {e}", TAG)
+            return None
+
+    async def getMatchmakingStatus(self) -> Optional[dict]:
+        """获取匹配状态, 兼容 teambuilder (aram/aram_mayhem/arena) 队列.
+
+        teambuilder 队列的状态在 /lol-lobby-team-builder/v1/matchmaking 下,
+        普通队列在 /lol-matchmaking/v1/search 下. 这里优先查 teambuilder,
+        失败再回退到 /lol-matchmaking/v1/search.
+        """
+        try:
+            res = await self.__get("/lol-lobby-team-builder/v1/matchmaking")
+            if res.status == 200:
+                return await res.json()
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError) as e:
+            logger.debug(f"matchmaking tb status failed: {e}", TAG)
+        try:
+            res = await self.__get("/lol-matchmaking/v1/search")
+            if res.status == 200:
+                return await res.json()
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError) as e:
+            logger.debug(f"matchmaking status failed: {e}", TAG)
+            return None
+        return None
+
+    async def startMatchmaking(self) -> bool:
+        """开始匹配, 兼容 teambuilder 队列.
+
+        对于 teambuilder 队列 (aram/aram_mayhem/arena 等), POST /lol-matchmaking/v1/search
+        会返回 500 错误 (Invalid function), 正确端点是 POST /lol-lobby/v2/lobby/matchmaking/search.
+        实际成功与否以 GET matchmaking 状态为准.
+        """
+        try:
+            res = await self.__post("/lol-lobby/v2/lobby/matchmaking/search", data={})
+            status = res.status
+            if status in (200, 204):
+                return True
+            # 500/其他状态码: 可能是端点不对, 尝试老端点
+        except Exception as e:
+            logger.warning(f"startMatchmaking tb endpoint failed: {e}", TAG)
+
+        try:
+            res = await self.__post("/lol-matchmaking/v1/search", data={})
+            status = res.status
+            if status in (200, 204):
+                return True
+        except Exception as e:
+            logger.warning(f"startMatchmaking failed: {e}", TAG)
+
+        # 即使两个端点都返回非 200/204, 也查询状态确认是否实际进入队列
+        # (国服 teambuilder 队列即使返回 500 也可能已实际开始匹配)
+        try:
+            mm = await self.getMatchmakingStatus()
+            if mm and mm.get('isCurrentlyInQueue') is True:
+                return True
+            if mm and mm.get('searchState') in ('Searching', 'Found', 'Accepted'):
+                return True
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError, KeyError) as e:
+            logger.debug(f"startMatchmaking verify status failed: {e}", TAG)
+        return False
+
+    async def isLobbyReadyToSearch(self) -> bool:
+        lobby = await self.getLobbyStatus()
+        if not lobby:
+            return False
+        can_start = lobby.get('canStartActivity')
+        if can_start is not None:
+            return can_start
+        queue_id = lobby.get('gameConfig', {}).get('queueId')
+        return queue_id is not None
+
+    @retry()
+    async def getGameflowSession(self) -> dict:
+        # NOTE: 该接口在自定义模式下可能返回上一局的 teamOne/teamTwo 脏数据,
+        #       tools.py:parseGameInfoByGameflowSession 中已做去重校验处理
         res = await self.__get("/lol-gameflow/v1/session")
         return await res.json()
 
     @retry()
-    async def getChampSelectSession(self):
+    async def getChampSelectSession(self) -> dict:
         res = await self.__get("/lol-champ-select/v1/session")
-        return await res.json()
-
-    @retry()
-    async def getGameQueues(self):
-        res = await self.__get("/lol-game-queues/v1/queues")
         return await res.json()
 
     # 同意交换英雄
     @retry()
-    async def acceptTrade(self, id):
+    async def acceptTrade(self, id) -> None:
         await self.__post(f"/lol-champ-select/v1/session/trades/{id}/accept")
         await self.__post(f"/lol-champ-select/v1/ongoing-trade/{id}/clear")
 
     # 同意交换楼层
     @retry()
-    async def acceptSwap(self, id):
+    async def acceptSwap(self, id) -> None:
         await self.__post(f"/lol-champ-select/v1/session/swaps/{id}/accept")
         await self.__post(f"/lol-champ-select/v1/ongoing-swap/{id}/clear")
 
-    # 备战席交换
-    async def benchSwap(self, championId):
-        res = await self.__post(f"/lol-champ-select/v1/session/bench/swap/{championId}")
-        return await res.json()
+    # 备战席交换 (大乱斗/海克斯大乱斗抢英雄)
+    async def benchSwap(self, championId) -> bool:
+        """POST bench/swap/{id}, 以 HTTP 状态判定是否换成功.
 
-    # 获取当前选择英雄
-    @retry()
-    async def getCurrentChampion(self):
-        res = await self.__get("/lol-champ-select/v1/current-champion")
-        return await res.json()
-
-    # 摇骰子
-    @retry()
-    async def reroll(self):
-        res = await self.__post("/lol-champ-select/v1/session/my-selection/reroll")
-        return await res.json()
+        不能沿用 @retry + res.json(): 目标被队友抢先拿走时 LCU 返回 4xx/5xx,
+        但并不抛异常, 旧实现会把它当成功 (抢人窗口显示"已换", 愿望单自动抢
+        也就此停手). 失败是抢人竞态的正常结果, 同样不能走 @retry 的
+        "弹错误提示"路径, 因此这里只返回 bool, 由调用方决定是否重试.
+        """
+        res = await self.__post(
+            f"/lol-champ-select/v1/session/bench/swap/{championId}")
+        if 200 <= res.status < 300:
+            return True
+        try:
+            body = (await res.text())[:200]
+        except Exception:
+            body = ""
+        logger.debug(
+            f"benchSwap {championId} rejected: status={res.status} body={body}",
+            TAG)
+        return False
 
     # 选择英雄
     @retry()
-    async def selectChampion(self, actionsId, championId, completed=None):
+    async def selectChampion(self, actionsId, championId, completed=None) -> bytes:
         data = {
             "championId": championId,
             'type': 'pick',
@@ -858,7 +1329,7 @@ class LolClientConnector(QObject):
 
     # 禁用英雄
     @retry()
-    async def banChampion(self, actionsId, championId, completed=None):
+    async def banChampion(self, actionsId, championId, completed=None) -> bytes:
         data = {
             "championId": championId,
             'type': 'ban',
@@ -872,72 +1343,39 @@ class LolClientConnector(QObject):
 
         return await res.read()
 
-    # 获取皮肤轮盘
     @retry()
-    async def getSkinCarousel(self):
-        # res = await self.__get("/lol-champ-select/v1/pickable-skin-ids") //这个是所有可用的皮肤，不是自己可用的皮肤--!
-        res = await self.__get("/lol-champ-select/v1/skin-carousel-skins")
-        return await res.json()
-
-    # 选皮肤、召唤师技能
-    @retry()
-    async def selectConfig(self, skinId, spell1Id=None, spell2Id=None, wardSkinId=None):
-        data = {
-            "selectedSkinId": skinId
-        }
-
-        # 4-点燃 12-闪现 14-传送 **推测未验证**
-        if spell1Id:
-            data["spell1Id"] = spell1Id
-        if spell2Id:
-            data["spell2Id"] = spell2Id
-        if wardSkinId:
-            # 不知道是什么，默认-1
-            data["wardSkinId"] = wardSkinId
-
-        res = await self.__patch("/lol-champ-select/v1/session/my-selection", data)
-        return await res.json()
-
-    @retry()
-    async def getFriends(self):
-        """
-        获取好友列表
-        """
-        res = await self.__get("/lol-chat/v1/friends")
-        return await res.json()
-
-    async def getSummonerById(self, summonerId):
+    async def getSummonerById(self, summonerId) -> dict:
         res = await self.__get(f"/lol-summoner/v1/summoners/{summonerId}")
 
         return await res.json()
 
     # @retry()
-    async def getGameStatus(self):
+    async def getGameStatus(self) -> str:
         res = await self.__get("/lol-gameflow/v1/gameflow-phase")
         res = await res.text()
 
         return res[1:-1]
 
     @retry()
-    async def getMapSide(self):
+    async def getMapSide(self) -> str:
         res = await self.__get("/lol-champ-select/v1/pin-drop-notification")
         res = await res.json()
 
         return res.get("mapSide", "")
 
     @retry()
-    async def getReadyCheckStatus(self):
+    async def getReadyCheckStatus(self) -> dict:
         res = await self.__get("/lol-matchmaking/v1/ready-check")
 
         return await res.json()
 
-    async def getCurrentRunePage(self):
+    async def getCurrentRunePage(self) -> dict:
         res = await self.__get("/lol-perks/v1/currentpage")
 
         return await res.json()
 
     @retry()
-    async def deleteCurrentRunePage(self):
+    async def deleteCurrentRunePage(self) -> None:
         try:
             page = await self.getCurrentRunePage()
 
@@ -954,66 +1392,25 @@ class LolClientConnector(QObject):
                 f"deleteCurrentRunePage error {stack = }, {e =}", TAG)
 
     @retry()
-    async def createRunePage(self, name, primaryId):
+    async def createRunePage(self, name, primaryId, secondaryId, perks) -> None:
         body = {
-            "name": name,
-            "primaryStyleId": primaryId,
-            "isEditable": True,
-            "current": True,
-        }
-
-        res = await self.__post("/lol-perks/v1/pages", data=body)
-        return await res.json()
-
-    @retry()
-    async def putRunePage(self, id, name, primaryId, secondaryId, perks):
-        body = {
-            "id": id,
-            "isRecommendationOverride": False,
-            "isTemporary": False,
             "name": name,
             "primaryStyleId": primaryId,
             "subStyleId": secondaryId,
             "selectedPerkIds": perks,
-            "current": True,
+            "current": True
         }
 
-        res = await self.__put(f"/lol-perks/v1/pages/{id}", data=body)
+        res = await self.__post("/lol-perks/v1/pages", data=body)
         res = await res.json()
 
     @retry()
-    async def getRuneInventory(self):
-        res = await self.__get("/lol-perks/v1/inventory")
-        return await res.json()
-
-    @retry()
-    async def getRunePages(self):
-        res = await self.__get('/lol-perks/v1/pages')
-        return await res.json()
-
-    @retry()
-    async def setSummonerSpells(self, spell1Id, spell2Id):
+    async def setSummonerSpells(self, spell1Id, spell2Id) -> aiohttp.ClientResponse:
         data = {'spell1Id': spell1Id, 'spell2Id': spell2Id}
 
         return await self.__patch("/lol-champ-select/v1/session/my-selection", data)
 
-    @retry()
-    async def getConversation(self):
-        res = await self.__get("/lol-chat/v1/conversations")
-        return await res.json()
-
-    @retry()
-    async def sendConversationNotify(self, id, message):
-        body = {
-            "body": message,
-            "id": id,
-            "type": "celebration"
-        }
-
-        res = await self.__post(f"/lol-chat/v1/conversations/{id}/messages", data=body)
-        return await res.json()
-
-    async def spectate(self, summonerName):
+    async def spectate(self, summonerName) -> bytes:
         info = await self.getSummonerByName(summonerName)
         puuid = info.get('puuid')
 
@@ -1028,7 +1425,7 @@ class LolClientConnector(QObject):
         }
 
         res = await self.__post(
-            f"/lol-spectator/v1/spectate/launch", data=data)
+            "/lol-spectator/v1/spectate/launch", data=data)
 
         res = await res.read()
 
@@ -1037,7 +1434,7 @@ class LolClientConnector(QObject):
 
         return res
 
-    async def spectateDirectly(self, summonerName):
+    async def spectateDirectly(self, summonerName) -> None:
         """
         用命令行唤起客户端，无需等待
         """
@@ -1065,95 +1462,238 @@ class LolClientConnector(QObject):
         subprocess.Popen(['League of Legends.exe', f'{params}'])
         os.chdir(pwd)
 
-    async def dodge(self):
-        data = {
-            "destination": 'lcdsServiceProxy',
-            "method": 'call',
-            "args": '["", "teambuilder-draft", "quitV2", ""]'
-        }
-
-        res = await self.__post("/lol-login/v1/session/invoke", data=data)
-
-        return await res.json()
-
-    async def getConversations(self):
-        res = await self.__get("/lol-chat/v1/conversations")
-
-        return await res.json()
-
-    async def getHelp(self):
-        res = await self.__get("/help")
-
-        return await res.json()
-
     @retry()
-    async def sendFriendRequest(self, name):
-        summoner = self.getSummonerByName(name)
-        summonerId = summoner['summonerId']
-
-        data = {
-            "name": name,
-        }
-
-        res = await self.__post('/lol-chat/v1/friend-requests', data=data)
-
-    @retry()
-    def sendNotificationMsg(self, title, content):
-        data = {
-            "critical": True,
-            "data": {
-                "details": content,
-                "title": title,
-            },
-            "detailKey": 'pre_translated_details',
-            "dismissible": True,
-            "id": 0,
-            "state": 'toast',
-            "titleKey": 'pre_translated_title',
-            "type": 'ranked_summary',
-        }
-
-        res = self.__post(
-            "/player-notifications/v1/notifications", data=data).json()
-
-        return res
-
-    @retry()
-    async def playAgain(self):
+    async def playAgain(self) -> bytes:
         res = await self.__post("/lol-lobby/v2/play-again")
 
         return await res.read()
 
+    async def tryPlayAgain(self) -> bool:
+        """POST play-again, 以 HTTP 状态判定是否被接受 (不走 @retry).
+
+        队友还没点"再来一局"/房间尚未就绪时 LCU 会返回 4xx/5xx 而不抛异常,
+        playAgain() 会把它当成功; 自动再来一局需要据此轮询重试.
+        """
+        res = await self.__post("/lol-lobby/v2/play-again")
+        if 200 <= res.status < 300:
+            return True
+        try:
+            body = (await res.text())[:200]
+        except Exception:
+            body = ""
+        logger.debug(f"play-again rejected: status={res.status} body={body}", TAG)
+        return False
+
+    async def dodge(self) -> bool:
+        """秒退英雄选择 (ChampSelect 阶段).
+
+        走 LCDS 服务代理 — 与客户端原生"退出对局"按钮同款调用:
+            POST /lol-login/v1/session/invoke
+                ?destination=lcdsServiceProxy&method=call
+                &args=["", "teambuilder-draft", "quitV2", ""]
+        参考 Sona lcu.dodgeChampSelectViaQuitV2() 与 LeagueAkari login.dodge().
+        此前两种实现实测均不生效: DELETE /lol-lobby/v2/lobby 仅 Lobby 阶段可用;
+        POST /lol-gameflow/v1/session/dodge 恒返回 204 但 phase 不动.
+        以 gameflow 离开 ChampSelect 作为成功判据, 避免误报"已秒退".
+        """
+        tag = "Dodge"
+        args = ['', 'teambuilder-draft', 'quitV2', '']
+        query = urlencode({
+            'destination': 'lcdsServiceProxy',
+            'method': 'call',
+            'args': json.dumps(args),
+        })
+        path = f"/lol-login/v1/session/invoke?{query}"
+        for attempt in range(1, 6):
+            try:
+                res = await self.__post(path, {'data': args})
+                logger.info(
+                    f"dodge: invoke quitV2 status={res.status} attempt={attempt}",
+                    tag)
+                if res.status >= 400:
+                    # 失败时 body 里有 errorCode/message, 是判断端点是否被
+                    # 客户端版本改动的唯一线索
+                    logger.warning(
+                        f"dodge: quitV2 rejected: {(await res.text())[:200]}",
+                        tag)
+            except Exception as e:
+                logger.warning(f"dodge: invoke quitV2 failed: {e}", tag)
+            # 秒退生效后 gameflow 会离开 ChampSelect, 每隔 0.25s 探一次
+            for _ in range(4):
+                await asyncio.sleep(0.25)
+                try:
+                    if await self.getGameStatus() != "ChampSelect":
+                        logger.info(
+                            f"dodge: phase left ChampSelect at attempt={attempt}",
+                            tag)
+                        return True
+                except Exception as e:
+                    logger.warning(f"dodge: get phase failed: {e}", tag)
+
+        # 兜底: Sona 正式版 (champselect-quit-button) 使用的 DELETE lobby.
+        # quitV2 在当前客户端版本不生效时, 至少还有这一条已在 Sona 上线的路径.
+        try:
+            res = await self.__delete("/lol-lobby/v2/lobby")
+            logger.info(f"dodge: fallback DELETE lobby status={res.status}", tag)
+        except Exception as e:
+            logger.warning(f"dodge: fallback DELETE lobby failed: {e}", tag)
+        for _ in range(4):
+            await asyncio.sleep(0.25)
+            try:
+                if await self.getGameStatus() != "ChampSelect":
+                    logger.info("dodge: phase left ChampSelect via fallback", tag)
+                    return True
+            except Exception as e:
+                logger.warning(f"dodge: get phase failed: {e}", tag)
+
+        logger.warning("dodge: phase still ChampSelect after retries", tag)
+        return False
+
+    async def sendChampSelectMessage(self, message: str) -> bool:
+        """向 BP 聊天窗发送一条消息.
+
+        选人聊天的 conversation id 并非固定 'champ-select', 需先
+        GET /lol-chat/v1/conversations 找到 type=='championSelect' 的那条,
+        取其真实 id 再 POST — 硬编码 id 在多数客户端版本下找不到对话会失败.
+
+        失败返回 False (记 warning, 不弹窗) — 播报属锦上添花,
+        不能因它打断正常流程.
+        """
+        try:
+            convs_res = await self.__get("/lol-chat/v1/conversations")
+            if convs_res.status != 200:
+                logger.warning(
+                    f"sendChampSelectMessage: conversations {convs_res.status}", TAG)
+                return False
+            convs = await convs_res.json()
+            # 诊断: 实机打印对话列表, 定位 `championSelect` 对话是否真是
+            # 用户所视的 BP 聊天框. 取证后按需移除.
+            if isinstance(convs, list):
+                for c in convs:
+                    if isinstance(c, dict):
+                        logger.warning(
+                            "sendChampSelectMessage: conv "
+                            f"id={c.get('id')} type={c.get('type')} "
+                            f"name={c.get('name')}", TAG)
+            conv_id = next(
+                (str(c.get("id")) for c in (convs or [])
+                 if str(c.get("type", "")).lower() == "championselect"),
+                None)
+            if not conv_id:
+                logger.warning(
+                    "sendChampSelectMessage: no championSelect conversation", TAG)
+                return False
+            logger.warning(
+                f"sendChampSelectMessage: found conv_id={conv_id}", TAG)
+
+            res = await self.__post(
+                f"/lol-chat/v1/conversations/{conv_id}/messages",
+                data={"type": "chat", "body": message})
+            if res.status in (200, 201):
+                logger.info("sendChampSelectMessage: posted", TAG)
+                return True
+            body = await res.text()
+            logger.warning(
+                f"sendChampSelectMessage: {res.status} {body}", TAG)
+            return False
+        except Exception as e:
+            logger.warning(f"sendChampSelectMessage failed: {e}", TAG)
+            return False
+
+    async def getFriends(self) -> list:
+        """获取好友列表, 用于 auto honor 识别可点赞好友.
+
+        返回 list[dict], 每个 dict 含 puuid/summonerId/name 等字段.
+        失败返回空列表.
+        """
+        try:
+            res = await self.__get("/lol-chat/v1/friends")
+            if res.status != 200:
+                return []
+            data = await res.json()
+            return data if isinstance(data, list) else []
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError) as e:
+            logger.debug(f"getFriends failed: {e}", TAG)
+            return []
+
+    async def getEogStats(self) -> Optional[dict]:
+        """获取本局 EndOfGame 点赞候选 (ballot).
+
+        正确端点为 /lol-honor-v2/v1/ballot (GET), 返回:
+        {gameId, eligibleAllies: [...], eligibleOpponents: [...],
+         honoredPlayers: [...], votePool: {...}}.
+        eligibleAllies[] 元素含 puuid/summonerId/summonerName/championId 等.
+        失败 (非 200 / 网络异常 / 解析错误) 返回 None.
+        """
+        try:
+            res = await self.__get("/lol-honor-v2/v1/ballot")
+            if res.status != 200:
+                logger.warning(
+                    f"getEogStats HTTP {res.status}", TAG)
+                return None
+            data = await res.json()
+            if isinstance(data, dict):
+                allies = data.get('eligibleAllies')
+                opponents = data.get('eligibleOpponents')
+                honored = data.get('honoredPlayers')
+                gameId = data.get('gameId')
+                logger.debug(
+                    f"getEogStats ballot: gameId={gameId} "
+                    f"eligibleAllies={len(allies) if isinstance(allies, list) else 'N/A'} "
+                    f"eligibleOpponents={len(opponents) if isinstance(opponents, list) else 'N/A'} "
+                    f"honoredPlayers={len(honored) if isinstance(honored, list) else 'N/A'}",
+                    TAG)
+                if isinstance(allies, list) and allies:
+                    first = allies[0]
+                    if isinstance(first, dict):
+                        logger.debug(
+                            f"getEogStats eligibleAllies[0] keys: "
+                            f"{list(first.keys())}", TAG)
+                if isinstance(allies, list) and not allies:
+                    # eligibleAllies 为空, 打印完整 ballot 用于诊断
+                    # (可能是 ARAM Mayhem 等模式 ballot 时序问题)
+                    logger.debug(
+                        f"getEogStats: eligibleAllies empty, "
+                        f"full ballot={str(data)[:500]}", TAG)
+            return data
+        except (aiohttp.ClientError, json.JSONDecodeError, AttributeError) as e:
+            logger.warning(f"getEogStats failed: {e}", TAG)
+            return None
+
+    async def submitHonor(self, recipientPuuid: str,
+                          honorCategory: str = "HEART",
+                          summonerId: int = None,
+                          gameId: int = None) -> bool:
+        """提交本局队友点赞 (参考 sona/lol-bot 实现).
+
+        ponytail: verified working — 纯 v2 端点 + res.ok 判断
+        使用 POST /lol-honor-v2/v1/honor-player 端点.
+        v2 body: {puuid, summonerId, gameId, honorCategory}
+        """
+        try:
+            puuid = str(recipientPuuid)
+            data = {
+                "puuid": puuid,
+                "summonerId": summonerId,
+                "gameId": gameId,
+                "honorCategory": honorCategory,
+            }
+            res = await self.__post(
+                "/lol-honor-v2/v1/honor-player", data=data)
+            return res.ok
+        except (aiohttp.ClientError, AttributeError, ValueError,
+                TypeError) as e:
+            logger.warning(f"submitHonor failed: {e}", TAG)
+            return False
+
     @retry()
-    async def getClientZoom(self):
+    async def getClientZoom(self) -> int:
         res = await self.__get("/riotclient/zoom-scale")
 
         return await res.json()
 
     @retry()
-    async def getFriends(self):
-        res = await self.__get("/lol-chat/v1/friends")
-
-        return await res.json()
-
-    async def getGameReplay(self, gameId):
-        data = {"componentType": "replay-button_match-history", "gameId": gameId}
-        res = await self.__post(f"/lol-replays/v1/rofls/{gameId}/download", data=data)
-
-        return res
-
-    async def getReplayMetadata(self, gameId):
-        res = await self.__get(f"/lol-replays/v1/metadata/{gameId}")
-
-        return await res.json()
-
-    async def getReplayPath(self):
-        res = await self.__get("/lol-replays/v1/rofls/path")
-
-        return await res.json()
-
-    @retry()
-    async def getSGPtoken(self):
+    async def getSGPtoken(self) -> str:
         res = await self.__json_retry_get("/entitlements/v1/token")
 
         if 'accessToken' not in res:
@@ -1161,12 +1701,12 @@ class LolClientConnector(QObject):
 
         return res['accessToken']
 
-    async def restartClient(self):
+    async def restartClient(self) -> aiohttp.ClientResponse:
         res = await self.__post("/riotclient/kill-and-restart-ux")
 
         return res
 
-    async def getSummonerGamesByPuuidViaSGP(self, puuid, begIdx, endIdx):
+    async def getSummonerGamesByPuuidViaSGP(self, puuid, begIdx, endIdx) -> dict:
         logger.debug(
             f"getSummonerGamesByPuuidViaSGP called, {puuid = }", TAG)
 
@@ -1179,7 +1719,7 @@ class LolClientConnector(QObject):
         res = await self.__sgp__get(url, params)
         return await res.json()
 
-    async def getSummonerGamingInfoByPuuidViaSgp(self, puuid):
+    async def getSummonerGamingInfoByPuuidViaSgp(self, puuid) -> dict:
         logger.debug(
             f"getSummonerGamingInfoByPuuidViaSgp called, {puuid = }", TAG)
 
@@ -1187,7 +1727,7 @@ class LolClientConnector(QObject):
         res = await self.__sgp__get(url)
         return await res.json()
 
-    async def getRankedStatsByPuuidViaSGP(self, puuid):
+    async def getRankedStatsByPuuidViaSGP(self, puuid) -> dict:
         logger.debug(
             f"getRankedStatsByPuuidViaSGP called, {puuid = }", TAG)
 
@@ -1200,7 +1740,7 @@ class LolClientConnector(QObject):
 
         return res
 
-    async def getSummonerByPuuidViaSGP(self, puuid):
+    async def getSummonerByPuuidViaSGP(self, puuid) -> dict:
         """
         该接口的返回值与 `self.getSummonerByPuuid()` 相比，拿不到召唤师的 `tagLine`
         即数字编号信息
@@ -1213,48 +1753,135 @@ class LolClientConnector(QObject):
         res = await self.__sgp__get(url)
         return await res.json()
 
-    def isInTencent(self):
+    async def getGameTimelineViaSgpQuietly(self, gameId) -> Optional[dict]:
+        """Fetch a finished game's detail timeline without surfacing failures.
+
+        LCU match-detail responses do not include timeline events. Tencent's
+        SGP DETAILS endpoint does, so the analysis page uses it lazily only
+        after the user opens the timeline tab.
+        """
+        if not gameId or not self.inTencent or self.sgpSess is None \
+                or not self.server:
+            return None
+        try:
+            url = (
+                "/match-history-query/v1/products/lol/"
+                f"{self.server.upper()}_{gameId}/DETAILS"
+            )
+            res = await self.__sgp__get(url)
+            payload = await res.json()
+            data = payload.get('json') if isinstance(payload, dict) else None
+            if not isinstance(data, dict):
+                data = payload
+            return data if isinstance(data, dict) and data.get('frames') else None
+        except (aiohttp.ClientError, AttributeError, ValueError, TypeError) as e:
+            logger.info(f"SGP timeline unavailable for {gameId}: {e}", TAG)
+            return None
+
+    def isInTencent(self) -> bool:
         return self.inTencent
 
     @needLcu()
-    async def __get(self, path, params=None):
-        return await self.lcuSess.get(path, params=params, ssl=False)
+    async def __get(self, path, params=None) -> aiohttp.ClientResponse:
+        async with _concurrency_limit():
+            res = await self.lcuSess.get(path, params=params, ssl=False)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        return res
 
     @needLcu()
-    async def __post(self, path, data=None):
+    async def __post(self, path, data=None) -> aiohttp.ClientResponse:
         headers = {"Content-type": "application/json"}
-        return await self.lcuSess.post(path, json=data, headers=headers, ssl=False)
+        async with _concurrency_limit():
+            res = await self.lcuSess.post(path, json=data, headers=headers, ssl=False)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        return res
 
     @needLcu()
-    async def __put(self, path, data=None):
-        return await self.lcuSess.put(path, json=data, ssl=False)
+    async def __put(self, path, data=None) -> aiohttp.ClientResponse:
+        async with _concurrency_limit():
+            res = await self.lcuSess.put(path, json=data, ssl=False)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        return res
 
     @needLcu()
-    async def __delete(self, path):
-        return await self.lcuSess.delete(path, ssl=False)
+    async def __delete(self, path) -> aiohttp.ClientResponse:
+        async with _concurrency_limit():
+            res = await self.lcuSess.delete(path, ssl=False)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        return res
 
     @needLcu()
-    async def __patch(self, path, data=None):
-        return await self.lcuSess.patch(path, json=data, ssl=False)
+    async def __patch(self, path, data=None) -> aiohttp.ClientResponse:
+        async with _concurrency_limit():
+            res = await self.lcuSess.patch(path, json=data, ssl=False)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        return res
 
-    async def __sgp__get(self, path, params=None):
+    async def __sgp__get(self, path, params=None) -> aiohttp.ClientResponse:
         assert self.inTencent
 
         headers = {
             "Authorization": f"Bearer {self.sgpToken}"
         }
 
-        return await self.sgpSess.get(path, params=params, ssl=False, headers=headers)
+        async with _concurrency_limit():
+            res = await self.sgpSess.get(path, params=params, ssl=False, headers=headers)
+        if res.status == 429:
+            retry_after = _parse_retry_after(res.headers.get('Retry-After'))
+            raise RateLimited(retry_after)
+        if res.status >= 400:
+            # SGP 上游服务故障时返回 4xx/5xx (如 503 "Connection retries
+            # limit exceeded"), 此前只有 429 被拦截, 5xx 的 JSON 错误体
+            # {"status": {...}} 会被下游当成"成功但无数据" -- 2026-10-24
+            # 排查: 78 条 "no usable games" 实为 503 误判. 读出错误体摘要
+            # 抛 ClientError, 让调用方按服务失败记录真实原因
+            try:
+                body = await res.text()
+            except (aiohttp.ClientError, ValueError) as e:
+                body = f"<unreadable: {e}>"
+            raise aiohttp.ClientError(
+                f"SGP HTTP {res.status}: {body[:200]}")
+        return res
 
-    def getLoginSummonerByPid(self, pid):
+    async def getLoginSummonerByPid(self, pid) -> dict:
         port, token, _ = getPortTokenServerByPid(pid)
         url = f'https://riot:{token}@127.0.0.1:{port}/lol-summoner/v1/current-summoner'
-        return requests.get(url, verify=False).json()
+        try:
+            async with aiohttp.ClientSession(
+                    auth=aiohttp.BasicAuth('riot', token),
+                    connector=aiohttp.TCPConnector(ssl=False)) as sess:
+                async with sess.get(url, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            logger.warning(f"getLoginSummonerByPid {pid} failed: {e}", TAG)
+            return {}
 
 
 class JsonManager:
-    def __init__(self, itemData, spellData, runeData, queueData, champions, skins, perks, augments):
-        self.items = {item["id"]: item["iconPath"] for item in itemData}
+    def __init__(self, itemData: list, spellData: list, runeData: list,
+                 queueData: list, champions: list, skins: dict,
+                 perks: dict, augments: list):
+        self.itemInfo = {
+            item["id"]: {
+                "name": item.get("name", ""),
+                "iconPath": item["iconPath"],
+            }
+            for item in itemData
+        }
+        self.items = {
+            itemId: item["iconPath"]
+            for itemId, item in self.itemInfo.items()
+        }
         self.spells = {item["id"]: item["iconPath"] for item in spellData[:-3]}
         self.runes = {item["id"]: {"icon": item["iconPath"],
                                    'name': item['name'],
@@ -1319,42 +1946,75 @@ class JsonManager:
             item['id']: item
             for item in augments}
 
-    def getItemIconPath(self, iconId):
+        # 预填充强化稀有度到 static_data 映射, 供战绩页面 AugmentRow 着色
+        # cherry-augments.json 中每个条目应含 rarity 字段 (位掩码: &1=silver, &4=gold, &8=prismatic)
+        try:
+            from app.lol.static_data import registerAugmentRarity
+            filled_count = 0
+            sample_logged = False
+            for aid, raw in self.cherryAugments.items():
+                if not isinstance(raw, dict):
+                    continue
+                rarity = raw.get('rarity')
+                if rarity is not None:
+                    registerAugmentRarity(aid, rarity)
+                    filled_count += 1
+                # 首次记录一条样本, 确认字段名 (调试用)
+                if not sample_logged:
+                    sample_logged = True
+                    logger.warning(
+                        f"[cherry-augments] sample aid={aid} keys={list(raw.keys())}",
+                        TAG)
+            logger.warning(
+                f"[cherry-augments] total={len(self.cherryAugments)} "
+                f"rarity_filled={filled_count}", TAG)
+        except Exception as e:
+            logger.warning(f"Failed to pre-fill augment rarity: {e}", TAG)
+
+    def getItemIconPath(self, iconId) -> str:
         if iconId != 0:
             try:
                 return self.items[iconId]
-            except:
-                logger.error(f"getItemIconPath, iconId: {iconId}", tag=TAG)
+            except KeyError:
+                logger.debug(f"getItemIconPath, iconId: {iconId}", tag=TAG)
 
         return "/lol-game-data/assets/ASSETS/Items/Icons2D/gp_ui_placeholder.png"
 
-    def getSummonerSpellIconPath(self, spellId):
+    def getItemName(self, iconId) -> str:
+        return self.itemInfo.get(iconId, {}).get("name", "")
+
+    def getSummonerSpellIconPath(self, spellId) -> str:
         if spellId != 0:
-            return self.spells[spellId]
+            try:
+                return self.spells[spellId]
+            except KeyError:
+                logger.warning(
+                    f"getSummonerSpellIconPath: unknown spellId {spellId}", TAG)
+                return f"/lol-game-data/assets/v1/summoner-spells/{spellId}.png"
         else:
             return "/lol-game-data/assets/data/spells/icons2d/summoner_empty.png"
 
-    def getRuneIconPath(self, runeId):
+    def getRuneIconPath(self, runeId) -> Optional[str]:
         try:
             return self.runes[runeId]['icon']
-        except:
+        except KeyError:
             for item in self.perks['styles']:
                 if item['id'] == runeId:
                     return item['iconPath']
 
-    def getRuneName(self, runeId):
+    def getRuneName(self, runeId) -> str:
         return self.runes[runeId]['name']
 
-    def getRuneDesc(self, runeId):
+    def getRuneDesc(self, runeId) -> str:
         return self.runes[runeId]['desc']
 
-    def getSummonerProfileIconPath(self, iconId):
+    def getSummonerProfileIconPath(self, iconId) -> str:
         return f"/lol-game-data/assets/v1/profile-icons/{iconId}.jpg"
 
-    def getChampionIconPath(self, championId):
+    def getChampionIconPath(self, championId) -> str:
         return f"/lol-game-data/assets/v1/champion-icons/{championId}.png"
 
-    def getMapNameById(self, mapId):
+    def getMapNameById(self, mapId) -> str:
         maps = {
             -1: ("特殊地图", "Special map"),
             11: ("召唤师峡谷", "Summoner's Rift"),
@@ -1368,36 +2028,34 @@ class JsonManager:
 
         return maps[key][index]
 
-    def getNameMapByQueueId(self, queueId):
+    def getNameMapByQueueId(self, queueId) -> dict:
         if queueId == 0:
             return {
-                "name": "Custom" if cfg.language.value == Language.ENGLISH else 
-                       "Personalizado" if cfg.language.value == Language.PORTUGUESE else 
-                       "自定义"
+                "name": "Custom" if cfg.language.value == Language.ENGLISH else "自定义"
             }
 
-        data = self.queues[queueId]
+        data = self.queues.get(queueId)
+        if data is None:
+            logger.warning(
+                f"getNameMapByQueueId: unknown queueId {queueId}", TAG)
+            name = f"Mode {queueId}" if cfg.language.value == Language.ENGLISH \
+                else f"模式 {queueId}"
+            return {"name": name, "map": ""}
         mapId = data["mapId"]
         name = data["name"]
 
-        with open("app/resource/i18n/gamemodes.json", encoding="utf-8") as f:
-            translate = json.loads(f.read())
-            
-            if name in translate:
-                if isinstance(translate[name], dict):
-                    if cfg.language.value == Language.ENGLISH:
-                        name = translate[name]["en"]
-                    elif cfg.language.value == Language.PORTUGUESE:
-                        name = translate[name]["pt"]
-                else:
-                    # Handle old format for backward compatibility
-                    if cfg.language.value == Language.ENGLISH:
-                        name = translate[name]
+        if cfg.language.value == Language.ENGLISH:
+            with open("app/resource/i18n/gamemodes.json", encoding="utf-8") as f:
+                translate = json.loads(f.read())
+
+                if name in translate:
+                    name = translate[name]
 
         map = self.getMapNameById(mapId)
+
         return {"map": map, "name": name}
 
-    def getMapIconByMapId(self, mapId, win):
+    def getMapIconByMapId(self, mapId, win) -> str:
         result = "victory" if win else "defeat"
         if mapId == 11:
             mapName = "sr"
@@ -1410,49 +2068,49 @@ class JsonManager:
 
         return f"app/resource/images/{mapName}-{result}.png"
 
-    def getChampionList(self):
+    def getChampionList(self) -> list:
         return [item for item in self.champions.keys()]
 
-    def getChampionIdList(self):
+    def getChampionIdList(self) -> list:
         return list(self.champs.keys())
 
-    def getChampions(self):
+    def getChampions(self) -> dict:
         return self.champs
 
-    def getSkinListByChampionName(self, championName):
+    def getSkinListByChampionName(self, championName) -> list:
         try:
             return [item for item in self.champions[championName]["skins"].items()]
-        except:
+        except (KeyError, TypeError):
             return []
 
-    def getSkinIdByChampionAndSkinName(self, championName, skinName):
+    def getSkinIdByChampionAndSkinName(self, championName, skinName) -> int:
         return self.champions[championName]["skins"][skinName]["skinId"]
 
-    def getChampionIdByName(self, championName):
+    def getChampionIdByName(self, championName) -> int:
         return self.champions[championName]["id"]
 
-    def getChampionNameById(self, championId):
+    def getChampionNameById(self, championId) -> Optional[str]:
         for cid in self.champs.keys():
             if cid == championId:
                 return self.champs[cid]
 
-    def getSkinAugments(self, skinId):
+    def getSkinAugments(self, skinId) -> Optional[str]:
         return self.skinAugments.get(skinId)
 
-    def getPerkStyles(self):
+    def getPerkStyles(self) -> Optional[dict]:
         return self.perkStyles
 
-    def getAugmentsIconPath(self, augmentId):
+    def getAugmentsIconPath(self, augmentId) -> str:
         try:
             return self.cherryAugments[augmentId]['augmentSmallIconPath']
 
-        except:
+        except (KeyError, TypeError):
             return "/lol-game-data/assets/ASSETS/Items/Icons2D/gp_ui_placeholder.png"
 
-    def getAugmentsName(self, augmentId):
+    def getAugmentsName(self, augmentId) -> str:
         return self.cherryAugments[augmentId]['nameTRA']
 
-    def getSummonerSpellList(self):
+    def getSummonerSpellList(self) -> list:
         # 没找到 LCU API 返回这个玩意的，硬编码妥了
         # 1  -> 净化
         # 3  -> 虚弱

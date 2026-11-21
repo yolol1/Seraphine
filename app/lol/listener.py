@@ -1,10 +1,5 @@
-import subprocess
-import logging
-import json
 
-import asyncio
-from PyQt5.QtCore import QThread, pyqtSignal
-import aiohttp
+from PyQt5.QtCore import QThread
 
 from app.common.logger import logger
 from app.common.signals import signalBus
@@ -15,9 +10,10 @@ TAG = "Listener"
 
 class LolProcessExistenceListener(QThread):
     def __init__(self, parent):
-        # Current Seraphine connected client pid
+        # 当前 Seraphine 连接的客户端 pid
         self.runningPid = 0
 
+        self._running = True
         super().__init__(parent)
 
     def run(self):
@@ -27,28 +23,41 @@ class LolProcessExistenceListener(QThread):
             signalBus.tasklistNotFound.emit()
             return
 
-        while True:
-            # Get all currently running client pids
-            pids = getLolClientPids(path)
+        while self._running:
+            try:
+                # 取一下当前运行中的所有客户端 pid
+                pids = getLolClientPids(path)
+            except Exception as e:
+                # tasklist / psutil 偶发异常 (issue #367), 记录后跳过本轮,
+                # 不要让监听线程整个崩溃退出
+                logger.exception(
+                    'getLolClientPids failed in this loop', e, TAG)
+                pids = []
 
-            # If there are clients running
+            # 如果有客户端正在运行
             if len(pids) != 0:
 
-                # If no client is currently connected, then the first client has started
+                # 如果当前没有连接客户端，则是第一个客户端启动了
                 if self.runningPid == 0:
                     self.runningPid = pids[0]
                     signalBus.lolClientStarted.emit(self.runningPid)
 
-                # If there is a client running, but the currently connected client is not among them
-                # This means it was a multi-client situation, and now the originally connected client has closed,
-                # so switch to the new client
+                # 如果当前有客户端启动中，但是当前连接的客户端不在这些客户端里
+                # 则说明是原来多开了客户端，现在原本连接的客户端关了，则切换到新的客户端
                 elif self.runningPid not in pids:
                     self.runningPid = pids[0]
                     signalBus.lolClientChanged.emit(self.runningPid)
 
-            # If no clients are running, and there was a client running in the last check
+            # 如果没有任何客户端在运行，且上一次检查时有客户端在运行
             else:
-                if self.runningPid and not isLolGameProcessExist(path):
+                try:
+                    gameExist = isLolGameProcessExist(path)
+                except Exception as e:
+                    logger.exception(
+                        'isLolGameProcessExist failed in this loop', e, TAG)
+                    gameExist = False
+
+                if self.runningPid and not gameExist:
                     self.runningPid = 0
                     signalBus.lolClientEnded.emit()
 
@@ -61,4 +70,7 @@ class StoppableThread(QThread):
         super().__init__(parent)
 
     def run(self):
-        self.target()
+        try:
+            self.target()
+        except Exception as e:
+            logger.exception(f"StoppableThread target failed: {e}", TAG)

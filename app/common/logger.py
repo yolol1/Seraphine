@@ -9,10 +9,10 @@ from app.common.config import cfg
 
 class CustomRotatingFileHandler(RotatingFileHandler):
     """
-    Prevents the log fragment name from being placed in the suffix.
+    使日志分片名称不再放到后缀中
 
-    RotatingFileHandler: aaa.log.1  
-    CustomRotatingFileHandler: aaa_1.log  
+    RotatingFileHandler: aaa.log.1
+    CustomRotatingFileHandler: aaa_1.log
     """
 
     def doRollover(self):
@@ -51,7 +51,7 @@ class Logger:
         self.logger = logging.getLogger(name)
         self.logger.setLevel(cfg.get(cfg.logLevel))
 
-        # Why not use a relative path directly here?
+        # 这里为什么不直接用相对路径捏？
         log_directory = os.path.join(os.getcwd(), 'log')
         if not os.path.exists(log_directory):
             os.makedirs(log_directory)
@@ -77,8 +77,7 @@ class Logger:
         return log_path
 
     def log(self, level, message, tag=None):
-        # FIXME if tag is none an exception will be thrown
-        extra = {'TAG': tag} if tag else {}
+        extra = {'TAG': tag if tag else '-'}
         self.logger.log(level, message, extra=extra)
 
     def debug(self, message, tag=None):
@@ -100,7 +99,7 @@ class Logger:
         self.log(logging.CRITICAL, message, tag)
 
     def get_traceback_string(self, exception):
-        # Retrieves the exception call stack information as a string.
+        # 获取异常的调用堆栈信息的字符串形式
         traceback_list = traceback.format_exception(
             type(exception), exception, exception.__traceback__)
         traceback_str = ''.join(traceback_list)
@@ -111,7 +110,7 @@ logger = Logger("Seraphine")
 
 
 if __name__ == "__main__":
-    # Example: enable console output.
+    # 示例：开启控制台输出
     log = Logger("Seraphine", console_output=True)
 
     log.debug("This is a debug message.")

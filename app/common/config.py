@@ -1,20 +1,19 @@
 from enum import Enum
-from copy import deepcopy
 import os
 import sys
 
 from PyQt5.QtCore import QLocale, QSize
 
 
-from .qfluentwidgets import (qconfig, QConfig, ConfigItem, FolderValidator, BoolValidator,
+from .qfluentwidgets import (qconfig, QConfig, ConfigItem, BoolValidator,
                              OptionsConfigItem, OptionsValidator, ConfigSerializer,
-                             RangeConfigItem, RangeValidator, EnumSerializer, ColorConfigItem, ConfigValidator)
+                             RangeConfigItem, RangeValidator, ColorConfigItem,
+                             Theme, EnumSerializer)
 
 
 class Language(Enum):
     CHINESE_SIMPLIFIED = QLocale(QLocale.Chinese, QLocale.China)
     ENGLISH = QLocale(QLocale.English)
-    PORTUGUESE = QLocale(QLocale.Portuguese)
     AUTO = QLocale()
 
 
@@ -39,28 +38,11 @@ def isWin11():
     return sys.platform == 'win32' and sys.getwindowsversion().build >= 22000
 
 
-class QueueFilterValidator(ConfigValidator):
-    def validate(self, value):
-        keys = ["420", "430", "440", "450", "480"]
-
-        for key in keys:
-            if key not in value:
-                return False
-
-        return True
-
-    def correct(self, value):
-        keys = ["420", "430", "440", "450", "480"]
-        new = deepcopy(value)
-
-        for key in keys:
-            if key not in value:
-                new[key] = []
-
-        return new
-
-
 class Config(QConfig):
+    themeMode = OptionsConfigItem(
+        "QFluentWidgets", "ThemeMode", Theme.AUTO,
+        OptionsValidator(Theme), EnumSerializer(Theme))
+
     lolFolder = ConfigItem("General", "LolPath", [])
     enableStartLolWithApp = ConfigItem("General", "EnableStartLolWithApp",
                                        False, BoolValidator())
@@ -93,13 +75,16 @@ class Config(QConfig):
     darkDeathsNumberColor = ColorConfigItem(
         "Personalization", "DarkDeathsNumberColor", "#ffff8d8d")
 
+    # 预组队高亮色 (对局信息界面)
+    team1Color = ColorConfigItem(
+        "Personalization", "Team1Color", '#27ffb01b')
+    team2Color = ColorConfigItem(
+        "Personalization", "Team2Color", '#27ff3399')
+
     careerGamesNumber = RangeConfigItem("Functions", "CareerGamesNumber", 20,
                                         RangeValidator(10, 100))
-    apiConcurrencyNumber = RangeConfigItem("Functions", "ApiConcurrencyNumber", 1,
+    apiConcurrencyNumber = RangeConfigItem("Functions", "ApiConcurrencyNumber", 5,
                                            RangeValidator(1, 100), restart=True)
-
-    gameInfoFilter = ConfigItem(
-        "Functions", "GameInfoFilter", False, BoolValidator())
 
     showTierInGameInfo = ConfigItem("Functions", "ShowTierInGameInfo", False,
                                     BoolValidator())
@@ -113,16 +98,61 @@ class Config(QConfig):
     enableAutoReconnect = ConfigItem("Functions",
                                      "EnableAutoReconnect", False,
                                      BoolValidator())
+    enableAutoStartMatchmaking = ConfigItem("Functions",
+                                            "EnableAutoStartMatchmaking", False,
+                                            BoolValidator())
 
-    autoAcceptMatchingDelay = RangeConfigItem(
-        "Functions", "AutoAcceptMatchingDelay", 0, RangeValidator(0, 11))
+    # 自动再来一局: EndOfGame 阶段自动点击"再来一局"
+    enableAutoPlayAgain = ConfigItem("Functions",
+                                     "EnableAutoPlayAgain", False,
+                                     BoolValidator())
+
+    autoAcceptDelayMs = RangeConfigItem(
+        "Functions", "AutoAcceptDelayMs", 1000, RangeValidator(0, 15000))
+    autoAcceptDeclineEnabled = ConfigItem(
+        "Functions", "AutoAcceptDeclineEnabled", True, BoolValidator())
+    autoStartMatchmakingDelay = RangeConfigItem(
+        "Functions", "AutoStartMatchmakingDelay", 2, RangeValidator(0, 30))
+
+    # auto honor: EndOfGame 自动给队友点赞
+    enableAutoHonor = ConfigItem("Functions",
+                                 "EnableAutoHonor", False, BoolValidator())
+    autoHonorStrategy = OptionsConfigItem(
+        "Functions", "AutoHonorStrategy", "friends_first",
+        OptionsValidator(["friends_first", "friends_only",
+                          "best_score", "random"]))
+    autoHonorDelay = RangeConfigItem(
+        "Functions", "AutoHonorDelay", 0, RangeValidator(0, 5))
+
+    # 全队 5 档评级 (胜方/败方各一套, 内置+用户命名方案模板)
+    enableTeamRating = ConfigItem("Functions",
+                                   "EnableTeamRating", True, BoolValidator())
+    # 结算评级风格: 内置方案 key | 用户方案名 | '随机'
+    teamRatingStyle = ConfigItem("Functions", "TeamRatingStyle", "tieba")
+    # 用户命名方案: {方案名: {win:[5], loss:[5], winComment:[5], lossComment:[5]}}
+    teamRatingSchemes = ConfigItem("Functions", "TeamRatingSchemes", {})
+    # 兼容旧版单桶自定义文案 (style=custom 时使用): {win: [...5], loss: [...5]}
+    teamRatingCustomLabels = ConfigItem(
+        "Functions", "TeamRatingCustomLabels", "")
+
+    # 上等马赛前评级: BP 阶段按可见段位评价队友并播报到 BP 聊天窗
+    enableHorseRatingChat = ConfigItem(
+        "Functions", "EnableHorseRatingChat", False, BoolValidator())
+    # 马评分风格: 内置方案 key ('horse'=纯牛马) | 用户方案名 | '随机'
+    horseRatingStyle = ConfigItem("Functions", "HorseRatingStyle", "horse")
+    # 用户命名马评分方案: {方案名: {win: [6 标签]}}
+    horseRatingSchemes = ConfigItem("Functions", "HorseRatingSchemes", {})
+    # 兼容旧版单桶自定义马评分文案 (style=custom 时使用): {win: [...6]}
+    horseRatingCustomLabels = ConfigItem(
+        "Functions", "HorseRatingCustomLabels", "")
+
+    # 红蓝方播报: BP 阶段向聊天窗播报本局所在阵营 (蓝方/红方)
+    enableSideChat = ConfigItem(
+        "Functions", "EnableSideChat", False, BoolValidator())
 
     enableAutoSelectTimeoutCompleted = ConfigItem("Functions",
                                                   "EnableAutoSelectTimeoutCompleted", False,
                                                   BoolValidator())
-
-    enableRandomSkin = ConfigItem(
-        "Functions", "enableRandomSkin", False, BoolValidator())
 
     enableAutoSelectChampion = ConfigItem(
         "Functions", "EnableAutoSelectChampion", False, BoolValidator())
@@ -172,10 +202,6 @@ class Config(QConfig):
         "Other", "SearchHistory", ""
     )
 
-    enableGameStartMinimize = ConfigItem("General",
-                                         "EnableGameStartMinimize", False,
-                                         BoolValidator())
-
     enableCheckUpdate = ConfigItem("General",
                                    "EnableCheckUpdate", True,
                                    BoolValidator())
@@ -183,15 +209,8 @@ class Config(QConfig):
     logLevel = OptionsConfigItem(
         "General", "LogLevel", 40, OptionsValidator([10, 20, 30, 40]), restart=True)
 
-    enableGithubProxy = ConfigItem(
-        "General", "EnableGithubProxy", False, BoolValidator())
-    githubProxyAddr = ConfigItem(
-        "General", "GithubProxyAddr", "127.0.0.1:10809")
-
-    enableOpggProxy = ConfigItem(
-        "General", "EnableOpggProxy", False, BoolValidator(), restart=True)
-    opggProxyAddr = ConfigItem(
-        "General", "OpggProxyAddr", "127.0.0.1:10809")
+    enableProxy = ConfigItem("General", "EnableProxy", False, BoolValidator())
+    proxyAddr = ConfigItem("General", "HttpProxy", "")
 
     opggRegion = ConfigItem("Functions", "OpggRegion", "kr",
                             OptionsValidator(["kr", "global"]), restart=True)
@@ -233,16 +252,73 @@ class Config(QConfig):
         "440": [],
         "450": [],
         "480": [],
-    }, QueueFilterValidator())
+    })
 
+    # 海克斯/大乱斗抢英雄 (备选席模式)
+    enableAutoAramBench = ConfigItem(
+        "Functions", "EnableAutoAramBench", False, BoolValidator())
+    hextechChampions = ConfigItem(
+        "Functions", "HextechChampions", [])
+    autoShowHextechWindow = ConfigItem(
+        "Functions", "AutoShowHextechWindow", True, BoolValidator())
+    enableHextechWindowOnTop = ConfigItem(
+        "Functions", "EnableHextechWindowOnTop", True, BoolValidator())
+
+    # 常驻侧边栏 (快捷开关 + 大乱斗换英雄): 客户端运行期间常驻贴在客户端左侧
+    enableSideDock = ConfigItem(
+        "Functions", "EnableSideDock", True, BoolValidator())
+    sideDockCollapsed = ConfigItem(
+        "Functions", "SideDockCollapsed", False, BoolValidator())
+
+    # 海克斯强化选择辅助 (ARAM Mayhem 游戏中推荐)
+    enableHextechAssist = ConfigItem(
+        "Functions", "EnableHextechAssist", True, BoolValidator())
+    hextechAssistAutoShow = ConfigItem(
+        "Functions", "HextechAssistAutoShow", True, BoolValidator())
+
+    # 死亡自动切窗: 死亡时自动切到指定应用, 复活后切回游戏窗口
+    enableDeathSwitch = ConfigItem(
+        "Functions", "EnableDeathSwitch", False, BoolValidator())
+    deathSwitchTargetExe = ConfigItem(
+        "Functions", "DeathSwitchTargetExe", "")
+    deathSwitchExcludedModes = ConfigItem(
+        "Functions", "DeathSwitchExcludedModes",
+        [1700, 1090, 1100, 1110, 1130, 1160])
+
+    lastSummoner = ConfigItem("Other", "LastSummoner", {})
+
+    # 配置迁移标记: 见文件末尾 _migrateConfig (一次性迁移的执行凭证)
+    hextechOnTopMigrated = ConfigItem(
+        "Other", "HextechOnTopMigrated", False, BoolValidator())
 
 YEAR = 2023
 AUTHOR = "Zzaphkiel"
-VERSION = "1.1.4"
+# 二次开发维护者信息 (fork 维护者署名, 与原作者 AUTHOR 区分)
+MAINTAINER = "Li-Qifeng"
+MAINTAINER_URL = "https://github.com/Li-Qifeng/Seraphine"
+VERSION = os.environ.get("SERAPHINE_DEV_VERSION") or "1.3.13"  # 2026-11-20: auto-start matchmaking hot toggle
 BETA = None
-FEEDBACK_URL = "https://github.com/Zzaphkiel/Seraphine/issues?q=is%3Aissue"
-GITHUB_URL = "https://github.com/Zzaphkiel/Seraphine"
+# 以下 URL 指向当前维护者的 fork 仓库 (接管 Release / Issue 反馈)
+FEEDBACK_URL = "https://github.com/Li-Qifeng/Seraphine/issues?q=is%3Aissue"
+GITHUB_URL = "https://github.com/Li-Qifeng/Seraphine"
 LOCAL_PATH = f"{os.getenv('APPDATA')}\\Seraphine"
 
 cfg = Config()
 qconfig.load(f"{LOCAL_PATH}\\config.json", cfg)
+
+
+def _migrateConfig():
+    """一次性配置迁移: 让默认值变更对存量用户同样生效.
+
+    EnableHextechWindowOnTop 默认值 False -> True (v1.3.x). 该配置项此前
+    没有设置界面入口, 存量用户落盘的 False 只能是旧默认值, 不会是用户
+    主动选择, 因此统一迁移为 True. 迁移后用户可在辅助功能-大乱斗组
+    自由开关; 独立 flag 保证迁移只跑一次, 不会覆盖用户后续的手动关闭.
+    新安装用户: 项本身默认已是 True, 迁移为 no-op.
+    """
+    if not cfg.get(cfg.hextechOnTopMigrated):
+        cfg.set(cfg.enableHextechWindowOnTop, True)
+        cfg.set(cfg.hextechOnTopMigrated, True)
+
+
+_migrateConfig()
