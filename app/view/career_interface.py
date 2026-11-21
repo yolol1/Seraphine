@@ -7,24 +7,76 @@ from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QVBoxLayout, QSpacerItem,
 from PyQt5.QtCore import Qt, pyqtSignal
 from ..common.qfluentwidgets import (TableWidget, PushButton, ComboBox,
                                      SmoothScrollArea, ToolTipFilter, setCustomStyleSheet,
-                                     ToolTipPosition, ToolButton, IndeterminateProgressRing,
+                                     ToolTipPosition, IndeterminateProgressRing,
                                      Flyout, FlyoutViewBase, FlyoutAnimationType, InfoBar,
                                      InfoBarPosition)
+from app.common.logger import logger
 
 from app.components.game_infobar_widget import GameInfoBar
 from app.components.champion_icon_widget import RoundIcon
 from app.components.profile_level_icon_widget import RoundLevelAvatar
 from app.components.summoner_name_button import SummonerName
 from app.components.color_label import ColorLabel
-from app.components.animation_frame import CardWidget, ColorAnimationFrame
+from app.components.animation_frame import ColorAnimationFrame
 from app.common.style_sheet import StyleSheet
 from app.common.icons import Icon
 from app.common.signals import signalBus
 from app.common.config import cfg
 from app.lol.connector import connector
 from app.lol.tools import (parseGames, parseSummonerData,
-                           getRecentTeammates, parseDetailRankInfo, SERVERS_NAME, SERVERS_SUBSET)
+                           getRecentTeammates, parseDetailRankInfo,
+                           getNameTagLineFromGame, aramStatsFromGames)
 from ..components.seraphine_interface import SeraphineInterface
+
+
+def _sgpGamesToLcuFormat(sgp_response: dict) -> dict:
+    """Convert SGP SUMMARY games response to LCU format for parseSummonerData."""
+    games = sgp_response.get("games") or []
+    return {
+        "gameCount": sgp_response.get("totalGames", len(games)),
+        "games": [g["json"] for g in games],
+        "gameBeginDate": sgp_response.get("gameBeginDate"),
+    }
+
+
+def _sgpSummonerToLcuFormat(sgp_summoner: dict, puuid: str, first_game: dict) -> dict:
+    """Convert SGP summoner response to LCU format for parseSummonerData."""
+    name, tagline = "", ""
+    if first_game and "json" in first_game:
+        result = getNameTagLineFromGame(first_game, puuid)
+        if result:
+            name, tagline = result
+    return {
+        "puuid": puuid,
+        "gameName": name,
+        "displayName": name,
+        "tagLine": tagline,
+        "summonerLevel": sgp_summoner.get("level", -1),
+        "xpSinceLastLevel": sgp_summoner.get("expPoints", 0),
+        "xpUntilNextLevel": sgp_summoner.get("expToNextLevel", 0),
+        "profileIconId": sgp_summoner.get("profileIconId", 0),
+        "privacy": sgp_summoner.get("privacy", "PUBLIC"),
+    }
+
+
+def _sgpRankedToLcuFormat(sgp_ranked: dict) -> dict:
+    """Convert SGP ranked stats (queues list) to LCU format (queueMap dict)."""
+    if not sgp_ranked or "errorCode" in sgp_ranked:
+        return {}
+    queue_map = {}
+    for q in sgp_ranked.get("queues") or []:
+        queue_map[q["queueType"]] = {
+            "tier": q.get("tier", ""),
+            "division": q.get("rank", "NA"),
+            "highestTier": q.get("highestTier", ""),
+            "highestDivision": q.get("highestRank", "NA"),
+            "previousSeasonEndTier": q.get("previousSeasonEndTier", ""),
+            "previousSeasonEndDivision": q.get("previousSeasonEndRank", "NA"),
+            "wins": q.get("wins", 0),
+            "losses": q.get("losses", 0),
+            "leaguePoints": q.get("leaguePoints", 0),
+        }
+    return {"queueMap": queue_map}
 
 
 class NameLabel(QLabel):
@@ -43,6 +95,9 @@ class CareerInterface(SeraphineInterface):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.viewport().setObjectName("careerViewport")
+        self.viewport().setAutoFillBackground(False)
         self.loginSummonerPuuid = None
         self.puuid = None
         self.showTagLine = False
@@ -58,12 +113,12 @@ class CareerInterface(SeraphineInterface):
         self.name = NameLabel(self.tr("Connecting..."))
         # self.serviceLabel = QLabel()
         self.tagLineLabel = TagLineLabel()
-        self.copyButton = ToolButton(Icon.COPY)
+        self.copyButton = PushButton(self.tr("Copy"))
         self.nameButtonLayout = QHBoxLayout()
         self.nameTagLineLayout = QVBoxLayout()
         self.subtitleLayout = QHBoxLayout()
 
-        self.buttonsLayout = QVBoxLayout()
+        self.buttonsLayout = QHBoxLayout()
         self.backToMeButton = PushButton(self.tr("Back to me"))
         self.refreshButton = PushButton(self.tr("Refresh"))
         self.searchButton = PushButton(self.tr("Game history"))
@@ -108,7 +163,9 @@ class CareerInterface(SeraphineInterface):
         self.tagLineLabel.setVisible(False)
         self.tagLineLabel.setAlignment(Qt.AlignCenter)
 
-        self.copyButton.setFixedSize(26, 26)
+        self.copyButton.setObjectName("copySummonerNameButton")
+        self.copyButton.setFixedHeight(30)
+        self.copyButton.setMinimumWidth(70)
         self.copyButton.setEnabled(False)
         self.copyButton.setToolTip(self.tr("Copy summoner name to ClipBoard"))
         self.copyButton.installEventFilter(
@@ -129,10 +186,17 @@ class CareerInterface(SeraphineInterface):
         self.gameInfoWidget.setObjectName("gameInfoWidget")
 
         self.backToMeButton.setEnabled(False)
+        for button, width in (
+                (self.backToMeButton, 104),
+                (self.refreshButton, 84),
+                (self.searchButton, 108)):
+            button.setObjectName("careerActionButton")
+            button.setFixedHeight(34)
+            button.setMinimumWidth(width)
 
         self.recentTeamButton.setEnabled(True)
 
-        self.rankTable.setRowCount(2)
+        self.rankTable.setRowCount(3)
         self.rankTable.setColumnCount(9)
         self.rankTable.verticalHeader().hide()
         self.rankTable.setWordWrap(False)
@@ -150,14 +214,17 @@ class CareerInterface(SeraphineInterface):
 
         self.rankInfo = [[
             self.tr('Ranked Solo'),
-        ], [
+        ] + ['--'] * 8, [
             self.tr('Ranked Flex'),
-        ]]
+        ] + ['--'] * 8, [
+            self.tr("大乱斗"),
+        ] + ['--'] * 8]
 
         self.filterComboBox.addItems([
             self.tr('All'),
             self.tr('Normal'),
-            self.tr("A.R.A.M."),
+            self.tr("大乱斗"),
+            self.tr("海克斯大乱斗"),
             self.tr("Ranked Solo"),
             self.tr("Ranked Flex")
         ])
@@ -237,6 +304,7 @@ class CareerInterface(SeraphineInterface):
         self.buttonsLayout.addWidget(self.backToMeButton)
         self.buttonsLayout.addWidget(self.refreshButton)
         self.buttonsLayout.addWidget(self.searchButton)
+        self.buttonsLayout.setSpacing(8)
         self.IconNameHBoxLayout.addLayout(self.buttonsLayout)
 
         self.gameInfoWidget.setLayout(self.gameInfoLayout)
@@ -255,7 +323,7 @@ class CareerInterface(SeraphineInterface):
         self.vBoxLayout.addWidget(self.gameInfoArea)
         self.vBoxLayout.addSpacing(10)
 
-        self.vBoxLayout.setContentsMargins(30, 32, 30, 20)
+        self.vBoxLayout.setContentsMargins(24, 24, 24, 20)
 
         self.setLoadingPageEnabled(True)
 
@@ -284,9 +352,28 @@ class CareerInterface(SeraphineInterface):
 
         self.progressRing.setVisible(enable)
 
+    def __fillAramStats(self, games):
+        """近 N 场大乱斗统计 (表格第 3 行总场/胜率/胜/负).
+
+        窗口有限 (cfg.careerGamesNumber), 非生涯累计; 窗口内无大乱斗局时保持 '--'.
+        统计经典大乱斗 (450) + 海克斯大乱斗 (2400).
+        段位/LP/最高/上赛季列无大乱斗概念, 天然 '--'.
+        """
+        row = self.rankInfo[2]
+        n = len(games.get("games", []))
+        row[0] = f"{self.tr('大乱斗')}({self.tr('近')}{n}{self.tr('场')})"
+        stats = aramStatsFromGames(games.get("games", []))
+        if not stats:
+            return
+        row[1] = str(stats["total"])
+        row[2] = stats["rate"]
+        row[3] = str(stats["wins"])
+        row[4] = str(stats["losses"])
+
     def __updateTable(self):
         for i, line in enumerate(self.rankInfo):
-            for j, data in enumerate(line):
+            row = list(line)
+            for j, data in enumerate(row):
                 item = QTableWidgetItem(data)
                 item.setTextAlignment(Qt.AlignHCenter | Qt.AlignVCenter)
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -297,33 +384,66 @@ class CareerInterface(SeraphineInterface):
         # self.table.setFixedWidth(self.table.viewportSizeHint().width())
         self.rankTable.setFixedHeight(
             self.rankTable.viewportSizeHint().height() + 4)
-        self.rankTable.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch)
+        header = self.rankTable.horizontalHeader()
+        header.setMinimumSectionSize(64)
+        header.setSectionResizeMode(QHeaderView.Fixed)
+        widths = [180, 80, 100, 76, 76, 130, 60, 130]
+        for column, width in enumerate(widths):
+            self.rankTable.setColumnWidth(column, width)
+        header.setSectionResizeMode(8, QHeaderView.Stretch)
 
     def initTableStyle(self):
         light = '''
-            QHeaderView::section:horizontal {
-                border: none;
-                border-bottom: 1px solid rgba(0, 0, 0, 0.095);
+            QTableView {
+                border: 1px solid rgba(0, 0, 0, 0.09);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.72);
+                color: rgba(0, 0, 0, 0.82);
+                font: 14px 'Microsoft YaHei UI', 'Segoe UI';
+                gridline-color: rgba(0, 0, 0, 0.055);
+                selection-background-color: rgba(0, 0, 0, 0.06);
+                selection-color: rgba(0, 0, 0, 0.9);
             }
 
-            QTableView {
-                border: 1px solid rgba(0, 0, 0, 0.095); 
-                border-radius: 6px;
-                background: rgba(255, 255, 255, 0.667);
+            QTableView::item {
+                padding: 9px 8px;
+                border-bottom: 1px solid rgba(0, 0, 0, 0.045);
+            }
+
+            QHeaderView::section:horizontal {
+                border: none;
+                border-bottom: 1px solid rgba(0, 0, 0, 0.09);
+                padding: 10px 8px;
+                background: rgba(0, 0, 0, 0.025);
+                color: rgba(0, 0, 0, 0.62);
+                font: bold 13px 'Microsoft YaHei UI', 'Segoe UI';
             }
         '''
 
         dark = '''
-            QHeaderView::section:horizontal {
-                border: none;
-                border-bottom: 1px solid rgb(35, 35, 35);
+            QTableView {
+                border: 1px solid rgba(255, 255, 255, 0.09);
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.035);
+                color: rgba(255, 255, 255, 0.88);
+                font: 14px 'Microsoft YaHei UI', 'Segoe UI';
+                gridline-color: rgba(255, 255, 255, 0.055);
+                selection-background-color: rgba(255, 255, 255, 0.08);
+                selection-color: #ffffff;
             }
 
-            QTableView {
-                border: 1px solid rgb(35, 35, 35); 
-                border-radius: 6px;
-                background: rgba(255, 255, 255, 0.051);
+            QTableView::item {
+                padding: 9px 8px;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+            }
+
+            QHeaderView::section:horizontal {
+                border: none;
+                border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+                padding: 10px 8px;
+                background: rgba(255, 255, 255, 0.035);
+                color: rgba(255, 255, 255, 0.62);
+                font: bold 13px 'Microsoft YaHei UI', 'Segoe UI';
             }
         '''
 
@@ -337,10 +457,21 @@ class CareerInterface(SeraphineInterface):
         self.filterComboBox.currentIndexChanged.connect(
             self.__onfilterComboBoxChanged)
         self.copyButton.clicked.connect(
-            lambda: pyperclip.copy(self.getSummonerName()))
+            self.__copySummonerName)
 
         self.recentTeamButton.clicked.connect(
             self.__onRecentTeammatesButtonClicked)
+
+        # LCU 冷启动 stale cache 后台恢复成功: 若正在展示该召唤师则自动重刷,
+        # 避免生涯页停留在冷启动时拿到的残缺战绩 (如只有 2 条)
+        signalBus.matchHistoryRecovered.connect(self.__onMatchHistoryRecovered)
+
+    @asyncSlot(str)
+    async def __onMatchHistoryRecovered(self, puuid: str):
+        if puuid and puuid == self.puuid:
+            logger.info(
+                "match history recovered, refresh career", "CareerInterface")
+            await self.refresh()
 
     async def updateNameIconExp(self, info):
         if not self.isLoginSummoner():
@@ -363,17 +494,56 @@ class CareerInterface(SeraphineInterface):
     @asyncSlot()
     async def __changeToCurrentSummoner(self):
         self.setLoadingPageEnabled(True)
-        summoner = await connector.getCurrentSummoner()
+        try:
+            summoner = await connector.getCurrentSummoner()
+        except Exception:
+            InfoBar.warning(
+                self.tr("Connection error"),
+                self.tr("Cannot connect to LOL client."),
+                orient=Qt.Vertical,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                duration=3000,
+                parent=self.window())
+            self.setLoadingPageEnabled(False)
+            return
+        # LCU 未就绪时 @retry 拦截 ReferenceError 返回 None
+        if summoner is None:
+            self.setLoadingPageEnabled(False)
+            return
         await self.updateInterface(summoner=summoner)
-        self.setLoadingPageEnabled(False)
 
     @asyncSlot()
     async def refresh(self):
-        if self.puuid:
-            index = self.filterComboBox.currentIndex()
-            await self.updateInterface(puuid=self.puuid)
-            self.filterComboBox.setCurrentIndex(index)
-            self.__onfilterComboBoxChanged(index)
+        # 三层 puuid 兜底:
+        #   1. self.puuid (正常加载后)
+        #   2. self.loginSummonerPuuid (初始加载失败的恢复)
+        #   3. connector.getCurrentSummoner() (极端边缘情况)
+        puuid = self.puuid
+        if not puuid:
+            puuid = self.loginSummonerPuuid
+        if not puuid:
+            try:
+                s = await connector.getCurrentSummoner()
+                puuid = s.get('puuid') if s else None
+            except Exception:
+                pass
+        if not puuid:
+            return
+
+        # 同步设置 loading 状态, 确保 UI 立即反馈
+        # asyncSlot 创建 task 后会立即返回, 若 loading 状态在 await 内设置,
+        # 用户点击刷新按钮后视觉延迟 (按钮不隐藏, loading 动画不显示)
+        self.setLoadingPageEnabled(True)
+
+        if self.loadGamesTask and not self.loadGamesTask.done():
+            self.loadGamesTask.cancel()
+
+        index = self.filterComboBox.currentIndex()
+        await self.updateInterface(puuid=puuid)
+        self.filterComboBox.blockSignals(True)
+        self.filterComboBox.setCurrentIndex(index)
+        self.filterComboBox.blockSignals(False)
+        self.__onfilterComboBoxChanged(index)
 
     async def updateInterface(self, puuid=None, summoner=None):
         '''
@@ -383,15 +553,61 @@ class CareerInterface(SeraphineInterface):
         # 不能同时为空
         assert summoner or puuid
 
-        self.setLoadingPageEnabled(True)
+        # 调用方若需要立即 UI 反馈 (如 refresh 按钮), 应在 await 前同步设置 loading
         self.recentTeammatesInfo = None
 
         if self.recentTeammatesFlyout:
             self.recentTeammatesFlyout.close()
             self.recentTeammatesFlyout = None
 
+        sgp_fallback = False
+        try:
+            if summoner is None:
+                try:
+                    summoner = await connector.getSummonerByPuuid(puuid)
+                except Exception:
+                    sgp_fallback = True
+                    sgp_summoner, sgp_games, sgp_ranked = await asyncio.gather(
+                        connector.getSummonerByPuuidViaSGP(puuid),
+                        connector.getSummonerGamesByPuuidViaSGP(puuid, 0, cfg.get(cfg.careerGamesNumber) - 1),
+                        connector.getRankedStatsByPuuidViaSGP(puuid),
+                    )
+                    if sgp_summoner is None:
+                        self.setLoadingPageEnabled(False)
+                        return
+                    if 'errorCode' in sgp_summoner:
+                        InfoBar.error(self.tr("Get summoner infomation error"),
+                                      self.tr("The server returned abnormal content."),
+                                      orient=Qt.Vertical,
+                                      position=InfoBarPosition.BOTTOM_RIGHT,
+                                      duration=5000,
+                                      parent=self.window())
+                        self.setLoadingPageEnabled(False)
+                        return
+                    first_game = (sgp_games.get("games") or [{}])[0]
+                    summoner = _sgpSummonerToLcuFormat(sgp_summoner, puuid, first_game)
+                    async def _wrap(v):
+                        return v
+                    self.loadGamesTask = asyncio.create_task(
+                        _wrap(_sgpGamesToLcuFormat(sgp_games)))
+                    rankTask = asyncio.create_task(
+                        _wrap(_sgpRankedToLcuFormat(sgp_ranked)))
+        except Exception as e:
+            InfoBar.warning(
+                self.tr("Connection error"),
+                self.tr("Cannot connect to LOL client, displaying cached data."),
+                orient=Qt.Vertical,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                duration=3000,
+                parent=self.window())
+            self.setLoadingPageEnabled(False)
+            return
+
+        # getSummonerByPuuid 在 LCU 未就绪时被 @retry 拦截返回 None
+        # (ReferenceError -> signalBus.lcuNotConnected -> return None)
         if summoner is None:
-            summoner = await connector.getSummonerByPuuid(puuid)
+            self.setLoadingPageEnabled(False)
+            return
 
         if 'errorCode' in summoner:
             InfoBar.error(self.tr("Get summoner infomation error"),
@@ -404,12 +620,27 @@ class CareerInterface(SeraphineInterface):
             self.setLoadingPageEnabled(False)
             return
 
-        self.loadGamesTask = asyncio.create_task(
-            connector.getSummonerGamesByPuuid(summoner['puuid'], 0, cfg.get(cfg.careerGamesNumber) - 1))
-        rankTask = asyncio.create_task(
-            connector.getRankedStatsByPuuid(summoner['puuid']))
+        if not sgp_fallback:
+            self.loadGamesTask = asyncio.create_task(
+                connector.getSummonerGamesByPuuid(summoner['puuid'], 0, cfg.get(cfg.careerGamesNumber) - 1))
+            rankTask = asyncio.create_task(
+                connector.getRankedStatsByPuuid(summoner['puuid']))
 
-        info = await parseSummonerData(summoner, rankTask, self.loadGamesTask)
+        try:
+            info = await parseSummonerData(summoner, rankTask, self.loadGamesTask)
+        except Exception as e:
+            logger.exception(
+                "parseSummonerData raised", e, "CareerInterface")
+            InfoBar.warning(
+                self.tr("Data load failed"),
+                self.tr("Failed to load game data, displaying cached data."),
+                orient=Qt.Vertical,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                duration=3000,
+                parent=self.window())
+            self.setLoadingPageEnabled(False)
+            return
+
         await self.repaintInterface(info)
 
     async def repaintInterface(self, info):
@@ -444,21 +675,26 @@ class CareerInterface(SeraphineInterface):
 
         self.puuid = puuid
 
+        # parseDetailRankInfo 只返回 Solo/Flex 两行, 需要补 3 行表 (含大乱斗)
+        # ponytail: 大乱斗无排位数据, 该行仅用于展示近 N 场统计
         if 'queueMap' in rankInfo:
             self.rankInfo = parseDetailRankInfo(rankInfo)
+            self.rankInfo.append([self.tr("大乱斗")] + ['--'] * 8)
             self.copyButton.setEnabled(True)
         else:
             self.rankInfo = [[
                 self.tr('Ranked Solo'),
-            ], [
+            ] + ['--'] * 8, [
                 self.tr('Ranked Flex'),
-            ]]
+            ] + ['--'] * 8, [
+                self.tr("大乱斗"),
+            ] + ['--'] * 8]
             self.copyButton.setEnabled(False)
 
-        if not self.isLoginSummoner():
-            for i in range(0, 2):
-                for j in [1, 2, 4]:
-                    self.rankInfo[i][j] = '--'
+        # 近 N 场大乱斗统计 (窗口 = cfg.careerGamesNumber, 非生涯累计; 无该队列局时保持 --)
+        self.__fillAramStats(games)
+
+        # 根因修复: 不再抹除他人 Solo/Flex 统计 (总场次/胜率/负场), 原有逻辑致表格大段 0/--
 
         self.__updateTable()
 
@@ -509,13 +745,55 @@ class CareerInterface(SeraphineInterface):
 
         if 'gameCount' in self.games:
 
-            for bar in [GameInfoBar(game) for game in self.games['games']]:
+            for bar in [self.__makeGameInfoBar(game)
+                        for game in self.games['games']]:
                 bar.setMaximumHeight(86)
                 self.gameInfoLayout.addWidget(bar)
                 self.gameInfoLayout.addSpacing(5)
 
             self.gameInfoLayout.addSpacerItem(
                 QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
+
+    def __makeGameInfoBar(self, game: dict) -> 'GameInfoBar':
+        """创建战绩卡片, 若评级缓存命中则附加当前召唤师的档位徽章."""
+        grade = None
+        gradeLabel = ''
+        gradeComment = ''
+        gradeEvidence = []
+        isCurrent = False
+        try:
+            if cfg.get(cfg.enableTeamRating):
+                from app.lol.war_criminal import (RANDOM_TEAM_KEY, gradeLabel as _gLabel,
+                                                  gradeComment as _gComment)
+                from app.lol.war_criminal_cache import getTeamRating
+                # 判断当前召唤师所在队是胜方还是败方
+                isWin = bool(game.get('win'))
+                ratingList = getTeamRating(game.get('gameId'), isWin)
+                if not ratingList:
+                    # 缓存未命中或胜败方判断错误时尝试另一队
+                    ratingList = getTeamRating(game.get('gameId'), not isWin)
+                if ratingList:
+                    # 找到当前召唤师的评级项
+                    currentPuuid = self.puuid
+                    for r in ratingList:
+                        if r.get('puuid') == currentPuuid:
+                            grade = r.get('grade')
+                            # label/评语按当前风格现算; 随机风格用缓存烘焙的实际方案
+                            style = cfg.get(cfg.teamRatingStyle)
+                            if style == RANDOM_TEAM_KEY:
+                                style = r.get('scheme')
+                            g = grade if isinstance(grade, int) else 3
+                            gradeLabel = _gLabel(g, bool(r.get('isWin', isWin)), style)
+                            gradeComment = _gComment(g, bool(r.get('isWin', isWin)), style)
+                            gradeEvidence = r.get('evidence') or []
+                            isCurrent = True
+                            break
+        except Exception:
+            pass
+
+        return GameInfoBar(game, grade=grade, gradeLabel=gradeLabel,
+                       gradeEvidence=gradeEvidence, gradeComment=gradeComment,
+                       isCurrent=isCurrent)
 
     def __onfilterComboBoxChanged(self, index):
         self.gameInfoArea.delegate.vScrollBar.resetValue(0)
@@ -536,8 +814,10 @@ class CareerInterface(SeraphineInterface):
         elif index == 2:
             targetId = 450
         elif index == 3:
-            targetId = 420
+            targetId = 2400
         elif index == 4:
+            targetId = 420
+        elif index == 5:
             targetId = 440
         else:
             targetId = 0
@@ -546,7 +826,7 @@ class CareerInterface(SeraphineInterface):
             self.games.get("games", []), targetId)
 
         for game in hitGames:
-            bar = GameInfoBar(game)
+            bar = self.__makeGameInfoBar(game)
             bar.setMaximumHeight(86)
             self.gameInfoLayout.addWidget(bar)
             self.gameInfoLayout.addSpacing(5)
@@ -577,7 +857,7 @@ class CareerInterface(SeraphineInterface):
         return res
 
     def isLoginSummoner(self):
-        return self.loginSummonerPuuid == None or self.loginSummonerPuuid == self.puuid
+        return self.loginSummonerPuuid is None or self.loginSummonerPuuid == self.puuid
 
     def __onRecentTeammatesButtonClicked(self):
         view = TeammatesFlyOut()
@@ -590,6 +870,15 @@ class CareerInterface(SeraphineInterface):
             view, self.recentTeamButton, self, FlyoutAnimationType.DROP_DOWN)
         self.recentTeammatesFlyout.closed.connect(
             self.__resetRecentTeammatesFlyout)
+
+    def __copySummonerName(self):
+        name = self.getSummonerName()
+        if not name:
+            return
+        pyperclip.copy(name)
+        InfoBar.success(
+            "", self.tr("Summoner name copied"), duration=1200,
+            parent=self.window(), position=InfoBarPosition.BOTTOM_RIGHT)
 
     def __resetRecentTeammatesFlyout(self):
         self.recentTeammatesFlyout = None
@@ -629,8 +918,8 @@ class TeammatesFlyOut(FlyoutViewBase):
         self.stackedWidget.addWidget(self.loadingPageWidget)
         self.stackedWidget.addWidget(self.infoPageWidget)
 
-        self.stackedWidget.setFixedHeight(352)
-        self.stackedWidget.setFixedWidth(490)
+        self.stackedWidget.setFixedHeight(360)
+        self.stackedWidget.setFixedWidth(540)
 
     def clear(self):
         for i in reversed(range(self.infopageVBoxLayout.count())):
@@ -667,7 +956,8 @@ class TeammateInfoBar(ColorAnimationFrame):
         self.hBoxLayout = QHBoxLayout(self)
 
         self.icon = RoundIcon(summoner['icon'], 40, 4, 4)
-        self.name = SummonerName(summoner['name'])
+        self.name = SummonerName(
+            summoner['name'], tagLine=summoner.get('tagLine'))
 
         self.totalTitle = QLabel(self.tr("Total: "))
         self.totalLabel = QLabel(str(summoner["total"]))
@@ -685,7 +975,8 @@ class TeammateInfoBar(ColorAnimationFrame):
             lambda: signalBus.toCareerInterface.emit(summoner['puuid']))
 
     def __initWidget(self):
-        self.name.setFixedWidth(180)
+        self.name.setFixedWidth(190)
+        self.name.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.totalLabel.setFixedWidth(40)
         self.winsLabel.setFixedWidth(40)
         self.lossesLabel.setFixedWidth(40)
@@ -702,6 +993,8 @@ class TeammateInfoBar(ColorAnimationFrame):
         self.lossesLabel.setAlignment(Qt.AlignCenter)
 
     def __initLayout(self):
+        self.hBoxLayout.setContentsMargins(6, 0, 6, 0)
+        self.hBoxLayout.setSpacing(4)
         self.hBoxLayout.addWidget(self.icon)
         self.hBoxLayout.addWidget(self.name)
         self.hBoxLayout.addWidget(self.totalTitle)

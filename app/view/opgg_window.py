@@ -2,7 +2,7 @@ import sys
 import win32api
 import traceback
 
-from qasync import asyncSlot, asyncClose
+from qasync import asyncSlot
 from PyQt5.QtGui import QColor, QPainter, QIcon, QShowEvent
 from PyQt5.QtCore import Qt, pyqtSignal, QSize, QRect, QEvent
 from PyQt5.QtWidgets import (QHBoxLayout, QStackedWidget, QWidget, QLabel,
@@ -11,7 +11,6 @@ from PyQt5.QtWidgets import (QHBoxLayout, QStackedWidget, QWidget, QLabel,
 
 
 from app.common.icons import Icon
-from app.lol.connector import connector
 from app.lol.opgg import opgg
 from app.lol.champions import ChampionAlias
 from app.common.logger import logger
@@ -21,13 +20,12 @@ from app.common.signals import signalBus
 from app.common.util import getLolClientWindowPos
 from app.common.qfluentwidgets import (FramelessWindow, isDarkTheme, BackgroundAnimationWidget,
                                        FluentTitleBar,  ComboBox, BodyLabel, ToolTipFilter,
-                                       ToolTipPosition, IndeterminateProgressRing, setTheme,
-                                       Theme, PushButton, SearchLineEdit, ToolButton,
-                                       FlyoutViewBase, Flyout, FlyoutAnimationType)
+                                       ToolTipPosition, IndeterminateProgressRing, SearchLineEdit, ToolButton,
+                                       FlyoutViewBase, Flyout)
 from app.components.transparent_button import TransparentToggleButton
-from app.components.multi_champion_select import ChampionSelectFlyout
 from app.view.opgg_tier_interface import TierInterface
 from app.view.opgg_build_interface import BuildInterface
+from app.view.opgg_hextech_assist_interface import HextechAssistInterface
 
 TAG = 'OpggWindow'
 
@@ -133,15 +131,12 @@ class OpggWindow(OpggWindowBase):
         self.tierComboBox = ComboBox()
         self.positionComboBox = ComboBox()
 
-        self.debugButton = PushButton()
-        self.debugButton.setFixedSize(33, 33)
-        self.debugButton.clicked.connect(self.__onDebugButtonClicked)
-
         self.versionLabel = BodyLabel()
 
         self.stackedWidget = QStackedWidget()
         self.tierInterface = TierInterface()
         self.buildInterface = BuildInterface()
+        self.hextechAssistInterface = HextechAssistInterface()
         self.waitingInterface = WaitingInterface()
         self.errorInterface = ErrorInterface()
         self.homeInterface = HomeInterface()
@@ -156,8 +151,6 @@ class OpggWindow(OpggWindowBase):
         self.__initWindow()
         self.__initLayout()
 
-        # self.debugButton.click()
-        self.debugButton.setVisible(False)
         self.setHomeInterfaceEnabled(True)
 
     def __initWindow(self):
@@ -166,19 +159,23 @@ class OpggWindow(OpggWindowBase):
         self.setWindowTitle("OP.GG")
 
         self.toggleButton.setToolTip(self.tr("Show Tier / Build"))
+        self.__refreshToolbarIcons()
+        qconfig.themeChangedFinished.connect(self.__refreshToolbarIcons)
         self.toggleButton.installEventFilter(ToolTipFilter(
             self.toggleButton, 500, ToolTipPosition.TOP))
 
         self.modeComboBox.addItem(
-            self.tr("Ranked"), icon="app/resource/images/sr-victory.png", userData='ranked')
+            self.tr("排位赛"), icon="app/resource/images/sr-victory.png", userData='ranked')
         self.modeComboBox.addItem(
-            self.tr("Aram"), icon="app/resource/images/ha-victory.png", userData='aram')
+            self.tr("大乱斗"), icon="app/resource/images/ha-victory.png", userData='aram')
         self.modeComboBox.addItem(
-            self.tr("Arena"), icon="app/resource/images/arena-victory.png", userData='arena')
+            self.tr("海克斯大乱斗"), icon="app/resource/images/ha-victory.png", userData='aram_mayhem')
         self.modeComboBox.addItem(
-            self.tr("Urf"), icon="app/resource/images/other-victory.png", userData='urf')
+            self.tr("斗魂竞技场"), icon="app/resource/images/arena-victory.png", userData='arena')
         self.modeComboBox.addItem(
-            self.tr("Nexus Blitz"), icon="app/resource/images/other-victory.png", userData='nexus_blitz')
+            self.tr("无限火力"), icon="app/resource/images/other-victory.png", userData='urf')
+        self.modeComboBox.addItem(
+            self.tr("极限闪击"), icon="app/resource/images/other-victory.png", userData='nexus_blitz')
 
         self.regionComboBox.addItem(
             self.tr("All regions"), icon="app/resource/images/global.svg", userData="global")
@@ -241,6 +238,17 @@ class OpggWindow(OpggWindowBase):
         signalBus.toOpggBuildInterface.connect(
             self.__toChampionBuildInterface)
 
+    def __refreshToolbarIcons(self):
+        color = QColor('#f2f2f2') if isDarkTheme() else QColor('#1a1a1a')
+        self.searchButton.setIcon(
+            Icon.SEARCH.icon(qconfig.theme, color))
+        self.toggleButton.icons = [
+            Icon.APPLIST.icon(qconfig.theme, color),
+            Icon.PERSON.icon(qconfig.theme, color),
+        ]
+        self.toggleButton.setIcon(
+            self.toggleButton.icons[self.toggleButton.currentIcon])
+
     def __setComboBoxCurrentData(self, comboBox: ComboBox, data) -> int:
         """
         这 `ComboBox` 居然没提供通过 `userData` 设置当前项的函数，我帮它实现一个
@@ -251,6 +259,16 @@ class OpggWindow(OpggWindowBase):
         index = comboBox.findData(data)
         comboBox.setCurrentIndex(index)
 
+    def setModeByData(self, mode: str):
+        """供外部调用: 根据 mode 字符串切换模式 combobox.
+
+        切换会触发 currentIndexChanged 信号, 进而调用 __onFilterTextChanged
+        刷新当前界面 (tier / build). 若 mode 与当前一致则不做任何操作.
+        """
+        if not mode:
+            return
+        self.__setComboBoxCurrentData(self.modeComboBox, mode)
+
     def __initLayout(self):
         self.filterLayout.addWidget(self.toggleButton)
         self.filterLayout.addWidget(self.searchButton)
@@ -258,7 +276,6 @@ class OpggWindow(OpggWindowBase):
         self.filterLayout.addWidget(self.regionComboBox)
         self.filterLayout.addWidget(self.tierComboBox)
         self.filterLayout.addWidget(self.positionComboBox)
-        self.filterLayout.addWidget(self.debugButton)
         self.filterLayout.addSpacerItem(QSpacerItem(
             0, 0, QSizePolicy.Expanding,  QSizePolicy.Fixed))
         self.filterLayout.addWidget(self.versionLabel)
@@ -266,6 +283,7 @@ class OpggWindow(OpggWindowBase):
 
         self.stackedWidget.addWidget(self.tierInterface)
         self.stackedWidget.addWidget(self.buildInterface)
+        self.stackedWidget.addWidget(self.hextechAssistInterface)
         self.stackedWidget.addWidget(self.waitingInterface)
         self.stackedWidget.addWidget(self.errorInterface)
         self.stackedWidget.addWidget(self.homeInterface)
@@ -404,12 +422,27 @@ class OpggWindow(OpggWindowBase):
             self.setAutoRefreshEnabled(True)
 
     async def __updateInterface(self, interface: QWidget):
+        # HomeInterface 无需拉取数据, 直接返回
+        if interface is self.homeInterface:
+            return
+
         map = {
             self.tierInterface: self.__updateTierInterface,
-            self.buildInterface: self.__updateBuildInterface
+            self.buildInterface: self.__updateBuildInterface,
+            self.hextechAssistInterface: self.__updateHextechAssist
         }
 
-        await map[interface]()
+        func = map.get(interface)
+        if func is None:
+            # 防御性: 未知界面 (例如 stackedWidget 仍为 HomeInterface 的情况下
+            # 触发了刷新), 直接切到 tierInterface 并刷新, 避免抛 KeyError
+            logger.warning(
+                f"__updateInterface got unknown interface: {interface}, "
+                f"fallback to tierInterface", TAG)
+            interface = self.tierInterface
+            func = self.__updateTierInterface
+
+        await func()
 
     async def __updateTierInterface(self):
         mode = self.modeComboBox.currentData()
@@ -442,7 +475,7 @@ class OpggWindow(OpggWindowBase):
             # rank 模式下，如果是切换了位置选项，会命中 cache，不用重新请求了
             if tier == self.cachedTier and \
                     region == self.cachedRegion and \
-                    self.cachedRankedTierList != None:
+                    self.cachedRankedTierList is not None:
                 res = self.cachedRankedTierList['data'][position]
                 data = self.cachedRankedTierList
 
@@ -503,13 +536,28 @@ class OpggWindow(OpggWindowBase):
 
         self.versionLabel.setText(self.tr("Version: ") + data['version'])
 
-    @asyncSlot(bool)
-    async def __onDebugButtonClicked(self, _):
-        await opgg.start()
-        await connector.autoStart()
-        await ChampionAlias.checkAndUpdate()
+    async def __updateHextechAssist(self):
+        """刷新海克斯辅助页 (由 __updateInterface 分发调用)"""
+        championId = self.buildInterface.getCurrentChampionId()
+        if not championId or championId <= 0:
+            return
+        await self.hextechAssistInterface.updateForChampion(championId)
 
-        await self.initWindow()
+    def showHextechAssist(self, championId):
+        """供外部调用: 切到海克斯辅助页并加载指定英雄数据.
+
+        Args:
+            championId: 当前游戏英雄 ID
+        """
+        if not championId or championId <= 0:
+            return
+        # 同步 buildInterface 的 championId (供 __updateHextechAssist 读取)
+        self.buildInterface.setCurrentChampionId(championId)
+        # 直接切到辅助页, 异步加载数据 (不走转圈流程, 游戏内需即时响应)
+        self.setCurrentInterface(self.hextechAssistInterface)
+        import asyncio
+        asyncio.ensure_future(
+            self.hextechAssistInterface.updateForChampion(championId))
 
     async def initWindow(self):
         self.__onFilterTextChanged(1)
@@ -547,8 +595,8 @@ class OpggWindow(OpggWindowBase):
         w, h = desktop.width(), desktop.height()
         self.move(w - self.width(), h // 2 - self.height() // 2)
 
-    def setHomeInterfaceEnabled(self, enabeld):
-        interface = self.homeInterface if enabeld else self.tierInterface
+    def setHomeInterfaceEnabled(self, enabled):
+        interface = self.homeInterface if enabled else self.tierInterface
         self.stackedWidget.setCurrentWidget(interface)
 
     def eventFilter(self, obj, e: QEvent):

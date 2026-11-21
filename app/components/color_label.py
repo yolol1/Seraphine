@@ -1,12 +1,11 @@
 from PyQt5.QtWidgets import QLabel
 from PyQt5.QtGui import QColor
 from app.common.style_sheet import ColorChangeable
-from app.common.qfluentwidgets import isDarkTheme
 
 
 class ColorLabel(QLabel, ColorChangeable):
     '''
-    The label color will automatically change as the corresponding `type` color changes
+    该标签颜色会跟随对应 `type` 颜色的改变而自动改变
     '''
 
     def __init__(self, text: str = None, type: str = None, parent=None):

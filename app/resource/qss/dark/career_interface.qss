@@ -1,16 +1,22 @@
+/* Career Interface — Dark Theme
+   Apple Design principle: every spacing, timing, and alignment
+   value is a deliberate choice you can defend. */
+
+/* ── Base typography ──────────────────────────────────── */
 QLabel {
-    color: white;
-    font: 14px 'Segoe UI', 'Microsoft YaHei';
+    color: rgba(255, 255, 255, 0.9);
+    font: 14px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
 QLabel#name {
     color: white;
-    font: bold 32px 'Segoe UI', 'Microsoft YaHei';
+    font: bold 28px 'Microsoft YaHei UI', 'Segoe UI';
+    letter-spacing: -0.3px;
 }
 
 QLabel#tagLineLabel {
-    font: 16px;
-    color: rgb(200, 200, 200);
+    font: 14px;
+    color: rgba(255, 255, 255, 0.6);
 }
 
 QLabel#rencent20GamesLabel,
@@ -18,35 +24,61 @@ QLabel#winsLabel,
 QLabel#lossesLabel,
 QLabel#kdaLabel,
 QLabel#kdaValLabel {
-    color: white;
-    font: 14px 'Segoe UI', 'Microsoft YaHei';
+    color: rgba(255, 255, 255, 0.85);
+    font: 14px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
 QLabel#winsLabel {
-    font: bold;
+    font: bold 14px;
 }
 
 QLabel#lossesLabel {
-    font: bold;
+    font: bold 14px;
 }
 
 QLabel#totalLabel {
-    font: bold;
+    font: bold 14px;
     color: --ThemeColorPrimary;
 }
 
-TeammateInfoBar>#winsLabel {
-    font: bold;
+PushButton#careerActionButton {
+    color: rgba(255, 255, 255, 0.84);
+    background-color: rgba(255, 255, 255, 0.075);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    border-radius: 8px;
+    padding: 0 12px;
+    font: 13px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
-TeammateInfoBar>#lossesLabel {
-    font: bold;
+PushButton#careerActionButton:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.18);
 }
 
-#gameInfoArea {
-    border: 1px solid rgb(35, 35, 35);
+PushButton#careerActionButton:pressed {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+PushButton#copySummonerNameButton {
+    color: rgba(255, 255, 255, 0.82);
+    background-color: rgba(255, 255, 255, 0.075);
+    border: 1px solid rgba(255, 255, 255, 0.11);
     border-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.051);
+    padding: 0 10px;
+    font: 12px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+PushButton#copySummonerNameButton:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.13);
+}
+
+/* ── Cards and containers ─────────────────────────────── */
+#gameInfoArea {
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.04);
 }
 
 #gameInfoWidget {
@@ -54,73 +86,70 @@ TeammateInfoBar>#lossesLabel {
 }
 
 GameInfoBar {
-    border-radius: 6px;
-    border: 1px solid;
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+GameInfoBar:hover {
+    background-color: rgba(255, 255, 255, 0.06);
 }
 
 GameInfoBar>QLabel {
-    color: white;
+    color: rgba(255, 255, 255, 0.85);
     background: transparent;
-    font: 14px 'Segoe UI', 'Microsoft YaHei';
+    font: 14px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
+/* ── KDA area ─────────────────────────────────────────── */
 ItemsKdaCsGold>QLabel {
-    font: 16px 'Segoe UI', 'Microsoft YaHei';
+    font: 15px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
-ItemsKdaCsGold>#kills {
-    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
-}
-
-ItemsKdaCsGold>#deaths {
-    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
-}
-
-ItemsKdaCsGold>#assists {
-    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
-}
-
-ItemsKdaCsGold>#slash1 {
-    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
-}
-
+ItemsKdaCsGold>#kills,
+ItemsKdaCsGold>#deaths,
+ItemsKdaCsGold>#assists,
+ItemsKdaCsGold>#slash1,
 ItemsKdaCsGold>#slash2 {
-    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
+    font: bold 15px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
+/* ── Result / Mode ─────────────────────────────────────── */
 ResultModeSpell>ColorLabel {
-    font: bold 17px 'Segoe UI', 'Microsoft YaHei';
+    font: bold 16px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
+/* ── Career interface root ─────────────────────────────── */
 CareerInterface {
+    border: none;
+    background-color: #202020;
+}
+
+#careerViewport {
     border: none;
     background-color: transparent;
 }
 
+/* ── Teammate info ─────────────────────────────────────── */
 TeammateInfoBar {
-    border: 1px solid;
-    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
 }
 
-TeammateInfoBar>#winsLabel {
-    font: bold;
+TeammateInfoBar:hover {
+    background-color: rgba(255, 255, 255, 0.06);
 }
 
+TeammateInfoBar>#winsLabel,
 TeammateInfoBar>#lossesLabel {
     font: bold;
 }
 
-/* TeammateInfoBar:hover {
-    border: 1px solid rgba(0, 0, 0, 0.095);
-    border-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.0837);
-} */
-
+/* ── Summoner name buttons ─────────────────────────────── */
 SummonerName {
-    font: bold 14px 'Segoe UI', 'Microsoft YaHei';
+    font: bold 14px 'Microsoft YaHei UI', 'Segoe UI';
     text-align: center;
-    padding: 4px 6px 4px 6px;
-    color: white;
+    padding: 4px 8px 4px 8px;
+    color: rgba(255, 255, 255, 0.9);
     border: none;
     background-color: transparent;
 }

@@ -1,4 +1,4 @@
-from PyQt5.QtCore import Qt, QRect, pyqtSignal
+from PyQt5.QtCore import Qt, QRect
 from PyQt5.QtGui import QPainter, QImage, QBrush, QColor
 
 from ..common.qfluentwidgets import NavigationWidget, isDarkTheme
@@ -11,7 +11,11 @@ class NavigationAvatarWidget(NavigationWidget):
         super().__init__(isSelectable=False, parent=parent)
 
         self.name = name
-        self.avatar = QImage(avatar).scaled(
+        img = QImage(avatar) if avatar else QImage(24, 24, QImage.Format_ARGB32)
+        if img.isNull():
+            img = QImage(24, 24, QImage.Format_ARGB32)
+            img.fill(QColor(0, 0, 0, 0))
+        self.avatar = img.scaled(
             24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation
         )
 

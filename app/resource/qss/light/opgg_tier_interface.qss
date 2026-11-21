@@ -38,6 +38,27 @@ ListItem {
 #counterLabel,
 #championLabel {
     color: black;
-    font: 14px 'Microsoft YaHei', 'Segoe UI';
+    font: 14px 'Microsoft YaHei UI', 'Segoe UI';
     padding: 6px 6px 8px 8px;
+}
+
+TransparentButton#tierSortButton {
+    color: rgba(0, 0, 0, 0.66);
+    background-color: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    padding: 5px 4px 7px 4px;
+    font: bold 13px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+TransparentButton#tierSortButton:hover {
+    color: rgba(0, 0, 0, 0.9);
+    background-color: rgba(0, 0, 0, 0.05);
+}
+
+TransparentButton#tierSortButton[selected=true] {
+    color: --ThemeColorDark1;
+    background-color: transparent;
+    border-bottom: 2px solid --ThemeColorPrimary;
 }

@@ -1,30 +1,27 @@
-from PyQt5.QtCore import QEvent, Qt, pyqtSignal, QRectF, QSize
-from PyQt5.QtGui import (QColor, QMouseEvent, QPainter, QPainterPath, QLinearGradient, QGradient,
-                         QPen, QPixmap, qGray, qAlpha, qRgba)
-from PyQt5.QtWidgets import QWidget, QFrame, QLabel, QGraphicsOpacityEffect
+from PyQt5.QtCore import QEvent, Qt, pyqtSignal, QRectF
+from PyQt5.QtGui import (QColor, QMouseEvent, QPainter, QPainterPath, QLinearGradient, QPen, QPixmap)
+from PyQt5.QtWidgets import QFrame, QLabel, QGraphicsOpacityEffect
 
-from app.common.qfluentwidgets import isDarkTheme
 
-import time
 
 
 class RoundIcon(QFrame):
     def __init__(self, icon=None, diameter=None, overscaled=0,
                  borderWidth=1, drawBackground=False, enabled=True, parent=None) -> None:
         super().__init__(parent)
-        self.image = QPixmap(icon)
+        self.image = QPixmap(icon) if icon else QPixmap()
 
         self.overscaled = overscaled
         self.borderWidth = borderWidth
         self.drawBackground = drawBackground
         self.enabled = enabled
 
-        self.havePic = icon != None
+        self.havePic = icon is not None and not self.image.isNull()
 
         self.setFixedSize(diameter, diameter)
 
     def paintEvent(self, event) -> None:
-        if not self.havePic:
+        if not self.havePic or self.image.isNull():
             return
 
         painter = QPainter(self)
@@ -35,6 +32,9 @@ class RoundIcon(QFrame):
 
         image = self.image.copy(
             self.overscaled, self.overscaled, width, height)
+
+        if image.isNull():
+            return
 
         size = self.size() * self.devicePixelRatioF()
         image: QPixmap = image.scaled(size,
@@ -67,8 +67,13 @@ class RoundIcon(QFrame):
         return super().paintEvent(event)
 
     def setIcon(self, icon):
-        self.havePic = True
-        self.image = QPixmap(icon)
+        new_image = QPixmap(icon) if icon else QPixmap()
+        if new_image.isNull():
+            self.havePic = False
+            self.image = QPixmap()
+        else:
+            self.havePic = True
+            self.image = new_image
 
         self.repaint()
 
@@ -84,7 +89,8 @@ class RoundIconButton(QFrame):
     def __init__(self, icon, diameter, overscaled, borderWidth, championName, championId, parent=None) -> None:
         super().__init__(parent)
 
-        self.image = QPixmap(icon)
+        self.image = QPixmap(icon) if icon else QPixmap()
+        self.havePic = not self.image.isNull()
 
         self.borderWidth = borderWidth
         self.overscaled = overscaled
@@ -94,10 +100,33 @@ class RoundIconButton(QFrame):
 
         self.isPressed = False
         self.isHover = False
+        self.isSelected = False
+        self.isGrabbed = False
+        self.isWishlist = False
+
+        self._toolTipFilter = None
 
         self.setFixedSize(diameter, diameter)
 
+    def setToolTipFilter(self, tooltipFilter):
+        """保存 ToolTipFilter 引用, 供 clearAll 时主动隐藏 tooltip"""
+        self._toolTipFilter = tooltipFilter
+
+    def cleanupToolTip(self):
+        """主动隐藏并清理 tooltip, 解决 deleteLater 延迟期间 tooltip 堆叠不消失的问题"""
+        if self._toolTipFilter:
+            try:
+                self._toolTipFilter.hideToolTip()
+            except RuntimeError:
+                # 防御: filter 内部的 widget 已被 Qt 原生删除 (RuntimeError:
+                # wrapped C/C++ object of type ... has been deleted)
+                pass
+            self._toolTipFilter = None
+
     def paintEvent(self, event) -> None:
+        if not self.havePic or self.image.isNull():
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -110,6 +139,9 @@ class RoundIconButton(QFrame):
 
         image = self.image.copy(
             self.overscaled, self.overscaled, width, height)
+
+        if image.isNull():
+            return
 
         size = self.size() * self.devicePixelRatioF()
         image = image.scaled(size,
@@ -125,9 +157,37 @@ class RoundIconButton(QFrame):
 
         painter.drawPixmap(self.rect(), image)
 
-        painter.setPen(
-            QPen(QColor(120, 90, 40), self.borderWidth, Qt.SolidLine))
+        # 选中态: 半透明绿色遮罩
+        if self.isSelected and not self.isGrabbed:
+            painter.setOpacity(1)
+            painter.setBrush(QColor(34, 197, 94, 90))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(self.rect())
+
+        painter.setClipping(False)
+
+        # 边框: 选中/已抢到用绿色, 愿望单用金色, 否则默认棕色
+        if self.isSelected or self.isGrabbed:
+            painter.setPen(
+                QPen(QColor(34, 197, 94), self.borderWidth + 1, Qt.SolidLine))
+        elif self.isWishlist:
+            painter.setPen(
+                QPen(QColor(234, 179, 8), self.borderWidth + 1, Qt.SolidLine))
+        else:
+            painter.setPen(
+                QPen(QColor(120, 90, 40), self.borderWidth, Qt.SolidLine))
+        painter.setBrush(Qt.NoBrush)
         painter.drawEllipse(0, 0, self.width(), self.height())
+
+        # 已抢到: 画一个白色勾
+        if self.isGrabbed:
+            painter.setPen(QPen(QColor(255, 255, 255), 2.5,
+                                Qt.SolidLine, Qt.RoundCap))
+            cx, cy = self.width() / 2, self.height() / 2
+            painter.drawLine(int(cx - 6), int(cy),
+                             int(cx - 2), int(cy + 4))
+            painter.drawLine(int(cx - 2), int(cy + 4),
+                             int(cx + 6), int(cy - 5))
 
         return super().paintEvent(event)
 
@@ -157,9 +217,10 @@ class RoundIconButton(QFrame):
 class TopRoundedLabel(QLabel):
     def __init__(self, imagePath=None, radius=4.0, parent=None):
         super().__init__(parent)
-        self.setPixmap(QPixmap(imagePath))
+        pixmap = QPixmap(imagePath) if imagePath else QPixmap()
+        self.setPixmap(pixmap)
 
-        self.havePic = imagePath != None
+        self.havePic = imagePath is not None and not pixmap.isNull()
         self.radius = radius
 
         self.opacity = QGraphicsOpacityEffect(opacity=1)
@@ -169,10 +230,14 @@ class TopRoundedLabel(QLabel):
         if not self.havePic:
             return super().paintEvent(e)
 
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return super().paintEvent(e)
+
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing)
 
-        pixmap = self.pixmap().scaled(
+        pixmap = pm.scaled(
             self.size()*self.devicePixelRatioF(),
             Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
@@ -199,9 +264,12 @@ class TopRoundedLabel(QLabel):
         painter.drawPixmap(self.rect(), pixmap)
 
     def setPicture(self, imagePath):
-        self.havePic = True
-
-        self.setPixmap(QPixmap(imagePath))
+        pm = QPixmap(imagePath) if imagePath else QPixmap()
+        if pm.isNull():
+            self.havePic = False
+        else:
+            self.havePic = True
+            self.setPixmap(pm)
         self.repaint()
 
     def setRedius(self, radius):
@@ -217,9 +285,10 @@ class TopRoundedLabel(QLabel):
 class RoundedLabel(QLabel):
     def __init__(self, imagePath=None, radius=4.0, borderWidth=2, borderColor: QColor = None, drawBackground=False, parent=None):
         super().__init__(parent)
-        self.setPixmap(QPixmap(imagePath))
+        pixmap = QPixmap(imagePath)
+        self.setPixmap(pixmap)
 
-        self.havePic = imagePath != None
+        self.havePic = imagePath is not None and not pixmap.isNull()
         self.radius = radius
         self.borderWidth = borderWidth
         self.borderColor = borderColor if borderColor else QColor(120, 90, 40)
@@ -229,10 +298,14 @@ class RoundedLabel(QLabel):
         if not self.havePic:
             return super().paintEvent(e)
 
+        pm = self.pixmap()
+        if pm is None or pm.isNull():
+            return super().paintEvent(e)
+
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing)
 
-        pixmap = self.pixmap().scaled(
+        pixmap = pm.scaled(
             self.size()*self.devicePixelRatioF(),
             Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
@@ -259,9 +332,12 @@ class RoundedLabel(QLabel):
                 QRectF(self.rect()), self.radius, self.radius)
 
     def setPicture(self, imagePath):
-        self.havePic = True
-
-        self.setPixmap(QPixmap(imagePath))
+        pm = QPixmap(imagePath) if imagePath else QPixmap()
+        if pm.isNull():
+            self.havePic = False
+        else:
+            self.havePic = True
+            self.setPixmap(pm)
         self.repaint()
 
     def setRedius(self, radius):
@@ -280,10 +356,11 @@ class SummonerSpellButton(QFrame):
     def __init__(self, imagePath=None, spellId=None, parent=None):
         super().__init__(parent)
 
+        self.image = None
         if imagePath:
-            self.image = QPixmap(imagePath)
-        else:
-            self.image = None
+            pm = QPixmap(imagePath)
+            if not pm.isNull():
+                self.image = pm
 
         self.spellId = spellId
         self.radius = 5.0
@@ -295,7 +372,7 @@ class SummonerSpellButton(QFrame):
         self.enabled = True
 
     def paintEvent(self, e):
-        if not self.image:
+        if self.image is None or self.image.isNull():
             return super().paintEvent(e)
 
         painter = QPainter(self)
@@ -329,7 +406,8 @@ class SummonerSpellButton(QFrame):
         return super().paintEvent(e)
 
     def setPicture(self, path):
-        self.image = QPixmap(path)
+        pm = QPixmap(path) if path else QPixmap()
+        self.image = None if pm.isNull() else pm
 
     def setSpellId(self, id):
         self.spellId = id

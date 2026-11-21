@@ -1,14 +1,12 @@
 import sys
 
-from PyQt5.QtCore import (Qt, QRectF, QPoint, QPropertyAnimation, QParallelAnimationGroup,
-                          QEasingCurve, QSize, QRect)
-from PyQt5.QtGui import QHideEvent, QPainter, QPainterPath, QPen, QFont, QPixmap, QColor
+from PyQt5.QtCore import (Qt, QRectF, QSize)
+from PyQt5.QtGui import QPainter, QPainterPath, QPen, QFont, QPixmap
 from PyQt5.QtWidgets import (QWidget, QApplication, QMainWindow, QHBoxLayout,
-                             QLabel, QVBoxLayout, QGridLayout, QFrame, QGraphicsDropShadowEffect)
+                             QLabel, QVBoxLayout, QGridLayout)
 
-from app.lol.aram import AramBuff
 from app.common.qfluentwidgets import (ProgressRing, ToolTipFilter, ToolTipPosition, isDarkTheme,
-                                       themeColor, FlyoutViewBase, TextWrap, FlyoutAnimationType)
+                                       themeColor, FlyoutViewBase)
 from app.components.color_label import ColorLabel
 from app.components.tool_tip import CustomToolTip
 from app.common.style_sheet import StyleSheet
@@ -69,7 +67,8 @@ class RoundLevelAvatar(QWidget):
         self.sep = .3 * diameter
         self.iconPath = icon
 
-        self.image = QPixmap(self.iconPath)
+        self.image = QPixmap(self.iconPath) if self.iconPath else QPixmap()
+        self.havePic = not self.image.isNull()
 
         self.setFixedSize(self.diameter, self.diameter)
 
@@ -97,6 +96,9 @@ class RoundLevelAvatar(QWidget):
             self.paintXpSinceLastLevel = self.xpSinceLastLevel
             self.callUpdate = False
 
+        if not self.havePic or self.image.isNull():
+            return
+
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
@@ -108,6 +110,9 @@ class RoundLevelAvatar(QWidget):
             width = image.width() - 10
             height = image.height() - 10
             image = image.copy(5, 5, width, height)
+
+        if image.isNull():
+            return
 
         scaledImage = image.scaled(size,
                                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
@@ -125,7 +130,13 @@ class RoundLevelAvatar(QWidget):
 
     def updateIcon(self, icon: str, xpSinceLastLevel=None, xpUntilNextLevel=None, text=""):
         self.iconPath = icon
-        self.image = QPixmap(self.iconPath)
+        pm = QPixmap(self.iconPath) if self.iconPath else QPixmap()
+        if pm.isNull():
+            self.havePic = False
+            self.image = QPixmap()
+        else:
+            self.havePic = True
+            self.image = pm
 
         if xpSinceLastLevel is not None and xpUntilNextLevel is not None:
             self.xpSinceLastLevel = xpSinceLastLevel

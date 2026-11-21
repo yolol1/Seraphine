@@ -1,35 +1,65 @@
 GameInfoInterface {
     border: none;
+    background-color: #202020;
+}
+
+#gameInfoViewport {
+    border: none;
     background-color: transparent;
 }
 
+PushButton#gameInfoActionButton {
+    color: rgba(255, 255, 255, 0.82);
+    background-color: rgba(255, 255, 255, 0.075);
+    border: 1px solid rgba(255, 255, 255, 0.11);
+    border-radius: 8px;
+    padding: 0 14px;
+    font: 13px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+PushButton#gameInfoActionButton:hover {
+    color: #ffffff;
+    background-color: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.18);
+}
+
+PushButton#gameInfoActionButton:pressed {
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
 SummonersView {
-    border: 1px solid rgb(35, 35, 35);
-    border-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.051);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    background-color: rgba(255, 255, 255, 0.045);
 }
 
 SummonersGamesView {
-    border-radius: 6px;
-    border: 1px solid rgb(35, 35, 35);
-    background-color: rgba(255, 255, 255, 0.051);
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.045);
+}
+
+#summonersGamesView {
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.045);
 }
 
 SummonerInfoView {
-    border-radius: 6px;
-    border: 1px solid rgb(82, 82, 82);
-    /* background-color: rgba(255, 255, 255, 0.051); */
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
-/* SummonerInfoView:enabled:hover {
-    background-color: rgba(255, 255, 255, 0.0837);
-} */
+SummonerInfoView:hover {
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: rgba(255, 255, 255, 0.08);
+}
 
 SummonerName {
-    font: bold 13px 'Microsoft YaHei', 'Segoe UI', 'PingFang SC';
-    /* text-align: left; */
-    padding: 4px 6px 4px 6px;
-    color: white;
+    font: bold 14px 'Microsoft YaHei UI', 'Segoe UI';
+    padding: 0 6px;
+    color: rgba(255, 255, 255, 0.9);
     border: none;
     background-color: transparent;
 }
@@ -43,68 +73,71 @@ SummonerName[pressed=true] {
 }
 
 SummonerName:disabled {
-    color: rgba(255, 255, 255, 0.43);
+    color: rgba(255, 255, 255, 0.5);
     background-color: transparent;
 }
 
 SummonerInfoView>QLabel {
-    color: white;
-    font: 12px 'Segoe UI', 'Microsoft YaHei';
+    color: rgba(255, 255, 255, 0.7);
+    font: 13px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
 SummonerInfoView>SummonerName {
-    font: bold 13px 'Microsoft YaHei', 'Segoe UI', 'PingFang SC';
-    /* text-align: left; */
-    padding: 4px 6px 4px 6px;
-    color: white;
+    font: bold 14px 'Microsoft YaHei UI', 'Segoe UI';
+    padding: 0 6px;
+    color: rgba(255, 255, 255, 0.9);
     border: none;
     background-color: transparent;
 }
 
 SummonerInfoView>#kdaLabel,
 SummonerInfoView>#kdaValLabel {
-    font: 10px 'Segoe UI', 'Microsoft YaHei';
-    /* border: 1px solid black; */
+    font: 12px 'Microsoft YaHei UI', 'Segoe UI';
 }
 
 GameTab {
-    border-radius: 6px;
+    border-radius: 7px;
     border: 1px solid;
 }
 
 GameTab>QLabel {
-    color: white;
-    font: 13px 'Segoe UI', 'Microsoft YaHei';
+    color: rgba(255, 255, 255, 0.9);
+    font: 13px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+GameTab>#modeName {
+    font: 11px 'Microsoft YaHei UI', 'Segoe UI';
+    color: rgba(255, 255, 255, 0.56);
 }
 
 GameTab>#time {
-    font: 11px;
+    font: 11px 'Microsoft YaHei UI', 'Segoe UI';
+    color: rgba(255, 255, 255, 0.56);
 }
 
 GameTab>#kills {
-    font: bold 11px;
+    font: bold 12px;
 }
 
 GameTab>#slash1 {
-    font: bold 11px;
+    font: bold 12px;
 }
 
 GameTab>#deaths {
-    font: bold 11px;
+    font: bold 12px;
 }
 
 GameTab>#slash2 {
-    font: bold 11px;
+    font: bold 12px;
 }
 
 GameTab>#assists {
-    font: bold 11px;
+    font: bold 12px;
 }
-
 
 Games {
     border: none;
-    border-right: 1px solid rgb(35, 35, 35);
+    border-right: 1px solid rgba(255, 255, 255, 0.08);
     background-color: transparent;
 }
 
@@ -113,8 +146,9 @@ Games[isLast=true] {
 }
 
 Games>#summonerName {
-    color: white;
-    font: bold 15px 'Microsoft YaHei', 'Segoe UI';
+    color: rgba(255, 255, 255, 0.9);
+    font: bold 13px 'Microsoft YaHei UI', 'Segoe UI';
+    padding: 0 4px;
 }
 
 Games>#summonerName:hover {
@@ -124,17 +158,41 @@ Games>#summonerName:hover {
 Games:hover {
     border: none;
     border-radius: 0;
-    background-color: rgba(255, 255, 255, 0.0837);
+    background-color: rgba(255, 255, 255, 0.08);
 }
 
 Games[isFirst=true]:hover {
-    border-top-left-radius: 6px;
-    border-bottom-left-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.0837);
+    border-top-left-radius: 8px;
+    border-bottom-left-radius: 8px;
+    background-color: rgba(255, 255, 255, 0.08);
 }
 
 Games[isLast=true]:hover {
-    border-top-right-radius: 6px;
-    border-bottom-right-radius: 6px;
-    background-color: rgba(255, 255, 255, 0.0837);
+    border-top-right-radius: 8px;
+    border-bottom-right-radius: 8px;
+    background-color: rgba(255, 255, 255, 0.08);
+}
+
+QScrollBar:vertical {
+    width: 9px;
+    margin: 2px 0;
+    background: transparent;
+}
+
+QScrollBar::handle:vertical {
+    min-height: 36px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.22);
+}
+
+QScrollBar::handle:vertical:hover {
+    background: rgba(255, 255, 255, 0.34);
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {
+    height: 0;
+    background: transparent;
 }

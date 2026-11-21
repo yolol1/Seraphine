@@ -1,14 +1,12 @@
-import subprocess
+import asyncio
 import os
-import threading
 
-import pyperclip
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QWidget, QVBoxLayout,
                              QSpacerItem, QSizePolicy)
+from qasync import asyncSlot
 
-from app.common.qfluentwidgets import (InfoBar, InfoBarPosition, PushButton, SmoothScrollArea,
-                                       IndeterminateProgressBar, ComboBox)
+from app.common.qfluentwidgets import (InfoBar, InfoBarPosition, PushButton, IndeterminateProgressBar, ComboBox)
 from app.components.seraphine_interface import SeraphineInterface
 
 from app.lol.connector import connector
@@ -106,7 +104,8 @@ class StartInterface(SeraphineInterface):
     def __connectSignalToSlot(self):
         self.pushButton.clicked.connect(self.__onPushButtonClicked)
 
-    def __onPushButtonClicked(self):
+    @asyncSlot()
+    async def __onPushButtonClicked(self):
         if self.loading:
             for clientName in ("client.exe", "LeagueClient.exe"):
                 path = f'{self.pathComboBox.currentText()}/{clientName}'
@@ -128,7 +127,16 @@ class StartInterface(SeraphineInterface):
             elif len(pids) == 1:
                 self.__showCantChangeLolClientInfo()
             else:
-                box = ChangeClientMessageBox(pids=pids, parent=self.window())
+                # 异步预取每个客户端的登录召唤师信息, 避免阻塞 Qt 事件循环
+                summoners = {}
+                results = await asyncio.gather(
+                    *(connector.getLoginSummonerByPid(pid) for pid in pids),
+                    return_exceptions=True)
+                for pid, res in zip(pids, results):
+                    summoners[pid] = res if isinstance(res, dict) else {}
+
+                box = ChangeClientMessageBox(pids=pids, summoners=summoners,
+                                             parent=self.window())
                 box.exec()
 
     def __showCantChangeLolClientInfo(self):

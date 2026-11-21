@@ -1,5 +1,6 @@
 import os
 import sys
+import random
 import traceback
 import time
 import copy
@@ -9,15 +10,16 @@ from pathlib import Path
 import pyperclip
 
 import asyncio
+import aiohttp
 from aiohttp.client_exceptions import ClientConnectorError
 from qasync import asyncClose, asyncSlot
-from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent, QTimer, QPoint
-from PyQt5.QtGui import QIcon, QImage
-from PyQt5.QtWidgets import QApplication, QSystemTrayIcon
+from PyQt5.QtCore import Qt, pyqtSignal, QSize, QEvent, QTimer
+from PyQt5.QtGui import QIcon, QImage, QColor
+from PyQt5.QtWidgets import QApplication, QLabel, QSystemTrayIcon
 
 from app.common.qfluentwidgets import (NavigationItemPosition, InfoBar, InfoBarPosition, Action,
                                        FluentWindow, SplashScreen, MessageBox, SmoothScrollArea,
-                                       ToolTipFilter, FluentIcon, ToolTipPosition, FluentWindowBase)
+                                       ToolTipFilter, FluentIcon, ToolTipPosition, Flyout, FlyoutAnimationType)
 
 from app.view.start_interface import StartInterface
 from app.view.setting_interface import SettingInterface
@@ -26,8 +28,12 @@ from app.view.search_interface import SearchInterface
 from app.view.game_info_interface import GameInfoInterface
 from app.view.auxiliary_interface import AuxiliaryInterface
 from app.view.opgg_window import OpggWindow
+from app.view.hextech_window import HextechWindow, HextechGrabFlyout
+from app.view.decline_window import DeclineWindow
 from app.common.util import (github, getLolClientPid, getTasklistPath,
-                             getLolClientPidSlowly, getLoLPathByRegistry)
+                             getLolClientPidSlowly, getLoLPathByRegistry,
+                             findGameWindowHwnd, findProcessWindowHwnd,
+                              forceForegroundWindow, sendMediaPlayPause)
 from app.components.avatar_widget import NavigationAvatarWidget
 from app.components.temp_system_tray_menu import TmpSystemTrayMenu
 from app.common.icons import Icon
@@ -45,14 +51,51 @@ from app.lol.tools import (parseAllyGameInfo, parseGameInfoByGameflowSession,
                            getAllyOrderByGameRole, getTeamColor, autoBan, autoPick,
                            autoComplete, autoSwap, autoTrade, ChampionSelection,
                            SERVERS_NAME, SERVERS_SUBSET, showOpggBuild, autoShow,
-                           autoSetSummonerSpell)
+                           autoSetSummonerSpell, autoBenchGrab)
 from app.lol.aram import AramBuff
 from app.lol.champions import ChampionAlias
 from app.lol.opgg import opgg
+from app.lol.static_data import static_data
+from app.lol.live_client import liveClient
+from app.lol.tools_pure import pickHonorTarget  # noqa: F401  # 保留供测试/外部调用
+from app.lol.horse_orchestrator import SendGuard, divisionNameToIdx, tierNameToIdx
 
 import threading
 
 TAG = "MainWindow"
+
+
+class DeathCountdownWindow(QLabel):
+    """顶层置顶复活倒计时窗口 — 即使 Seraphine 在后台也可见"""
+
+    def __init__(self):
+        super().__init__(None)
+        self.setWindowFlags(
+            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAlignment(Qt.AlignCenter)
+        self.setStyleSheet(
+            "QLabel { background: rgba(0,0,0,180); color: #ff6666; "
+            "font-size: 32px; font-weight: bold; padding: 6px 20px; "
+            "border-radius: 10px; border: 1px solid rgba(255,70,70,100); }"
+        )
+
+    def showWithText(self, text: str):
+        self.setText(text)
+        self.adjustSize()
+        # 定位在屏幕正中央顶部
+        screen = QApplication.primaryScreen()
+        if screen:
+            sg = screen.availableGeometry()
+            self.move(sg.left() + (sg.width() - self.width()) // 2, sg.top() + 12)
+        self.show()
+
+    def closeEvent(self, a0):
+        # 防止悬空窗口残留 — Qt.Tool + 无 parent 时需显式关闭
+        self.hide()
+        super().closeEvent(a0)
 
 
 class MainWindow(FluentWindow):
@@ -60,7 +103,13 @@ class MainWindow(FluentWindow):
     showUpdateMessageBox = pyqtSignal(dict)
     showNoticeMessageBox = pyqtSignal(str)
     checkUpdateFailed = pyqtSignal()
+
+    checkUpToDate = pyqtSignal()
     fetchNoticeFailed = pyqtSignal()
+    showUpdateDot = pyqtSignal()
+
+    # 秒退确认后回到 async 执行 (确认框在同步上下文弹出, 见 __showDodgeConfirmBox)
+    dodgeConfirmed = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -90,15 +139,49 @@ class MainWindow(FluentWindow):
             target=self.checkUpdate, parent=self)
         self.checkNoticeThread = StoppableThread(
             target=lambda: self.checkNotice(False), parent=self)
+        self._updateDot = None
+        # 上等马播报: 每局每通道最多一次的守卫
+        self._horseSendGuard = SendGuard()
+        # 红蓝方播报: 每局最多一次的守卫
+        self._sideChatGuard = SendGuard()
+        # 本局实际使用的马评分方案 (随机风格时进局只抽一次, 全局共享)
+        self._horseResolvedStyle = None
 
         logger.critical("Seraphine listerners started", TAG)
 
-        self.currentSummoner = None
+        self.currentSummoner = cfg.get(cfg.lastSummoner) or None
 
         self.isGaming = False
+        # 当前这局的对局面板是否真正加载成功 (GameStart 失败时供 InProgress 补拉)
+        self.gameInfoLoaded = False
         self.isTrayExit = False
         self.tasklistEnabled = True
         self.championSelection = ChampionSelection()
+        self._autoStartTask = None
+        self._lastGameStatus = None
+        self._accept_task = None
+        self._accepted_this_ready_check = False
+        self._user_declined_this_session = False
+
+        # 海克斯辅助: 游戏内 3 秒轮询 Live Client API 采集已选强化
+        self.hextechAssistTimer = QTimer(self)
+        self.hextechAssistTimer.setInterval(3000)
+        self.hextechAssistTimer.timeout.connect(
+            lambda: asyncio.ensure_future(self.__onHextechAssistTick()))
+
+        # 死亡自动切窗: 游戏内 2 秒轮询死亡状态
+        self.deathSwitchTimer = QTimer(self)
+        self.deathSwitchTimer.setInterval(2000)
+        self.deathSwitchTimer.timeout.connect(
+            lambda: asyncio.ensure_future(self.__onDeathSwitchTick()))
+        self._deathPrevAlive = True
+        self._deathRespawnTask = None
+        self._deathBrowserHwnd = 0
+        self._deathCountdownEnd = 0.0
+        self._deathCountdownWindow = DeathCountdownWindow()
+        self._deathCountdownTimer = QTimer(self)
+        self._deathCountdownTimer.setInterval(1000)
+        self._deathCountdownTimer.timeout.connect(self.__onDeathCountdownTick)
 
         self.lastTipsTime = time.time()
         self.lastTipsType = None
@@ -106,6 +189,16 @@ class MainWindow(FluentWindow):
         self.__initInterface()
         self.__initNavigation()
         self.__initListener()
+
+        # Hextech 抢人窗口必须在 __conncetSignalToSlot 之前创建 (接线引用 self.hextechWindow)
+        self.hextechWindow = HextechWindow()
+        self.hextechWindow.setChampionSelection(self.championSelection)
+
+        # 拒绝对局窗口 (自动接受后反悔): 同样需在接线前创建
+        self.declineWindow = DeclineWindow()
+        self.declineWindow.declineRequested.connect(
+            lambda: asyncio.ensure_future(self.__declineMatchMaking()))
+
         self.__conncetSignalToSlot()
         self.__autoStartLolClient()
 
@@ -115,7 +208,38 @@ class MainWindow(FluentWindow):
 
         logger.critical("Seraphine initialized", TAG)
 
+        QTimer.singleShot(0, lambda: asyncio.ensure_future(self.__initOfflineServices()))
+
         self.__silentStart()
+
+    async def __initOfflineServices(self):
+        try:
+            await static_data.ensure_loaded()
+        except (OSError, RuntimeError) as e:
+            logger.warning(f"static_data load failed: {e}", TAG)
+        try:
+            await opgg.start()
+            # 切换到 tier 界面后再初始化, 否则当前界面仍是 homeInterface,
+            # __updateInterface 会因早期返回而不拉取数据 (导致必须连接客户端才能加载)
+            self.opggWindow.setHomeInterfaceEnabled(False)
+            await self.opggWindow.initWindow()
+        except Exception as e:
+            logger.warning(f"Failed to pre-start OPGG: {e}", TAG)
+        if self.currentSummoner:
+            await self.__updateAvatarIconName()
+            # 用 lastSummoner 加载生涯页面 (客户端未连接时显示缓存的召唤师信息,
+            # 战绩/段位数据因 LCU 不可用而为空, parseSummonerData 已有容错)
+            try:
+                self.careerInterface.setLoginSummonerPuuid(
+                    self.currentSummoner.get('puuid'))
+                # 同步设置 loading 状态以立即 UI 反馈
+                self.careerInterface.setLoadingPageEnabled(True)
+                await self.careerInterface.updateInterface(
+                    summoner=self.currentSummoner)
+                # 客户端未连接时停留在生涯页面, 而不是启动页
+                self.checkAndSwitchTo(self.careerInterface)
+            except Exception as e:
+                logger.warning(f"Failed to load career with lastSummoner: {e}", TAG)
 
     def __initConfig(self):
         folder = cfg.get(cfg.lolFolder)
@@ -166,6 +290,16 @@ class MainWindow(FluentWindow):
         pos = NavigationItemPosition.BOTTOM
 
         self.navigationInterface.addItem(
+            routeKey='HextechGrab',
+            icon=QIcon("app/resource/images/hextech.svg"),
+            text=self.tr("换英雄"),
+            onClick=self.showHextechWindow,
+            selectable=False,
+            position=pos,
+            tooltip=self.tr("大乱斗无CD换英雄")
+        )
+
+        self.navigationInterface.addItem(
             routeKey='Opgg',
             icon=QIcon("app/resource/images/opgg.svg"),
             text="OP.GG",
@@ -173,6 +307,16 @@ class MainWindow(FluentWindow):
             selectable=False,
             position=pos,
             tooltip="OP.GG"
+        )
+
+        self.navigationInterface.addItem(
+            routeKey='Dodge',
+            icon=Icon.EXIT,
+            text=self.tr("秒退"),
+            onClick=self.__onDodgeButtonClicked,
+            selectable=False,
+            position=pos,
+            tooltip=self.tr("秒退"),
         )
 
         self.navigationInterface.addItem(
@@ -208,14 +352,14 @@ class MainWindow(FluentWindow):
             position=pos,
         )
 
-        self.addSubInterface(
+        self.settingNavItem = self.addSubInterface(
             self.settingInterface, FluentIcon.SETTING,
             self.tr("Settings"), pos,
         )
 
-        # set the maximum width
-        self.navigationInterface.setExpandWidth(250)
-        self.navigationInterface.setMinimumExpandWidth(1321)
+        # Keep navigation compact while leaving room for the longest label.
+        self.navigationInterface.setExpandWidth(210)
+        self.navigationInterface.panel.expand()
 
     def __conncetSignalToSlot(self):
         # From listener:
@@ -234,8 +378,13 @@ class MainWindow(FluentWindow):
             self.__onChampSelectChanged)
         signalBus.lcuApiExceptionRaised.connect(
             self.__onShowLcuConnectError)
+        signalBus.lcuNotConnected.connect(self.__onLcuNotConnected)
         signalBus.getCmdlineError.connect(
             self.__showNeedAdminMessageBox)
+        signalBus.readyCheckChanged.connect(
+            self.__onReadyCheckChanged)
+        cfg.enableAutoStartMatchmaking.valueChanged.connect(
+            self.__onAutoStartMatchmakingToggled)
 
         # From career_interface
         signalBus.careerGameBarClicked.connect(self.__onCareerGameClicked)
@@ -243,6 +392,14 @@ class MainWindow(FluentWindow):
         # From search_interface and gameinfo_interface
         signalBus.toSearchInterface.connect(self.__switchToSearchInterface)
         signalBus.toCareerInterface.connect(self.__switchToCareerInterface)
+        self.gameInfoInterface.manualSendHorseReport.connect(
+            self.__onManualSendHorseReport)
+        # 对局信息页"刷新"按钮: 战绩服务故障恢复后手动重拉
+        self.gameInfoInterface.refreshRequested.connect(
+            self.__onGameInfoRefreshRequested)
+        # 后台恢复拿到完整战绩后自动重绘对局信息面板
+        signalBus.matchHistoryRecovered.connect(
+            self.__onMatchHistoryRecovered)
 
         # From setting_interface
         self.settingInterface.careerGamesCount.pushButton.clicked.connect(
@@ -252,12 +409,19 @@ class MainWindow(FluentWindow):
 
         # From main_window
         self.showUpdateMessageBox.connect(self.__onShowUpdateMessageBox)
+        signalBus.checkUpdateRequested.connect(
+            lambda: threading.Thread(target=self.checkUpdate, args=(True,), daemon=True).start())
         self.showNoticeMessageBox.connect(self.__onShowNoticeMessageBox)
         self.checkUpdateFailed.connect(self.__onCheckUpdateFailed)
+        self.checkUpToDate.connect(self.__onCheckUpToDate)
         self.fetchNoticeFailed.connect(self.__onFetchNoticeFailed)
+        self.showUpdateDot.connect(self._showUpdateDot)
+        self.dodgeConfirmed.connect(self.__doDodge)
         self.stackedWidget.currentChanged.connect(
             self.__onCurrentStackedChanged)
         self.mainWindowHide.connect(self.__onWindowHide)
+
+        # Hextech/ARAM 抢人窗口 (hextechGrabbed 信号由 HextechWindow 自行 connect, 避免跨类 name mangling)
 
     def __initWindow(self):
         self.setMinimumSize(1134, 826)
@@ -306,11 +470,29 @@ class MainWindow(FluentWindow):
 
         InfoBar.error(
             self.tr("LCU request error"),
-            self.tr(f"Connect API") + f" {api}: {msg}",
+            self.tr("Connect API") + f" {api}: {msg}",
             duration=5000,
             orient=Qt.Vertical,
             parent=self,
             position=InfoBarPosition.BOTTOM_RIGHT
+        )
+
+    def __onLcuNotConnected(self):
+        # LCU 未就绪仍有请求发送时, 由 @retry 统一拦截 ReferenceError 后发射此信号
+        # 复用 lastTipsTime/lastTipsType 限频, 避免短时间内大量请求刷屏
+        if time.time() - self.lastTipsTime < 1.5 and self.lastTipsType is ReferenceError:
+            return
+        self.lastTipsTime = time.time()
+        self.lastTipsType = ReferenceError
+
+        InfoBar.warning(
+            self.tr("Client not connected"),
+            self.tr("League of Legends client is not running. "
+                    "Please start the client first."),
+            orient=Qt.Vertical,
+            duration=4000,
+            position=InfoBarPosition.BOTTOM_RIGHT,
+            parent=self
         )
 
     def __onWindowHide(self, hide):
@@ -325,25 +507,35 @@ class MainWindow(FluentWindow):
             self.showNormal()
             self.activateWindow()
 
-    def checkUpdate(self):
-        if not cfg.get(cfg.enableCheckUpdate):
+    def checkUpdate(self, force=False):
+        if not force and not cfg.get(cfg.enableCheckUpdate):
             return
 
+        logger.info(f"checkUpdate started (force={force})", TAG)
+
         try:
-            releasesInfo = github.checkUpdate()
-        except:
+            releasesInfo = github.checkUpdate(force_refresh=force)
+        except Exception as e:
+            logger.warning(f"checkUpdate failed: {e}", TAG)
             self.checkUpdateFailed.emit()
             return
 
+        # debug
+        logger.info(f"checkUpdate: github.checkUpdate() returns type={type(releasesInfo).__name__} keys={list(releasesInfo.keys()) if isinstance(releasesInfo, dict) else 'N/A'}", TAG)
         if releasesInfo:
+            logger.info(f"update available: {releasesInfo['new_version']}", TAG)
             self.showUpdateMessageBox.emit(releasesInfo)
+            self.showUpdateDot.emit()
+        elif force:
+            logger.info("no update available", TAG)
+            self.checkUpToDate.emit()
 
     def checkNotice(self, triggerByUser):
         try:
             noticeInfo = github.getNotice()
             sha = noticeInfo['sha']
             content = noticeInfo['content']
-        except:
+        except Exception:
             self.fetchNoticeFailed.emit()
             return
 
@@ -361,6 +553,33 @@ class MainWindow(FluentWindow):
                 "Failed to check for updates, possibly unable to connect to Github."),
             duration=5000,
             orient=Qt.Vertical,
+            parent=self,
+            position=InfoBarPosition.BOTTOM_RIGHT
+        )
+
+    def _showUpdateDot(self):
+        if self._updateDot:
+            return
+        # ponytail: 用 QLabel 子控件替代 DotInfoBadge, 避免创建顶层 4x4 窗口
+        # (qfluentwidgets 无 NAVIGATION_ITEM position 管理器, 传 parent=None
+        # 导致 DotInfoBadge 成为顶层窗口, Windows 标题栏与 4x4 max size 冲突)
+        dot = QLabel(self.settingNavItem)
+        dot.setFixedSize(8, 8)
+        dot.setStyleSheet("background-color: red; border-radius: 4px;")
+        dot.move(self.settingNavItem.width() - 10, 3)
+        dot.show()
+        self._updateDot = dot
+
+    def _clearUpdateDot(self):
+        if self._updateDot:
+            self._updateDot.deleteLater()
+            self._updateDot = None
+
+    def __onCheckUpToDate(self):
+        InfoBar.success(
+            self.tr("Check Update"),
+            self.tr("Already up to date"),
+            duration=3000,
             parent=self,
             position=InfoBarPosition.BOTTOM_RIGHT
         )
@@ -391,7 +610,7 @@ class MainWindow(FluentWindow):
 
         if not msgBox.exec():
             signalBus.terminateListeners.emit()
-            sys.exit()
+            QApplication.quit()
 
     def __showNeedAdminMessageBox(self):
         msgBox = MessageBox(self.tr("Get cmdline error"), self.tr(
@@ -400,7 +619,7 @@ class MainWindow(FluentWindow):
         msgBox.exec()
 
         signalBus.terminateListeners.emit()
-        sys.exit()
+        QApplication.quit()
 
     def __initSystemTray(self):
         self.trayIcon = QSystemTrayIcon(self)
@@ -412,8 +631,6 @@ class MainWindow(FluentWindow):
         careerAction = Action(Icon.PERSON, self.tr("Career"), self)
         searchAction = Action(Icon.SEARCH, self.tr("Search 👀"), self)
         gameInfoAction = Action(Icon.GAME, self.tr("Game Information"), self)
-        auxiliaryAction = Action(
-            Icon.WRENCH, self.tr("Auxiliary Functions"), self)
         settingsAction = Action(Icon.SETTING, self.tr("Settings"), self)
         quitAction = Action(Icon.EXIT, self.tr('Quit'), self)
 
@@ -423,10 +640,7 @@ class MainWindow(FluentWindow):
 
         def quit():
             self.isTrayExit = True
-            self.__terminateListeners()
-            self.opggWindow.close()
-            cfg.set(cfg.windowSize, self.windowSize)
-            QApplication.instance().quit()
+            self.close()
 
         careerAction.triggered.connect(
             lambda: showAndSwitch(self.careerInterface))
@@ -434,18 +648,15 @@ class MainWindow(FluentWindow):
             lambda: showAndSwitch(self.searchInterface))
         gameInfoAction.triggered.connect(
             lambda: showAndSwitch(self.gameInfoInterface))
-        auxiliaryAction.triggered.connect(
-            lambda: showAndSwitch(self.auxiliaryFuncInterface))
         settingsAction.triggered.connect(
             lambda: showAndSwitch(self.settingInterface))
         quitAction.triggered.connect(quit)
 
-        self.trayMenu = TmpSystemTrayMenu(parent=self)
+        self.trayMenu = TmpSystemTrayMenu(self)
 
         self.trayMenu.addAction(careerAction)
         self.trayMenu.addAction(searchAction)
         self.trayMenu.addAction(gameInfoAction)
-        self.trayMenu.addAction(auxiliaryAction)
         self.trayMenu.addSeparator()
         self.trayMenu.addAction(settingsAction)
         self.trayMenu.addAction(quitAction)
@@ -470,16 +681,23 @@ class MainWindow(FluentWindow):
 
     async def __changeCareerToCurrentSummoner(self):
         summoner = await connector.getCurrentSummoner()
+        # LCU 未就绪时 @retry 拦截 ReferenceError 返回 None
+        # (已通过 signalBus.lcuNotConnected 发射统一提示)
+        if summoner is None:
+            self.careerInterface.setLoadingPageEnabled(False)
+            return
         self.currentSummoner = summoner
         name = summoner.get("gameName") or summoner['displayName']
         self.careerInterface.setLoginSummonerPuuid(summoner['puuid'])
 
+        # 同步设置 loading 状态以立即 UI 反馈
+        self.careerInterface.setLoadingPageEnabled(True)
         asyncio.create_task(self.careerInterface.updateInterface(
             summoner=summoner))
 
     @asyncSlot(int)
     async def __onLolClientStarted(self, pid):
-        logger.info(f"League of Legends client started: {pid}", TAG)
+        logger.info(f"LoL client started: {pid}, refresh career", TAG)
         res = await self.__startConnector(pid)
         if not res:
             return
@@ -487,6 +705,7 @@ class MainWindow(FluentWindow):
         await opgg.start()
         self.checkAndSwitchTo(self.careerInterface)
         self.isClientProcessRunning = True
+        self.hextechWindow.setClientPresent(True)
 
         await self.__changeCareerToCurrentSummoner()
         await self.__updateAvatarIconName()
@@ -536,8 +755,23 @@ class MainWindow(FluentWindow):
         # ---- 240413 ---- By Hpero4
 
         self.__unlockInterface()
-        await asyncio.gather(championsInit, aramInitT)
-        await self.__onGameStatusChanged(status)
+
+        # 启动时若已在游戏里 (GameStart/InProgress), 先拉对局面板并切页:
+        # 不能等 AramBuff/英雄别名的网络初始化, 否则面板会被延后十几秒
+        # (期间停在生涯页, 看起来就是"没有自动加载对局信息")
+        if status in ('GameStart', 'InProgress'):
+            await self.__onGameStatusChanged(status)
+            await asyncio.gather(championsInit, aramInitT)
+        else:
+            await asyncio.gather(championsInit, aramInitT)
+            # status 是初始化前取的, 等待期间可能已变 (选人→进游戏),
+            # 用最新值处理, 避免按过期阶段走
+            try:
+                status = await connector.getGameStatus()
+            except Exception as e:
+                logger.warning(
+                    f"refresh game status after init failed: {e}", TAG)
+            await self.__onGameStatusChanged(status)
 
         # Note 如果你希望测试大乱斗的数据弹框, 参考这个 -- By Hpero4
         # self.careerInterface.icon.aramInfo = AramBuff.getInfoByChampionId(75)
@@ -561,6 +795,8 @@ class MainWindow(FluentWindow):
     @asyncSlot(int)
     async def __onLolClientChanged(self, pid):
         logger.critical(f"League of Legends client changed: {pid}", TAG)
+        self.currentSummoner = None
+        self.careerInterface.setLoginSummonerPuuid(None)
         await self.__onLolClientEnded()
         self.processListener.runningPid = pid
         await self.__onLolClientStarted(pid)
@@ -569,40 +805,66 @@ class MainWindow(FluentWindow):
     async def __onLolClientEnded(self):
         logger.critical("League of Legends client ended", TAG)
 
+        # LCU 断开后本局状态不再可信: 客户端重开时 gameflow 可能直接是
+        # InProgress, 而 InProgress 分支靠 isGaming 判断是否需要重新拉取
+        # 对局信息 — 不复位就会整局都不刷新 (需重启应用才恢复)
+        self.isGaming = False
+        self.gameInfoLoaded = False
+
         if self.searchInterface.gameLoadingTask:
-            self.searchInterface.puuid = 0
+            self.searchInterface.gameLoadingTask.cancel()
             self.searchInterface.gameLoadingTask = None
 
+        if self.careerInterface.loadGamesTask and not self.careerInterface.loadGamesTask.done():
+            self.careerInterface.loadGamesTask.cancel()
+            self.careerInterface.loadGamesTask = None
+
+        # 停止海克斯辅助轮询
+        self.hextechAssistTimer.stop()
+        self.opggWindow.hextechAssistInterface.clearState()
+
         await connector.close()
-        await opgg.close()
 
         self.isClientProcessRunning = False
-        self.currentSummoner = None
-        self.careerInterface.setLoginSummonerPuuid(None)
+        self.hextechWindow.setClientPresent(False)
 
         await self.__updateAvatarIconName()
 
-        self.startInterface.showLoadingPage()
-        self.careerInterface.setLoadingPageEnabled(True)
-        self.opggWindow.setHomeInterfaceEnabled(True)
+        # OPGG 数据不依赖 LCU (走 lol-api-champion.op.gg),
+        # 客户端断开后保持 tierInterface 可用, 不切回 homeInterface,
+        # 避免触发 setComboBoxesEnabled(False) 把所有过滤控件锁死.
+        # 与 __initOfflineServices 启动路径保持一致.
 
         self.setWindowTitle("Seraphine")
 
-        self.checkAndSwitchTo(self.startInterface)
-        self.__lockInterface()
+        # 有 lastSummoner 时保留在生涯页面 (显示上次召唤师信息), 不切到启动页
+        if self.currentSummoner and self.careerInterface.puuid:
+            self.checkAndSwitchTo(self.careerInterface)
+        else:
+            self.startInterface.showLoadingPage()
+            self.checkAndSwitchTo(self.startInterface)
+            self.__lockInterface()
 
     async def __updateAvatarIconName(self):
         if self.currentSummoner:
             try:
                 iconId = self.currentSummoner['profileIconId']
-                icon = await connector.getProfileIcon(iconId)
+                try:
+                    icon = await connector.getProfileIcon(iconId)
+                except Exception:
+                    cached_icon = f"app/resource/game/profile icons/{iconId}.jpg"
+                    icon = cached_icon if os.path.exists(cached_icon) else "app/resource/images/game.png"
                 name = (self.currentSummoner.get("gameName")
                         or self.currentSummoner['displayName'])
 
-                server = SERVERS_NAME.get(connector.server) or connector.server
-                name += self.tr(" (") + server + self.tr(")")
+                server = (self.currentSummoner.get('server')
+                          or (SERVERS_NAME.get(connector.server) or connector.server if getattr(connector, 'server', None) else ''))
+                suffix = self.tr(" (") + server + self.tr(")") if server else ""
+                if getattr(connector, 'lcuSess', None) is None:
+                    suffix = suffix + self.tr(" (offline)") if suffix else self.tr(" (offline)")
+                name += suffix
 
-                subset = SERVERS_SUBSET.get(connector.server)
+                subset = SERVERS_SUBSET.get(connector.server) if getattr(connector, 'server', None) else None
 
                 if subset and not self.avatarWidget.toolTip():
                     tooltip = self.tr(", ").join(subset)
@@ -612,7 +874,7 @@ class MainWindow(FluentWindow):
                                       ToolTipPosition.TOP)
                     )
 
-            except:
+            except Exception:
                 icon = "app/resource/images/game.png"
                 name = self.tr("Start LOL")
                 self.avatarWidget.setToolTip("")
@@ -621,7 +883,11 @@ class MainWindow(FluentWindow):
             name = self.tr("Start LOL")
             self.avatarWidget.setToolTip("")
 
-        self.avatarWidget.avatar = QImage(icon).scaled(
+        img = QImage(icon) if icon else QImage(24, 24, QImage.Format_ARGB32)
+        if img.isNull():
+            img = QImage(24, 24, QImage.Format_ARGB32)
+            img.fill(QColor(0, 0, 0, 0))
+        self.avatarWidget.avatar = img.scaled(
             24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.avatarWidget.name = name
 
@@ -642,11 +908,33 @@ class MainWindow(FluentWindow):
     @asyncSlot(dict)
     async def __onCurrentSummonerProfileChanged(self, data: dict):
         self.currentSummoner = data
+        self.__cacheCurrentSummoner(data)
 
         await asyncio.gather(self.__updateAvatarIconName(),
                              self.careerInterface.updateNameIconExp(data))
 
         logger.debug(f"Update Summoner Info : {data}", TAG)
+
+    def __cacheCurrentSummoner(self, data: dict):
+        if not data or not data.get('summonerId'):
+            return
+        try:
+            cached = {
+                'summonerId': data.get('summonerId'),
+                'puuid': data.get('puuid'),
+                'displayName': data.get('displayName'),
+                'gameName': data.get('gameName'),
+                'tagLine': data.get('tagLine'),
+                'profileIconId': data.get('profileIconId'),
+                'summonerLevel': data.get('summonerLevel'),
+                'xpSinceLastLevel': data.get('xpSinceLastLevel'),
+                'xpUntilNextLevel': data.get('xpUntilNextLevel'),
+                'privacy': data.get('privacy'),
+                'server': getattr(connector, 'server', None),
+            }
+            cfg.set(cfg.lastSummoner, cached)
+        except Exception as e:
+            logger.warning(f"Failed to cache current summoner: {e}", TAG)
 
     def __autoStartLolClient(self):
         if self.isClientProcessRunning:
@@ -739,12 +1027,13 @@ class MainWindow(FluentWindow):
             msgBox.cancelButton.setText(self.tr('Exit'))
             self.update()
 
-            cfg.set(cfg.enableCloseToTray,
-                    (True if 1 == msgBox.exec() else False))
+            cfg.set(cfg.enableCloseToTray, msgBox.exec())
 
         if not cfg.get(cfg.enableCloseToTray) or self.isTrayExit:
             self.__terminateListeners()
+            self._deathCountdownWindow.close()
             self.opggWindow.close()
+            self.hextechWindow.shutdown()
 
             cfg.set(cfg.windowSize, self.windowSize)
 
@@ -773,93 +1062,232 @@ class MainWindow(FluentWindow):
 
         try:
             self.careerInterface.w.close()
-        except:
-            pass
+        except (AttributeError, RuntimeError) as e:
+            logger.debug(f"careerInterface close skipped: {e}", TAG)
 
         self.checkAndSwitchTo(self.careerInterface)
+        # 同步设置 loading 状态以立即 UI 反馈
+        self.careerInterface.setLoadingPageEnabled(True)
         await self.careerInterface.updateInterface(puuid=puuid)
 
     @asyncSlot(str)
     async def __onGameStatusChanged(self, status):
+        self._lastGameStatus = status
+        # 海克斯换英雄窗口只在选人阶段有意义: 状态一变就立即隐藏, 不能放在
+        # 函数末尾 -- 战绩服务故障时下方 await 抛异常会跳过末尾收尾,
+        # 窗口残留到游戏结束才消失 (2026-10-24 用户反馈)
+        if status != 'ChampSelect':
+            self.opggWindow.setStaysOnTopEnabled(False)
+        # 侧边栏常驻: 只按阶段高亮相关开关 (离开选人时自动收起换英雄区), 不再隐藏窗口
+        self.hextechWindow.setPhase(status)
+
         title = None
         isGaming = False
 
-        logger.critical(f"Client gameflow phase changed: {status}", TAG)
-
         if status == 'None':
             title = self.tr("Home")
+            self._user_declined_this_session = False
             await self.__onGameEnd()
         elif status == 'ChampSelect':
             title = self.tr("Selecting Champions")
+            side = None
 
-            # 在标题添加所处队伍
-            side = await connector.getMapSide()
-            if side:
-                if side == 'blue':
-                    mapSide = self.tr("Blue Team")
-                else:
-                    mapSide = self.tr("Red Team")
+            # 在标题添加所处队伍 (getMapSide 偶发失败不应阻断选英雄流程)
+            try:
+                side = await connector.getMapSide()
+                if side:
+                    if side == 'blue':
+                        mapSide = self.tr("Blue Team")
+                    else:
+                        mapSide = self.tr("Red Team")
 
-                title = title + " - " + mapSide
+                    title = title + " - " + mapSide
+            except Exception as e:
+                logger.warning(f"getMapSide failed, skipping: {e}", TAG)
+
+            # 红蓝方聊天播报: 与标题共用一次 getMapSide 结果, 每局最多一次
+            if side in ('blue', 'red') and cfg.get(cfg.enableSideChat) \
+                    and self._sideChatGuard.try_acquire():
+                asyncio.create_task(self.__postSideChat(side))
 
             await self.__onChampionSelectBegin()
         elif status == 'GameStart':
             title = self.tr("Gaming")
-            await self.__onGameStart()
+            # 对局信息解析失败 (如战绩服务 503) 不应中断 gameflow 收尾
+            try:
+                await self.__onGameStart()
+            except Exception as e:
+                logger.warning(
+                    f"__onGameStart failed ({type(e).__name__}: {e}), "
+                    f"skip to keep gameflow pipeline going", TAG)
             isGaming = True
         elif status == 'InProgress':
             title = self.tr("Gaming")
 
-            # 重连或正常进入游戏 (走 GameStart), 不需要更新数据
-            if not self.isGaming:
-                await self.__onGameStart()
+            # 重连或正常进入游戏 (走 GameStart), 不需要更新数据;
+            # 但 GameStart 阶段加载失败 (session 尚无 gameData/队伍) 时
+            # isGaming 已为 True, 需要按"是否真正加载成功"补一次
+            if not self.isGaming or not self.gameInfoLoaded:
+                try:
+                    await self.__onGameStart()
+                except Exception as e:
+                    logger.warning(
+                        f"__onGameStart failed ({type(e).__name__}: {e}), "
+                        f"skip to keep gameflow pipeline going", TAG)
             isGaming = True
         elif status == 'WaitingForStatus':
             title = self.tr("Waiting for status")
-        elif status == 'EndOfGame':
+        elif status in ('PreEndOfGame', 'EndOfGame'):
             title = self.tr("End of game")
+            # ponytail: PreEndOfGame 时 honor 才能被真正提交 (EndOfGame 会话已拆除)
+            if status == 'PreEndOfGame' and cfg.get(cfg.enableAutoHonor):
+                asyncio.create_task(self.__autoHonor())
+            # 自动再来一局: EndOfGame 阶段调用 playAgain()
+            if status == 'EndOfGame' and cfg.get(cfg.enableAutoPlayAgain):
+                asyncio.create_task(self.__autoPlayAgain())
         elif status == 'Lobby':
             title = self.tr("Lobby")
+            self._user_declined_this_session = False
+            # Schedule before the potentially slow match-history/career refresh
+            # so a service error cannot prevent matchmaking from starting.
+            self.__scheduleAutoStartMatchmaking()
+
+            # 预取 match-history: 一次请求, 战犯诊断/生涯/搜索页共享
+            # 取三者的最大范围, 存到 connector 的 fast cache 中
+            max_needed = max(
+                1,                                        # __diagnoseLastGame 需要 1 条
+                cfg.get(cfg.careerGamesNumber),           # 生涯页需要
+                20,                                       # 搜索页需要 20 条
+            )
+            if isinstance(self.currentSummoner, dict):
+                prefetch_puuid = self.currentSummoner.get('puuid')
+                if prefetch_puuid:
+                    logger.info(
+                        f"Lobby: prefetching games [{0}-{max_needed - 1}] "
+                        f"for {prefetch_puuid}", TAG)
+                    # 预取是尽力而为: LCU/SGP 双失败时会抛
+                    # SummonerGamesNotFound, 不能让它中断 Lobby 后续流程
+                    # (战犯诊断/生涯刷新), 否则整个 __onGameStatusChanged 被打断
+                    try:
+                        await connector.getSummonerGamesByPuuid(
+                            prefetch_puuid, 0, max_needed - 1)
+                    except Exception as e:
+                        logger.warning(
+                            f"Lobby: prefetch games failed "
+                            f"({type(e).__name__}: {e}), continue", TAG)
+
+            # 战犯诊断必须在生涯刷新前完成, 否则 verdict 缓存还没写入,
+            # 战绩卡片渲染时 getVerdict 命中不到, 徽章不会显示
             await self.__onGameEnd()
+            # LCU match-history 缓存过期由 connector.getSummonerGamesByPuuid
+            # 内部的重试机制处理 (检测到 stale cache 自动等待重试),
+            # 这里无需再 sleep
+            logger.info("Career: refresh triggered (lobby)", TAG)
             await self.careerInterface.refresh()
+
+            # 同步刷新战绩查询页: 生涯页刷新后, 若搜索页已加载同一召唤师,
+            # 强制重新拉取数据, 避免左侧对局列表显示旧数据
+            if (self.searchInterface.puuid
+                    and self.searchInterface.puuid != 0
+                    and self.searchInterface.puuid == self.careerInterface.puuid):
+                asyncio.create_task(
+                    self.searchInterface.searchAndShowFirstPage(force=True))
 
             if self.stackedWidget.currentWidget() is self.gameInfoInterface:
                 self.switchTo(self.careerInterface)
 
         elif status == 'ReadyCheck':
             title = self.tr("Ready check")
+            self._accepted_this_ready_check = False
             await self.__onMatchMade()
         elif status == 'Matchmaking':
             title = self.tr("Match making")
             await self.__onGameEnd()
-        elif status == "Reconnect":  # 等待重连
+        elif status == "Reconnect":
             title = self.tr("Waiting reconnect")
             await self.__onReconnect()
 
+        if status != 'Lobby':
+            self.__cancelAutoStartMatchmaking()
+
+        if status != 'ReadyCheck':
+            self._accepted_this_ready_check = False
+            if self._accept_task and not self._accept_task.done():
+                self._accept_task.cancel()
+                self._accept_task = None
+            self.declineWindow.hide()
+
         self.isGaming = isGaming
 
-        if status != 'ChampSelect':
-            self.opggWindow.setStaysOnTopEnabled(False)
-
-        if title != None:
+        if title is not None:
             self.setWindowTitle("Seraphine - " + title)
 
     async def __onMatchMade(self):
         if not cfg.get(cfg.enableAutoAcceptMatching):
             return
+        if self._accepted_this_ready_check:
+            return
+        if self._user_declined_this_session:
+            return
 
-        async def accept():
-            timeDelay = cfg.get(cfg.autoAcceptMatchingDelay)
-            await asyncio.sleep(timeDelay)
+        self._accepted_this_ready_check = True
+        self._accept_task = asyncio.create_task(self._do_accept())
+
+    async def _do_accept(self):
+        import random
+        delay_ms = cfg.get(cfg.autoAcceptDelayMs)
+        if delay_ms > 0:
+            delay_ms = random.randint(0, delay_ms)
+
+        await asyncio.sleep(delay_ms / 1000)
+
+        if self._user_declined_this_session:
+            return
+
+        try:
             status = await connector.getReadyCheckStatus()
-
             if status.get("errorCode"):
                 return
+            if status.get('playerResponse') == 'Declined':
+                self._user_declined_this_session = True
+                return
 
-            if not status['playerResponse'] == 'Declined':
-                await connector.acceptMatchMaking()
+            await connector.acceptMatchMaking()
+        except Exception as e:
+            # LCU 掉线等: 下一次 ReadyCheck 会重置状态重试, 这里只记日志
+            logger.warning(f"auto accept failed: {e}", TAG)
 
-        asyncio.create_task(accept())
+    @asyncSlot(dict)
+    async def __onReadyCheckChanged(self, data):
+        declined = data.get('playerResponse') == 'Declined'
+        if declined:
+            self._user_declined_this_session = True
+            if self._accept_task and not self._accept_task.done():
+                self._accept_task.cancel()
+                self._accept_task = None
+        # 拒绝弹窗仅对开启自动接受的用户有意义 (设置名即"自动接受后可手动拒绝");
+        # 已拒绝是终态, 再点 decline 无效, 不再显示
+        if (data.get('state') == 'InProgress'
+                and not declined
+                and cfg.get(cfg.enableAutoAcceptMatching)
+                and cfg.get(cfg.autoAcceptDeclineEnabled)):
+            self.declineWindow.show()
+        else:
+            self.declineWindow.hide()
+
+    async def __declineMatchMaking(self):
+        try:
+            await connector.declineMatchMaking()
+        except Exception as e:
+            logger.warning(f"decline match making failed: {e}", TAG)
+            return
+        self._user_declined_this_session = True
+        if self._accept_task and not self._accept_task.done():
+            self._accept_task.cancel()
+            self._accept_task = None
+        self.declineWindow.hide()
+        InfoBar.success("", self.tr("已拒绝对局"), duration=2000,
+                        parent=self, position=InfoBarPosition.BOTTOM_RIGHT)
 
     async def __onReconnect(self):
         if not cfg.get(cfg.enableAutoReconnect):
@@ -873,35 +1301,397 @@ class MainWindow(FluentWindow):
 
         asyncio.create_task(reconnect())
 
+    async def __autoHonor(self):
+        """EndOfGame 阶段自动点赞 (参考 sona/lol-bot 实现).
+
+        使用 GET /lol-honor-v2/v1/ballot 获取点赞候选面板,
+        逐票 POST /lol-honor-v2/v1/honor-player 提交.
+        每票随机选取 HEART/COOL/SHOTCALLER 类别.
+
+        ballot 可能因 LCU 时序问题为空, 最多重试 3 次.
+        """
+        import random as _random
+
+        if not cfg.get(cfg.enableAutoHonor):
+            return
+
+        try:
+            await asyncio.sleep(cfg.get(cfg.autoHonorDelay))
+
+            ballot = None
+            for attempt in range(3):
+                ballot = await connector.getEogStats()
+                if not ballot:
+                    logger.warning(
+                        f"Auto honor: no ballot (attempt={attempt})", TAG)
+                    await asyncio.sleep(2)
+                    continue
+                allies = (ballot.get('eligibleAllies') or [])
+                opponents = (ballot.get('eligibleOpponents') or [])
+                if allies or opponents:
+                    break
+                logger.warning(
+                    f"Auto honor: eligibleAllies/Opponents empty, "
+                    f"retry in 2s (attempt={attempt})", TAG)
+                await asyncio.sleep(2)
+
+            if not ballot:
+                logger.warning("Auto honor: no ballot after retries", TAG)
+                return
+
+            allies = list(ballot.get('eligibleAllies') or [])
+            opponents = list(ballot.get('eligibleOpponents') or [])
+            votes = (ballot.get('votePool') or {}).get('votes') or 1
+            gameId = ballot.get('gameId')
+
+            # ponytail: Fisher-Yates 打散 (同 sona) — verified working
+            for i in range(len(allies) - 1, 0, -1):
+                j = _random.randint(0, i)
+                allies[i], allies[j] = allies[j], allies[i]
+            for i in range(len(opponents) - 1, 0, -1):
+                j = _random.randint(0, i)
+                opponents[i], opponents[j] = opponents[j], opponents[i]
+
+            # ponytail: strategy 只重排 allies, 不改变 submission loop 逻辑
+            strategy = cfg.get(cfg.autoHonorStrategy)
+            if strategy in ('friends_first', 'friends_only') and allies:
+                try:
+                    friends = await connector.getFriends()
+                    friends_puuid = {f.get('puuid') for f in friends
+                                    if isinstance(f, dict) and f.get('puuid')}
+                    friend_allies = [a for a in allies
+                                    if a.get('puuid') in friends_puuid]
+                    if strategy == 'friends_only':
+                        if not friend_allies:
+                            logger.warning(
+                                "Auto honor: friends_only no friends", TAG)
+                            return
+                        allies = friend_allies
+                    else:  # friends_first
+                        non_friends = [a for a in allies
+                                      if a.get('puuid') not in friends_puuid]
+                        allies = friend_allies + non_friends  # 好友在前
+                except Exception as e:
+                    logger.warning(
+                        f"Auto honor: strategy failed, fallback: {e}", TAG)
+
+            # ponytail: 先队友, 多余给对手 (同 sona) — verified working
+            targets = (allies + opponents)[:votes]
+
+            _HONOR_CATEGORIES = ('HEART', 'COOL', 'SHOTCALLER')
+            success = 0
+            for i, target in enumerate(targets):
+                puuid = target.get("puuid")
+                summonerId = target.get("summonerId")
+                if not puuid:
+                    continue
+                category = _random.choice(_HONOR_CATEGORIES)
+                is_ally = i < len(allies)
+                ok = await connector.submitHonor(
+                    puuid, category,
+                    summonerId=summonerId, gameId=gameId)
+                if ok:
+                    success += 1
+                logger.info(
+                    f"Auto honor: vote {i+1}/{len(targets)} → "
+                    f"[{category}] {target.get('championName', puuid)} "
+                    f"{'队友' if is_ally else '对手'} "
+                    f"{'✓' if ok else '✗'}", TAG)
+
+            logger.info(
+                f"Auto honor: done {success}/{len(targets)} votes", TAG)
+
+        except Exception as e:
+            logger.warning(f"Auto honor failed: {e}", TAG)
+
+    async def __autoPlayAgain(self):
+        """EndOfGame 阶段自动点击"再来一局".
+
+        调用 POST /lol-lobby/v2/play-again, 让客户端自动回到排队.
+        首次延迟 2 秒, 避免与 honor 提交竞争; 之后若被拒绝 (队友未点再来一局等)
+        或阶段仍停在结算, 每 2 秒重试, 最多约 90 秒. 阶段离开结算即视为成功.
+        """
+        try:
+            await asyncio.sleep(2)
+            deadline = time.monotonic() + 90
+            attempt = 0
+            while time.monotonic() < deadline:
+                attempt += 1
+                phase = await connector.getGameStatus()
+                if phase not in ('EndOfGame', 'PreEndOfGame'):
+                    logger.info(
+                        f"Auto play again: done (phase={phase}, attempt={attempt})", TAG)
+                    return
+                if await connector.tryPlayAgain():
+                    logger.info(
+                        f"Auto play again: accepted (attempt={attempt})", TAG)
+                else:
+                    logger.info(
+                        f"Auto play again: rejected, retry in 2s (attempt={attempt})", TAG)
+                await asyncio.sleep(2)
+            logger.warning("Auto play again: gave up after 90s", TAG)
+        except Exception as e:
+            logger.warning(f"Auto play again failed: {e}", TAG)
+
+    def __scheduleAutoStartMatchmaking(self):
+        if not cfg.get(cfg.enableAutoStartMatchmaking):
+            return
+        logger.info("Auto-start matchmaking: scheduled (entered lobby)", TAG)
+        self.__cancelAutoStartMatchmaking()
+
+        async def autoStart():
+            delay = cfg.get(cfg.autoStartMatchmakingDelay)
+            await asyncio.sleep(delay)
+            try:
+                # 队友还没进房/未准备时 canStartActivity 为 False, 不能就此放弃:
+                # 每 2 秒重试, 最多约 120 秒; 离开 Lobby 由 __cancelAutoStartMatchmaking 取消
+                deadline = time.monotonic() + 120
+                attempt = 0
+                while time.monotonic() < deadline:
+                    attempt += 1
+                    cur_status = await connector.getGameStatus()
+                    if cur_status != 'Lobby':
+                        logger.info(
+                            f"Auto-start matchmaking: status changed to {cur_status}, stop", TAG)
+                        return
+                    search_status = await connector.getMatchmakingStatus()
+                    if search_status and search_status.get('searchState') in ('Searching', 'Found', 'Accepted'):
+                        logger.info(
+                            f"Auto-start matchmaking: already in state {search_status.get('searchState')}, stop", TAG)
+                        return
+                    if await connector.isLobbyReadyToSearch():
+                        if await connector.startMatchmaking():
+                            logger.info(
+                                f"Auto-start matchmaking: started successfully (attempt={attempt})", TAG)
+                            return
+                        logger.info(
+                            f"Auto-start matchmaking: start rejected, retry in 2s (attempt={attempt})", TAG)
+                    else:
+                        logger.info(
+                            f"Auto-start matchmaking: lobby not ready, retry in 2s (attempt={attempt})", TAG)
+                    await asyncio.sleep(2)
+                logger.warning("Auto-start matchmaking: gave up after 120s", TAG)
+            except Exception as e:
+                logger.warning(f"Auto-start matchmaking error: {e}", TAG)
+            finally:
+                self._autoStartTask = None
+
+        self._autoStartTask = asyncio.create_task(autoStart())
+
+    @asyncSlot(object)
+    async def __onAutoStartMatchmakingToggled(self, enabled):
+        if not enabled:
+            self.__cancelAutoStartMatchmaking()
+            return
+        try:
+            status = await connector.getGameStatus()
+        except Exception as e:
+            logger.warning(
+                f"Auto-start matchmaking toggle status check failed: {e}", TAG)
+            return
+        if status == 'Lobby':
+            self.__scheduleAutoStartMatchmaking()
+
+    def __cancelAutoStartMatchmaking(self):
+        if self._autoStartTask and not self._autoStartTask.done():
+            self._autoStartTask.cancel()
+        self._autoStartTask = None
+
     # 进入英雄选择界面时触发
     async def __onChampionSelectBegin(self):
-        self.championSelection.reset()
-        self.checkAndSwitchTo(self.gameInfoInterface)
+        # 冷启动竞态: LCU 已进入选人但 currentSummoner 尚未拿到 (None) 时,
+        # 后续所有解析都需要 summonerId, 直接跳过避免 TypeError 闪退
+        if not self.currentSummoner:
+            logger.warning(
+                "champion select begin but currentSummoner is None, skip", TAG)
+            return
 
+        self.championSelection.reset()
         cSession, gSession = await asyncio.gather(connector.getChampSelectSession(),
                                                   connector.getGameflowSession())
 
         try:
             queueId = gSession['gameData']['queue']['id']
-        except:
+        except (KeyError, TypeError):
             queueId = None
+
+        # 防御: 极端情况下 res.json() 返回 null -> session 为 None
+        cSession = cSession or {}
 
         self.championSelection.queueId = queueId
 
+        # ponytail: 先设 flag 再 show，避免 setWindowFlags 重建窗口
         if cfg.get(cfg.autoShowOpgg):
-            self.opggWindow.show()
-
             if cfg.get(cfg.enableOpggOnTop):
                 self.opggWindow.setStaysOnTopEnabled(True)
+            self.opggWindow.show()
+
+        # 大乱斗备选席模式: 侧边栏显示换英雄区 (自动弹出开启且已折叠时自动展开).
+        # WS 事件可能在这之前已到达 (await asyncio.gather 交出了事件循环),
+        # 用当前 session 强制刷新, 避免保留上一局的旧数据.
+        if cSession.get('benchEnabled'):
+            self.hextechWindow.setBenchMode(
+                True, expand=bool(cfg.get(cfg.autoShowHextechWindow)))
+            signalBus.hextechSessionUpdated.emit(cSession)
 
         currentSummonerId = self.currentSummoner['summonerId']
         info = await parseAllyGameInfo(cSession, currentSummonerId, queueId, useSGP=True)
         self.gameInfoInterface.updateAllySummoners(info)
 
+        # 随机风格进局只 resolve 一次: UI 徽章与 BP 播报同局共用同一套方案
+        from app.lol.horse_rating import resolve_horse_style
+        self._horseResolvedStyle = resolve_horse_style(
+            str(cfg.get(cfg.horseRatingStyle)))
+
+        # 对局页概览: 异步填充上等马评级 (默认开启, 失败静默)
+        asyncio.create_task(
+            self.__fillHorseRatingForSummoners(info, queue_id=queueId))
+
+        # 上等马赛前评级: BP 阶段评价队友并播报到聊天窗 (默认关)
+        if cfg.get(cfg.enableHorseRatingChat) and self._horseSendGuard.try_acquire():
+            asyncio.create_task(self.__postHorseReport(info, queue_id=queueId))
+
+        self.checkAndSwitchTo(self.gameInfoInterface)
+
+    def __onManualSendHorseReport(self):
+        """手动触发: 与自动发送共享每局一次守卫, 防止连点并发刷屏/竞态."""
+        if not self._horseSendGuard.try_acquire():
+            logger.warning("HorseRating: manualSend blocked by per-game guard", TAG)
+            return
+        info = self.gameInfoInterface._allyInfo
+        if not info:
+            logger.warning("HorseRating: manualSend no allyInfo", TAG)
+            return
+        asyncio.create_task(
+            self.__postHorseReport(
+                info, queue_id=getattr(self.championSelection, 'queueId', None)))
+
+    async def __postHorseReport(self, allyInfo, queue_id=None, style=None):
+        """构建上等马播报文案并延迟发送到 BP 聊天窗 (基于可见段位, 失败静默).
+
+        queue_id 非空时战绩统计只按该模式组过滤 (排位/大乱斗等).
+        style 为本局已 resolve 的方案 key (None 时用 __onChampionSelectBegin
+        烘焙的 self._horseResolvedStyle, 保证与 UI 徽章同局同方案).
+        """
+        from app.lol.horse_orchestrator import buildHorseReport
+        try:
+            me = self.currentSummoner.get('puuid')
+            summoners = [
+                {
+                    'puuid': s.get('puuid'),
+                    'gameName': s.get('name'),
+                    'tagLine': s.get('tagLine'),
+                    'tierIdx': tierNameToIdx(
+                        (s.get('rankInfo') or {}).get('solo', {}).get('tier')),
+                    'divisionIdx': divisionNameToIdx(
+                        (s.get('rankInfo') or {}).get('solo', {}).get('division')),
+                    'lp': (s.get('rankInfo') or {}).get('solo', {}).get('lp'),
+                    'gamesInfo': s.get('gamesInfo'),
+                    'kda': s.get('kda'),
+                }
+                for s in (allyInfo or {}).get('summoners', [])
+                if s.get('puuid')
+            ]
+            teammates = [s for s in summoners if s['puuid'] != me]
+            # 无队友数据时(单人自定义/队友隐藏/AI)回退到含自己, 保证播报仍能发出
+            if not teammates:
+                teammates = summoners
+            message = await buildHorseReport(
+                teammates, style=style or self._horseResolvedStyle,
+                queue_id=queue_id)
+            if not message:
+                logger.warning(
+                    "HorseRating: empty message; "
+                    f"summoners={len(teammates)} ally_total="
+                    f"{len((allyInfo or {}).get('summoners', []) or [])}", TAG)
+                return
+            logger.info(
+                "HorseRating: built message with "
+                f"{len(teammates)} summoners, sending", TAG)
+            await asyncio.sleep(random.uniform(2.0, 5.0))
+            if await connector.sendChampSelectMessage(message):
+                logger.info("HorseRating: report posted to BP chat", TAG)
+        except Exception as e:
+            logger.warning(f"HorseRating: report failed: {e}", TAG)
+
+    async def __postSideChat(self, side: str):
+        """红蓝方聊天播报: 延迟发送到 BP 聊天窗, 失败静默 (锦上添花).
+
+        随机延迟 1.5~3s: 等 championSelect conversation 建立完成,
+        同时避免秒发消息的机械感.
+        """
+        try:
+            await asyncio.sleep(random.uniform(1.5, 3.0))
+            message = self.tr("We are on the blue side") if side == 'blue' \
+                else self.tr("We are on the red side")
+            if await connector.sendChampSelectMessage(message):
+                logger.info(f"SideChat: posted '{side}'", TAG)
+        except Exception as e:
+            logger.warning(f"SideChat: post failed: {e}", TAG)
+
+    async def __fillHorseRatingForSummoners(self, allyInfo, side='ally', queue_id=None,
+                                            style=None):
+        """对局页概览卡异步填充上等马评级 (默认开启). 大乱斗/海克斯只看 KDA.
+
+        style 为本局已 resolve 的方案 key (None 时用 __onChampionSelectBegin
+        烘焙的 self._horseResolvedStyle, 与 BP 播报同局共用同一套方案).
+        """
+        from app.lol.horse_orchestrator import fetchVerdictsForTeam
+
+        summoners = [
+            s for s in (allyInfo or {}).get('summoners', [])
+            if s.get('puuid')
+        ]
+        if not summoners:
+            return
+        try:
+            summaries = [
+                {'puuid': s['puuid'],
+                 'gameName': s.get('name'),
+                 'tagLine': s.get('tagLine'),
+                 'tierIdx': tierNameToIdx(
+                     (s.get('rankInfo') or {}).get('solo', {}).get('tier')),
+                 'divisionIdx': divisionNameToIdx(
+                     (s.get('rankInfo') or {}).get('solo', {}).get('division')),
+                 'lp': (s.get('rankInfo') or {}).get('solo', {}).get('lp'),
+                 'gamesInfo': s.get('gamesInfo'),
+                 'kda': s.get('kda')}
+                for s in summoners]
+            verdicts = await fetchVerdictsForTeam(
+                summaries, queue_id=queue_id, style=style or self._horseResolvedStyle)
+            team = (self.gameInfoInterface.summonersView.enemy
+                    if side == 'enemy'
+                    else self.gameInfoInterface.summonersView.ally)
+            for s in summoners:
+                view = team.items.get(s.get('summonerId'))
+                if not view:
+                    continue
+                view.updateEloInfo(verdicts.get(s['puuid'], {}))
+            shown = sum(1 for s in summoners
+                        if (verdicts.get(s['puuid']) or {}).get('score') is not None)
+            logger.info(
+                f"HorseRating: {side} overview badges {shown}/{len(summoners)} "
+                f"(total ally {len((allyInfo or {}).get('summoners', []) or [])})",
+                TAG)
+        except Exception as e:
+            logger.warning(f"fill horse rating failed: {e}", TAG)
+
+
     # 英雄选择时，英雄改变 / 楼层改变时触发
     @asyncSlot(dict)
     async def __onChampSelectChanged(self, data):
-        data = data['data']
+        # WS 事件 payload 可能缺失 data / 字段不全 (LCU 竞态), 裸下标会经
+        # asyncSlot 冒泡闪退, 统一防御性取值后跳过不完整事件
+        data = (data or {}).get('data') or {}
+        if not data:
+            return
+
+        # 抢英雄是时延敏感操作 (备选席目标可能几百毫秒内被队友抢走),
+        # 先于下面会 await 网络的 phase 处理/头像刷新启动, 与它们并发执行
+        grabTask = None
+        if data.get('benchEnabled'):
+            grabTask = asyncio.ensure_future(
+                autoBenchGrab(data, self.championSelection))
 
         phase = {
             'PLANNING': [autoSetSummonerSpell, autoShow],
@@ -909,29 +1699,100 @@ class MainWindow(FluentWindow):
             'FINALIZATION': [autoSetSummonerSpell, autoTrade, showOpggBuild],
         }
 
-        for func in phase.get(data['timer']['phase'], []):
+        # timer/myTeam 可能缺失 (不完整 session), 缺失时跳过对应逻辑
+        timerPhase = (data.get('timer') or {}).get('phase')
+        for func in phase.get(timerPhase, []):
             if await func(data, self.championSelection):
                 break
 
-        # 更新头像
-        await self.gameInfoInterface.updateAllyIcon(data['myTeam'])
+        myTeam = data.get('myTeam') or []
+        if myTeam:
+            await self.gameInfoInterface.updateAllyIcon(myTeam)
+            self.gameInfoInterface.updateAllySummonersOrder(myTeam)
 
-        # 更新楼层顺序
-        self.gameInfoInterface.updateAllySummonersOrder(data['myTeam'])
+        grabbed = await grabTask if grabTask is not None else False
+
+        # 海克斯/大乱斗: 备选席模式时刷新抢人窗口的头像墙.
+        # 本帧刚换过英雄时 data 已是换之前的旧快照, 跳过渲染,
+        # 等换英雄触发的下一帧用新数据刷新
+        if data.get('benchEnabled') and not grabbed:
+            signalBus.hextechSessionUpdated.emit(data)
 
     # 进入游戏后触发
     async def __onGameStart(self):
+        queueId = await self.__loadGameInfoPanel()
+        if queueId is None:
+            return
+
+        # ARAM Mayhem: 启动海克斯辅助轮询
+        if queueId == 2400 and cfg.get(cfg.enableHextechAssist):
+            logger.info(
+                f"HextechAssist: starting timer for queueId={queueId}", TAG)
+            self.hextechAssistTimer.start()
+            # 自动切到 OPGG 海克斯辅助页 (若开启自动显示)
+            if cfg.get(cfg.hextechAssistAutoShow):
+                try:
+                    championId = await self.__getChampionIdFromLiveClient()
+                    if championId and championId > 0:
+                        logger.info(
+                            f"HextechAssist: auto show for championId={championId}", TAG)
+                        self.opggWindow.showHextechAssist(championId)
+                    else:
+                        logger.info(
+                            "HextechAssist: no championId from live client", TAG)
+                except Exception as e:
+                    logger.warning(f"Hextech assist auto show failed: {e}", TAG)
+
+        # 死亡自动切窗: 非排除模式且启用时启动轮询
+        if cfg.get(cfg.enableDeathSwitch):
+            excluded = cfg.get(cfg.deathSwitchExcludedModes)
+            if isinstance(excluded, list) and queueId not in excluded:
+                logger.info(
+                    f"DeathSwitch: starting timer for queueId={queueId}", TAG)
+                self._deathPrevAlive = True
+                self._deathRespawnTask = None
+                self._deathBrowserHwnd = 0
+                self.deathSwitchTimer.start()
+
+    async def __loadGameInfoPanel(self, force=False):
+        """拉取 gameflow session 并重绘对局信息面板.
+
+        进游戏 (__onGameStart) / 对局信息页"刷新"按钮 /
+        matchHistoryRecovered 自动刷新共用.
+        force=True 时忽略"已加载"跳过逻辑强制重拉.
+        返回 queueId; 不在对局或数据缺失时返回 None.
+        """
+        if not self.currentSummoner:
+            logger.warning("game start but currentSummoner is None, skip", TAG)
+            return None
+
         session = await connector.getGameflowSession()
         currentSummonerId = self.currentSummoner['summonerId']
 
-        queueId = session['gameData']['queue']['id']
+        # 防御: gameflow session 可能缺失 gameData/queue (LCU 竞态),
+        # 后续解析全部依赖 queueId, 拿不到时直接跳过
+        try:
+            queueId = session['gameData']['queue']['id']
+        except (KeyError, TypeError):
+            logger.warning("game start session has no gameData/queue, skip", TAG)
+            return None
+
         if queueId in (1700, 1090, 1100, 1110, 1130, 1160):  # 斗魂 云顶匹配 (排位)
-            return
+            return None
 
         # 如果是进游戏后开的软件，需要先把友方信息更新上去
         async def paintAllySummonersInfo():
-            # TODO 自定义时, 若队伍成员<5, 会触发重新加载导致性能浪费
-            if self.gameInfoInterface.allyChampions and len(self.gameInfoInterface.allyChampions) >= 5:
+            # 如果已经加载过且数量与当前队伍人数匹配，避免重复加载
+            ally_team = None
+            for team_key in ('teamOne', 'teamTwo'):
+                team = session['gameData'].get(team_key, [])
+                if any(p.get('summonerId') == currentSummonerId for p in team):
+                    ally_team = team
+                    break
+            expected_ally_count = len(ally_team) if ally_team else 0
+
+            if not force and self.gameInfoInterface.allyChampions and expected_ally_count > 0 \
+                    and len(self.gameInfoInterface.allyChampions) >= expected_ally_count:
                 return
 
             info = await parseGameInfoByGameflowSession(
@@ -944,6 +1805,8 @@ class MainWindow(FluentWindow):
             self.gameInfoInterface.allyGamesView.clear()
 
             self.gameInfoInterface.updateAllySummoners(info)
+            asyncio.create_task(
+                self.__fillHorseRatingForSummoners(info, queue_id=queueId))
 
         # 将敌方的召唤师基本信息绘制上去
         async def paintEnemySummonersInfo():
@@ -953,10 +1816,14 @@ class MainWindow(FluentWindow):
             # 这个 info 是已经按照游戏位置排序过的了（若排位）
             self.gameInfoInterface.updateEnemySummoners(info)
 
+            # 对局页概览: 异步填充敌方上等马评级 (与友方一致, 失败静默)
+            asyncio.create_task(
+                self.__fillHorseRatingForSummoners(info, side='enemy', queue_id=queueId))
+
         # 更新己方召唤师楼层顺序至角色顺序
         async def sortAllySummonersByGameRole():
             order = getAllyOrderByGameRole(session, currentSummonerId)
-            if order == None:
+            if order is None:
                 return
 
             interface = self.gameInfoInterface
@@ -979,10 +1846,256 @@ class MainWindow(FluentWindow):
         await paintTeamColor()
 
         self.checkAndSwitchTo(self.gameInfoInterface)
+        self.gameInfoLoaded = True
+        return queueId
+
+    @asyncSlot()
+    async def __onGameInfoRefreshRequested(self):
+        """对局信息页"刷新"按钮: 强制重拉当前对局的队友战绩."""
+        logger.info("GameInfo: manual refresh requested", TAG)
+        try:
+            await self.__loadGameInfoPanel(force=True)
+        except Exception as e:
+            logger.warning(
+                f"GameInfo: manual refresh failed ({type(e).__name__}: {e})",
+                TAG)
+
+    @asyncSlot(str)
+    async def __onMatchHistoryRecovered(self, puuid):
+        """后台恢复拿到完整战绩后自动重绘对局信息面板 (无需手动刷新)."""
+        if not (self.isGaming
+                or self.stackedWidget.currentWidget() is self.gameInfoInterface):
+            return
+        logger.info(
+            f"match history recovered ({puuid}), refresh game info panel", TAG)
+        try:
+            await self.__loadGameInfoPanel(force=True)
+        except Exception as e:
+            logger.warning(
+                f"GameInfo: auto refresh failed ({type(e).__name__}: {e})",
+                TAG)
 
     async def __onGameEnd(self):
+        self.gameInfoLoaded = False
+        # 停止死亡自动切窗轮询
+        self.deathSwitchTimer.stop()
+        self.__hideDeathCountdown()
+        self._deathPrevAlive = True
+        self._deathBrowserHwnd = 0
+        if self._deathRespawnTask and not self._deathRespawnTask.done():
+            self._deathRespawnTask.cancel()
+            self._deathRespawnTask = None
+
+        # 停止海克斯辅助轮询
+        self.hextechAssistTimer.stop()
+        self.opggWindow.hextechAssistInterface.clearState()
+
+        # 一局结束: 重置赛前评级发送守卫, 下局自动发送恢复可用
+        self._horseSendGuard.reset()
+        self._sideChatGuard.reset()
+
         if not cfg.get(cfg.enableReserveGameinfo):
             self.gameInfoInterface.clear()
+
+        # 全队 5 档评级: EndOfGame→Lobby 阶段评分并写缓存.
+        # 必须 await 完成, 否则紧接着的生涯刷新拿不到评级缓存, 徽章不显示
+        lastGameParsed = None
+        if cfg.get(cfg.enableTeamRating):
+            logger.info("TeamRating: diagnose triggered (game end)", TAG)
+            lastGameParsed = await self.__diagnoseLastGame()
+
+        # ponytail: auto-popup disabled — exec() in async path blocks career refresh
+        # if lastGameParsed:
+        #     try:
+        #         from app.components.game_analysis_dialog import GameAnalysisDialog
+        #         dialog = GameAnalysisDialog(lastGameParsed, parent=self)
+        #         dialog.exec()
+        #     except Exception as e:
+        #         logger.error(f"GameAnalysis: auto-popup failed: {e}", TAG)
+        #         import traceback
+        #         logger.error(traceback.format_exc(), TAG)
+
+    async def __diagnoseLastGame(self):
+        """诊断上一局, 把 verdict 写入 war_criminal_cache.
+
+        失败不阻塞流程, 仅日志. 海克斯大乱斗 (queueId=2400) 与
+        ARAM/排位均参与诊断.
+        """
+        try:
+            from app.lol.war_criminal import diagnoseGameFromParsed
+            from app.lol.war_criminal_cache import getVerdict
+            from app.lol.tools import parseGameDetailData
+
+            # 拿当前召唤师 puuid, 用于判断嫌疑者
+            currentPuuid = None
+            if isinstance(self.currentSummoner, dict):
+                currentPuuid = self.currentSummoner.get('puuid')
+            if not currentPuuid:
+                logger.warning("WarCriminal: no current puuid", TAG)
+                return
+
+            # 取上一局 summary
+            # connector.getSummonerGamesByPuuid 返回 dict (含 gameCount/games 等键),
+            # 内部 games 字段才是对局列表
+            # 游戏刚结束时 LCU API 可能还没更新战绩, 需要重试
+            gamesResp = None
+            for attempt in range(3):
+                gamesResp = await connector.getSummonerGamesByPuuid(
+                    currentPuuid, 0, 1)
+                games_check = []
+                if isinstance(gamesResp, dict):
+                    games_check = gamesResp.get("games") or []
+                elif isinstance(gamesResp, list):
+                    games_check = gamesResp
+                if games_check:
+                    break
+                logger.warning(
+                    f"WarCriminal: no games yet, retry {attempt + 1}/3", TAG)
+                await asyncio.sleep(2)
+            logger.debug(
+                f"WarCriminal: gamesResp type={type(gamesResp).__name__} "
+                f"len={len(gamesResp) if hasattr(gamesResp, '__len__') else 'N/A'}",
+                TAG)
+            if isinstance(gamesResp, dict):
+                games = gamesResp.get("games") or []
+            elif isinstance(gamesResp, list):
+                games = gamesResp
+            else:
+                games = []
+            if not games:
+                logger.warning("WarCriminal: no recent game", TAG)
+                return
+            lastGame = games[0] if isinstance(games, list) and games else None
+            if not isinstance(lastGame, dict):
+                logger.warning(f"WarCriminal: invalid lastGame type={type(lastGame)}", TAG)
+                return
+            gameId = lastGame.get('gameId')
+            if not gameId:
+                logger.warning("WarCriminal: no gameId in lastGame", TAG)
+                return
+
+            # 如果缓存已有该局, 跳过
+            if getVerdict(gameId):
+                logger.info(f"WarCriminal: game {gameId} already diagnosed", TAG)
+                return
+
+            # 拿本局详情
+            detail = await connector.getGameDetailByGameId(gameId)
+            if not detail:
+                logger.warning(f"WarCriminal: no detail for {gameId}", TAG)
+                return
+
+            # 解析双方队伍 (注意签名: parseGameDetailData(puuid, game))
+            parsed = await parseGameDetailData(currentPuuid, detail)
+            if not parsed:
+                logger.warning(f"WarCriminal: parseGameDetailData returned None for {gameId}", TAG)
+                return
+
+            ratingStyle = cfg.get(cfg.teamRatingStyle)
+            await diagnoseGameFromParsed(parsed, currentPuuid, gameId,
+                                          ratingStyle=ratingStyle)
+            return parsed
+        except Exception as e:
+            logger.warning(f"WarCriminal diagnose failed: {e}", TAG)
+
+    async def __onHextechAssistTick(self):
+        """海克斯辅助定时轮询: 采集已选强化并刷新推荐列表"""
+        try:
+            from app.lol.augment_live import fetchCurrentAugments
+            liveData = await fetchCurrentAugments()
+            if liveData:
+                signalBus.liveGameDataUpdated.emit(liveData)
+                self.opggWindow.hextechAssistInterface.updateLiveState(liveData)
+        except Exception as e:
+            logger.warning(f"Hextech assist tick failed: {e}", TAG)
+
+    async def __onDeathSwitchTick(self):
+        """死亡自动切窗: 检查死亡状态并切换窗口"""
+        if not cfg.get(cfg.enableDeathSwitch):
+            return
+        # 已有复活等待任务, 由 __onRespawnWaiter 处理, 不再重复判断
+        if self._deathRespawnTask and not self._deathRespawnTask.done():
+            return
+        try:
+            info = await liveClient.getActivePlayerDeathInfoFromAll()
+            if info is None:
+                # 游戏已结束或 Live Client 不可用, 重置状态
+                self._deathPrevAlive = True
+                return
+            is_dead = info.get('isDead', False)
+            if is_dead and self._deathPrevAlive:
+                logger.info(f"DeathSwitch: detected death, respawnTimer={info.get('respawnTimer')}", TAG)
+                remaining = info.get('respawnTimer', 30.0)
+                self._deathCountdownEnd = time.time() + remaining
+                self._deathCountdownWindow.showWithText(
+                    self.tr("{:.0f}s 后复活").format(remaining))
+                self._deathCountdownTimer.start()
+                hwnd = findProcessWindowHwnd(cfg.get(cfg.deathSwitchTargetExe))
+                if hwnd:
+                    logger.info(f"DeathSwitch: switching to hwnd={hwnd}", TAG)
+                    self._deathBrowserHwnd = hwnd
+                    forceForegroundWindow(hwnd)
+                    sendMediaPlayPause(hwnd)
+                else:
+                    logger.warning(f"DeathSwitch: no visible window for target exe '{cfg.get(cfg.deathSwitchTargetExe)}'", TAG)
+                self._deathPrevAlive = False
+                self._deathRespawnTask = asyncio.create_task(
+                    self.__onRespawnWaiter(remaining))
+            elif not is_dead and not self._deathPrevAlive:
+                logger.info("DeathSwitch: respawn detected by poll", TAG)
+                self.__hideDeathCountdown()
+                hwnd = findGameWindowHwnd()
+                if hwnd:
+                    forceForegroundWindow(hwnd)
+                if self._deathBrowserHwnd:
+                    sendMediaPlayPause(self._deathBrowserHwnd)
+                self._deathPrevAlive = True
+        except Exception as e:
+            logger.warning(f"DeathSwitch tick failed: {e}", TAG)
+
+    def __onDeathCountdownTick(self):
+        now = time.time()
+        remaining = self._deathCountdownEnd - now
+        if remaining > 0:
+            self._deathCountdownWindow.setText(
+                self.tr("{:.0f}s 后复活").format(remaining))
+            self._deathCountdownWindow.adjustSize()
+        else:
+            self._deathCountdownWindow.hide()
+            self._deathCountdownTimer.stop()
+
+    def __hideDeathCountdown(self):
+        self._deathCountdownWindow.hide()
+        self._deathCountdownTimer.stop()
+
+    async def __onRespawnWaiter(self, respawn_timer: float):
+        """等待复活后自动切回游戏窗口"""
+        try:
+            await asyncio.sleep(respawn_timer + 0.5)
+            for _ in range(5):
+                info = await liveClient.getActivePlayerDeathInfoFromAll()
+                if info and not info.get('isDead', True):
+                    self.__hideDeathCountdown()
+                    hwnd = findGameWindowHwnd()
+                    if hwnd:
+                        forceForegroundWindow(hwnd)
+                    if self._deathBrowserHwnd:
+                        sendMediaPlayPause(self._deathBrowserHwnd)
+                    self._deathPrevAlive = True
+                    self._deathRespawnTask = None
+                    logger.info("DeathSwitch: switched back to game window", TAG)
+                    return
+                await asyncio.sleep(1)
+            logger.info("DeathSwitch: respawn timer expired but still dead, giving up", TAG)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"DeathSwitch respawn waiter failed: {e}", TAG)
+        finally:
+            if self._deathRespawnTask and self._deathRespawnTask.done():
+                self._deathRespawnTask = None
+            if not self._deathPrevAlive:
+                self._deathPrevAlive = True
 
     def __checkWindowSize(self):
         if (dpi := self.devicePixelRatioF()) == 1.0:
@@ -1003,6 +2116,9 @@ class MainWindow(FluentWindow):
         msg = ChangeDpiMessageBox(self.window())
         msg.exec()
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+
     @asyncSlot(str)
     async def __onCareerGameClicked(self, gameId):
         name = self.careerInterface.getSummonerName()
@@ -1012,7 +2128,10 @@ class MainWindow(FluentWindow):
         self.searchInterface.filterComboBox.setCurrentIndex(0)
 
         # 先加载完再切换, 避免加载过程中换搜索目标导致puuid出错 -- By Hpero4
-        await self.searchInterface.searchAndShowFirstPage(self.careerInterface.puuid)
+        # force=True: 从生涯页点击进入详情页时强制重新加载, 避免搜索页之前
+        # 因 LCU stale cache 只拿到少量数据时, 复用旧数据导致左侧列表不全
+        await self.searchInterface.searchAndShowFirstPage(
+            self.careerInterface.puuid, force=True)
         self.checkAndSwitchTo(self.searchInterface)
         self.searchInterface.loadingGameId = gameId
 
@@ -1020,11 +2139,205 @@ class MainWindow(FluentWindow):
         self.searchInterface.waitingForDrawSelect(gameId)
         await self.searchInterface.updateGameDetailView(gameId, self.careerInterface.puuid)
 
-    def showOpggWindow(self):
+    @asyncSlot()
+    async def showOpggWindow(self):
         self.opggWindow.show()
         self.opggWindow.showNormal()
-
         self.opggWindow.raise_()
+
+        # 自动获取当前英雄和模式, 切换 OPGG 到对应界面
+        if not self.isClientProcessRunning:
+            return
+        try:
+            await self.__autoSyncOpggToCurrentGame()
+        except Exception as e:
+            logger.warning(f"Auto sync OPGG to current game failed: {e}", TAG)
+
+    async def __autoSyncOpggToCurrentGame(self):
+        """根据当前游戏状态自动切换 OPGG 模式和英雄"""
+        try:
+            status = await connector.getGameStatus()
+        except Exception as e:
+            logger.warning(f"Auto sync OPGG: getGameStatus failed: {e}", TAG)
+            return
+
+        # 用 error 级别记录, 确保写入日志文件 (项目日志级别为 ERROR)
+        logger.info(f"Auto sync OPGG: status={status}", TAG)
+
+        # 仅在选人或游戏中自动切换
+        if status not in ('ChampSelect', 'InProgress', 'Lobby', 'ReadyCheck'):
+            return
+
+        championId = 0
+        queueId = 0
+
+        if status == 'ChampSelect':
+            try:
+                session = await connector.getChampSelectSession()
+            except (aiohttp.ClientError, OSError) as e:
+                logger.debug(f"getChampSelectSession failed: {e}", TAG)
+                return
+            if not session:
+                return
+            # 从选人会话提取当前玩家英雄
+            cellId = session.get('localPlayerCellId', 0)
+            for p in session.get('myTeam', []):
+                if p.get('cellId') == cellId:
+                    championId = p.get('championId', 0) or p.get(
+                        'championPickIntent', 0)
+                    break
+            # 选人会话本身不含 queueId, 通过 gameflow 获取
+            try:
+                gf = await connector.getGameflowSession()
+                queueId = gf.get('gameData', {}).get(
+                    'queue', {}).get('id', 0) if gf else 0
+            except Exception:
+                queueId = 0
+        elif status == 'InProgress':
+            # 游戏中: 从 gameflow 获取 queueId
+            try:
+                session = await connector.getGameflowSession()
+                data = session.get('gameData', {}) if session else {}
+                queueId = data.get('queue', {}).get('id', 0)
+            except Exception as e:
+                logger.warning(
+                    f"Auto sync OPGG: getGameflowSession failed: {e}", TAG)
+            # 游戏中: 从 Live Client API 获取当前英雄
+            championId = await self.__getChampionIdFromLiveClient()
+
+        mode = self.__queueIdToOpggMode(queueId, status)
+        logger.info(
+            f"Auto sync OPGG: championId={championId}, queueId={queueId}, mode={mode}", TAG)
+
+        if not mode:
+            return
+
+        # ARAM Mayhem 游戏中: 切到海克斯辅助页 (而非 build 页)
+        if mode == 'aram_mayhem' and status == 'InProgress' \
+                and cfg.get(cfg.enableHextechAssist):
+            if championId and championId > 0:
+                self.opggWindow.showHextechAssist(championId)
+            return
+
+        if championId and championId > 0:
+            # 有英雄: 跳转到 build 页 (信号处理会自动设置 mode combobox)
+            signalBus.toOpggBuildInterface.emit(championId, mode, "")
+        else:
+            # 无英雄: 仅切换模式, 刷新当前界面
+            self.opggWindow.setModeByData(mode)
+
+    async def __getChampionIdFromLiveClient(self) -> int:
+        """从 Live Client API (端口 2999) 获取当前游戏中英雄 ID, 失败返回 0"""
+        try:
+            active_name = await liveClient.getActivePlayerName()
+            data = await liveClient.getAllGameData()
+            if not data or not isinstance(data, dict):
+                return 0
+            all_players = data.get('allPlayers', [])
+            if not isinstance(all_players, list):
+                return 0
+            for p in all_players:
+                if not isinstance(p, dict):
+                    continue
+                # 匹配活跃玩家 (summonerName 或 riotIdName)
+                p_name = p.get('summonerName') or p.get('riotIdName') or ''
+                if active_name and p_name and (
+                        p_name == active_name or active_name.startswith(p_name)):
+                    champion_name = p.get('championName', '')
+                    if champion_name:
+                        try:
+                            return connector.manager.getChampionIdByName(champion_name)
+                        except (AttributeError, KeyError, ValueError) as e:
+                            logger.debug(f"getChampionIdByName failed: {e}", TAG)
+                            return 0
+                    break
+        except Exception as e:
+            logger.warning(
+                f"Auto sync OPGG: Live Client API failed: {e}", TAG)
+        return 0
+
+    def __queueIdToOpggMode(self, queueId, status):
+        """queueId -> OPGG mode 字符串"""
+        if queueId == 450:
+            return 'aram'
+        if queueId == 2400:
+            return 'aram_mayhem'
+        if queueId in (1700, 1710):
+            return 'arena'
+        if queueId == 1300:
+            return 'nexus_blitz'
+        if queueId in (900, 1900):
+            return 'urf'
+        # 排位/其他
+        return 'ranked' if status in ('ChampSelect', 'InProgress') else ""
+
+    @asyncSlot()
+    async def showHextechWindow(self):
+        """导航栏按钮: 弹出换英雄 Flyout 浮层 (不进入独立页面)"""
+        if not self.isClientProcessRunning:
+            InfoBar.warning(
+                self.tr("提示"),
+                self.tr("英雄联盟客户端未运行"),
+                parent=self, duration=3000, position=InfoBarPosition.TOP)
+            return
+
+        # 锚点: 导航栏中点击的按钮
+        target = self.sender() or self.navigationInterface
+
+        # 取当前选人会话; 不在选人中则提示
+        try:
+            data = await connector.getChampSelectSession()
+        except Exception:
+            data = None
+
+        if not data or not data.get('benchEnabled'):
+            InfoBar.warning(
+                self.tr("提示"),
+                self.tr("当前不在大乱斗选人中"),
+                parent=self, duration=3000, position=InfoBarPosition.TOP)
+            return
+
+        # 构建 Flyout
+        flyoutView = HextechGrabFlyout(self)
+
+        from app.lol.tools import _getLocalChampionId, _getBenchChampionIds
+        bench = set(_getBenchChampionIds(data))
+        mine = _getLocalChampionId(data)
+        cellId = data.get('localPlayerCellId')
+        shown = set()
+
+        # 手持
+        if mine:
+            name, icon = await self.hextechWindow._getChampionNameIcon(mine)
+            flyoutView.addChampion(mine, icon, name, 'mine')
+            shown.add(mine)
+        # 备选席
+        for cid in sorted(bench):
+            if cid in shown:
+                continue
+            name, icon = await self.hextechWindow._getChampionNameIcon(cid)
+            flyoutView.addChampion(cid, icon, name, 'bench')
+            shown.add(cid)
+        # 队友持有
+        for player in data.get('myTeam', []):
+            cid = player.get('championId', 0) or 0
+            if cid in shown or cid == 0 or player.get('cellId') == cellId:
+                continue
+            name, icon = await self.hextechWindow._getChampionNameIcon(cid)
+            flyoutView.addChampion(cid, icon, name, 'ally')
+            shown.add(cid)
+
+        flyoutView.connectClicks()
+        flyoutView.championGrabRequested.connect(self.__onHextechFlyoutGrab)
+
+        self._hextechFlyout = Flyout.make(
+            flyoutView, target, self, FlyoutAnimationType.DROP_DOWN)
+
+    def __onHextechFlyoutGrab(self, championId):
+        """Flyout 头像点击: 设为手动抢目标"""
+        self.championSelection.hextechTargetId = championId
+        self.championSelection.manualGrabRequested = True
+        logger.info(f"hextech flyout: manual grab {championId}", TAG)
 
     @asyncSlot()
     async def __refreshCareerInterface(self):
@@ -1036,6 +2349,46 @@ class MainWindow(FluentWindow):
         isMicaEnabled = cfg.get(cfg.micaEnabled)
         self.setMicaEffectEnabled(isMicaEnabled)
         self.opggWindow.setMicaEffectEnabled(isMicaEnabled)
+        self.hextechWindow.setMicaEffectEnabled(isMicaEnabled)
+
+    @asyncSlot()
+    async def __onDodgeButtonClicked(self):
+        if not self.isClientProcessRunning:
+            return
+
+        # Sona 契约: 秒退会吃逃跑惩罚, 调用方须先校验 ChampSelect 阶段
+        # 并取得用户确认 — 见 sona champselect-quit-button.ts
+        try:
+            phase = await connector.getGameStatus()
+        except Exception:
+            phase = None
+        if phase != 'ChampSelect':
+            InfoBar.warning("", self.tr("当前不在英雄选择阶段"), duration=2000,
+                            parent=self, position=InfoBarPosition.BOTTOM_RIGHT)
+            return
+
+        # 弹框必须退出协程栈后进行: exec() 直接在 async 路径中
+        # 会阻塞事件循环 (见上方 game-analysis 的前车之鉴)
+        QTimer.singleShot(0, self.__showDodgeConfirmBox)
+
+    def __showDodgeConfirmBox(self):
+        msgBox = MessageBox(self.tr("确认秒退？"),
+                            self.tr("秒退将立即退出英雄选择，短时间内无法匹配，并可能扣除信誉分"),
+                            self.window())
+        msgBox.yesButton.setText(self.tr("确认秒退"))
+        msgBox.cancelButton.setText(self.tr("取消"))
+        if msgBox.exec():
+            self.dodgeConfirmed.emit()
+
+    @asyncSlot()
+    async def __doDodge(self):
+        ok = await connector.dodge()
+        if ok:
+            InfoBar.success("", self.tr("已秒退"), duration=2000,
+                            parent=self, position=InfoBarPosition.BOTTOM_RIGHT)
+        else:
+            InfoBar.warning("", self.tr("秒退失败"), duration=2000,
+                            parent=self, position=InfoBarPosition.BOTTOM_RIGHT)
 
     @asyncSlot()
     async def __onFixLCUButtonClicked(self):
@@ -1048,19 +2401,6 @@ class MainWindow(FluentWindow):
         content = "".join(tracebackFormat)
 
         if ty in [ConnectionRefusedError, ClientConnectorError]:
-            return
-
-        if issubclass(ty, OSError) and getattr(value, 'errno', None) == 28:
-            if not getattr(self, "_diskFullWarned", False):
-                self._diskFullWarned = True
-                InfoBar.warning(
-                    self.tr("Insufficient disk space"),
-                    self.tr("Your disk is full. Please clear some space to ensure Seraphine runs properly."),
-                    duration=5000,
-                    orient=Qt.Vertical,
-                    parent=self,
-                    position=InfoBarPosition.BOTTOM_RIGHT
-                )
             return
 
         logger.error(f"Exception occurred:\n{content}", "Crash")
@@ -1089,6 +2429,8 @@ class MainWindow(FluentWindow):
     def __onCurrentStackedChanged(self, index):
         widget: SmoothScrollArea = self.stackedWidget.view.currentWidget()
         widget.delegate.vScrollBar.resetValue(0)
+        if widget is self.settingInterface:
+            self._clearUpdateDot()
 
     def eventFilter(self, obj, e: QEvent):
         # Fix #553, #560

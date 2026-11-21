@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import QFrame
 from PyQt5.QtCore import Qt, pyqtSignal, pyqtProperty
-from PyQt5.QtGui import QColor, QPainter, QPainterPath
+from PyQt5.QtGui import QColor, QPainter
 from app.common.qfluentwidgets import BackgroundAnimationWidget, isDarkTheme
 
 from app.common.style_sheet import ColorChangeable
@@ -10,6 +10,9 @@ class CardWidget(BackgroundAnimationWidget, QFrame):
     clicked = pyqtSignal()
     pressed = pyqtSignal()
 
+    # Animation durations (ms) — Apple Design: 150-300ms for micro-interactions
+    _ANIM_DURATION = 160
+
     def __init__(self, parent=None, type=None):
         QFrame.__init__(self, parent=parent)
         if type:
@@ -17,7 +20,7 @@ class CardWidget(BackgroundAnimationWidget, QFrame):
         else:
             BackgroundAnimationWidget.__init__(self)
         self._isClickEnabled = False
-        self._borderRadius = 4
+        self._borderRadius = 8  # 4→8: modern radius
 
     def mousePressEvent(self, e):
         super().mousePressEvent(e)
@@ -35,13 +38,13 @@ class CardWidget(BackgroundAnimationWidget, QFrame):
         return self._isClickEnabled
 
     def _normalBackgroundColor(self):
-        return QColor(233, 233, 233, 13 if isDarkTheme() else 170)
+        return QColor(255, 255, 255, 25 if isDarkTheme() else 210)
 
     def _hoverBackgroundColor(self):
-        return QColor(243, 243, 243, 21 if isDarkTheme() else 127)
+        return QColor(255, 255, 255, 40 if isDarkTheme() else 160)
 
     def _pressedBackgroundColor(self):
-        return QColor(255, 255, 255, 8 if isDarkTheme() else 64)
+        return QColor(255, 255, 255, 12 if isDarkTheme() else 100)
 
     def getBorderRadius(self):
         return self._borderRadius
@@ -83,7 +86,7 @@ class ColorAnimationFrame(CardWidget, ColorChangeable):
         try:
             # 由于同样原因，这里不 try 就报错咯 ^^_
             self._updateBackgroundColor()
-        except:
+        except (RuntimeError, AttributeError):
             return
 
     def _normalBackgroundColor(self):
@@ -110,7 +113,7 @@ class NoBorderColorAnimationFrame(CardWidget, ColorChangeable):
         try:
             # 由于同样原因，这里不 try 就报错咯 ^^_
             self._updateBackgroundColor()
-        except:
+        except (RuntimeError, AttributeError):
             return
 
     def _normalBackgroundColor(self):

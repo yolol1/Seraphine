@@ -1,14 +1,17 @@
-from PyQt5.QtCore import Qt, QRect
+from PyQt5.QtCore import Qt, QRect, QTimer
 from PyQt5.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QFrame, QSpacerItem, QSizePolicy)
-from PyQt5.QtGui import QPixmap, QPen, QPainter, QColor
+from PyQt5.QtGui import QPen, QPainter, QColor
 
-from app.common.qfluentwidgets import isDarkTheme, Theme
+import asyncio
+
+from app.common.qfluentwidgets import isDarkTheme, Theme, ToolTipFilter, ToolTipPosition
 from app.common.signals import signalBus
 from app.common.config import cfg
+from app.common.logger import logger
 from app.components.champion_icon_widget import RoundIcon, RoundedLabel
 from app.components.color_label import ColorLabel, DeathsLabel
-from app.components.animation_frame import CardWidget, ColorAnimationFrame
+from app.components.animation_frame import ColorAnimationFrame
 
 
 class RoundLevel(QFrame):
@@ -67,7 +70,7 @@ class ResultModeSpell(QFrame):
             self.resultLabel = ColorLabel(self.tr("Lose"), 'lose')
 
         self.modeLabel = QLabel(mode)
-        self.modeLabel.setStyleSheet("QLabel {font: 12px;}")
+        self.modeLabel.setStyleSheet("QLabel {font: 14px 'Microsoft YaHei UI';}")
 
         self.spell1 = RoundedLabel(spell1, 0, 2)
         self.spell2 = RoundedLabel(spell2, 0, 2)
@@ -213,7 +216,7 @@ class MapTime(QFrame):
         self.vBoxLayout = QVBoxLayout(self)
 
         self.mapLabel = QLabel(
-            f'{map} - {position}' if position != None else f'{map}')
+            f'{map} - {position}' if position is not None else f'{map}')
         self.timeLabel = QLabel(f"{duration} · {time}")
 
         self.__initLayout()
@@ -222,8 +225,8 @@ class MapTime(QFrame):
 
     def __initLayout(self):
         self.vBoxLayout.setContentsMargins(0, 5, 0, 0)
-        self.mapLabel.setStyleSheet("QLabel {font: 12px;}")
-        self.timeLabel.setStyleSheet("QLabel {font: 12px;}")
+        self.mapLabel.setStyleSheet("QLabel {font: 13px 'Microsoft YaHei UI';}")
+        self.timeLabel.setStyleSheet("QLabel {font: 13px 'Microsoft YaHei UI';}")
 
         self.vBoxLayout.addWidget(self.mapLabel)
         self.vBoxLayout.addWidget(self.timeLabel)
@@ -232,8 +235,109 @@ class MapTime(QFrame):
         )
 
 
+class AugmentRow(QFrame):
+    """海克斯大乱斗强化图标行, 异步加载强化图标 (OPGG 图标本身带稀有度颜色)"""
+
+    # 固定宽度: 4 个图标位 × 22px + 3 间距 × 2px = 94px
+    # 用于表头列对齐 (即使该玩家只有 2-3 个强化, 也保留 4 个位置的宽度)
+    FIXED_WIDTH = 94
+
+    def __init__(self, augmentIds: list, parent=None, championId=None):
+        super().__init__(parent)
+        self.augmentIds = augmentIds or []
+        self.championId = championId
+        self.hBoxLayout = QHBoxLayout(self)
+        self.iconLabels = []
+
+        self.__initLayout()
+        # 异步加载强化图标
+        if self.augmentIds:
+            QTimer.singleShot(0, self.__loadAugmentIcons)
+
+    def __initLayout(self):
+        self.hBoxLayout.setContentsMargins(0, 0, 0, 0)
+        self.hBoxLayout.setSpacing(2)
+        # 固定宽度, 保证表头列对齐
+        self.setFixedWidth(self.FIXED_WIDTH)
+
+        # 始终创建 4 个图标槽位 (海克斯大乱斗最多 4 个强化)
+        # 没有强化的槽位显示为空占位
+        for i in range(4):
+            label = RoundedLabel(borderWidth=1, radius=3.0)
+            label.setFixedSize(22, 22)
+            # 无强化数据的槽位设为透明
+            if i >= len(self.augmentIds):
+                label.setVisible(False)
+            self.iconLabels.append(label)
+            self.hBoxLayout.addWidget(label)
+
+        # 只对实际有强化 ID 的槽位加载图标
+        self._activeLabels = self.iconLabels[:len(self.augmentIds)]
+
+    async def __loadAugmentIconsAsync(self):
+        try:
+            from app.lol.static_data import (
+                safeGetAugmentIcon, safeGetAugmentName)
+            # 先确保 OPGG 已拉取当前英雄的强化列表 (会注册 augId -> OPGG 图标路径)
+            # OPGG 海克斯图标本身带稀有度颜色, 优于 LCU 默认图标
+            await self.__ensureOpggIcons()
+
+            for label, aid in zip(self._activeLabels, self.augmentIds):
+                try:
+                    icon = await safeGetAugmentIcon(aid)
+                    if icon:
+                        label.setPicture(icon)
+                    # 异步加载强化名称作为 tooltip
+                    name = await safeGetAugmentName(aid)
+                    if name:
+                        label.setToolTip(name)
+                        label.installEventFilter(
+                            ToolTipFilter(label, 0, ToolTipPosition.TOP))
+                except RuntimeError:
+                    # 异步加载期间战绩页已刷新/销毁, Qt 控件的 C++ 对象已被删除,
+                    # 剩余槽位同属该行, 无需继续
+                    return
+                except Exception as e:
+                    logger.warning(f"[AugmentRow] load aid={aid} failed: {e}")
+        except RuntimeError:
+            return
+        except Exception as e:
+            logger.warning(f"[AugmentRow] load failed: {e}")
+
+    async def __ensureOpggIcons(self):
+        """确保 OPGG 已拉取当前英雄的海克斯强化图标
+
+        OPGG 图标本身带稀有度颜色, 拉取后会注册到 safeGetAugmentIcon 优先返回.
+        若本地已有缓存图标则跳过.
+        """
+        if not self.championId:
+            return
+        try:
+            from app.lol.static_data import getAugmentOpggIconPath
+            # 检查是否已有 OPGG 图标缓存, 有则无需拉取
+            need_fetch = any(
+                not getAugmentOpggIconPath(aid) for aid in self.augmentIds)
+            if not need_fetch:
+                return
+            from app.lol.opgg import opgg
+            if not getattr(opgg, 'apiSession', None) or opgg.apiSession.closed:
+                await opgg.start()
+            await opgg.fetchMayhemAugmentRarities(self.championId)
+        except Exception as e:
+            logger.warning(f"[AugmentRow] ensure OPGG icons failed: {e}")
+
+    def __loadAugmentIcons(self):
+        try:
+            asyncio.ensure_future(self.__loadAugmentIconsAsync())
+        except RuntimeError:
+            pass
+
+
 class GameInfoBar(ColorAnimationFrame):
-    def __init__(self, game: dict = None, parent: QWidget = None):
+    def __init__(self, game: dict = None, parent: QWidget = None,
+                 grade: int = None, gradeLabel: str = '',
+                 gradeEvidence: list = None, gradeComment: str = None,
+                 isCurrent: bool = False):
         if game['remake']:
             type = 'remake'
         elif game['win']:
@@ -242,6 +346,11 @@ class GameInfoBar(ColorAnimationFrame):
             type = 'lose'
 
         self.gameId = game['gameId']
+        self.grade = grade
+        self.gradeLabel = gradeLabel
+        self.gradeEvidence = gradeEvidence or []
+        self.gradeComment = gradeComment
+        self.isCurrent = isCurrent
 
         super().__init__(type=type, parent=parent)
         self.hBoxLayout = QHBoxLayout(self)
@@ -276,6 +385,12 @@ class GameInfoBar(ColorAnimationFrame):
         self.mapTime = MapTime(
             game["map"], game['position'], game["time"], game["duration"])
 
+        # 海克斯大乱斗: 强化图标行
+        augmentIds = game.get("augmentIds") or []
+        championId = game.get("championId")
+        self.augmentRow = AugmentRow(
+            augmentIds, championId=championId) if augmentIds else None
+
     def __initLayout(self):
         self.hBoxLayout.setContentsMargins(11, 8, 11, 8)
         self.hBoxLayout.addWidget(self.championIcon)
@@ -288,5 +403,18 @@ class GameInfoBar(ColorAnimationFrame):
         self.hBoxLayout.addSpacerItem(
             QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum)
         )
-        self.hBoxLayout.addSpacing(15)
+        # 海克斯强化图标 (仅在海克斯大乱斗时显示)
+        if self.augmentRow:
+            self.hBoxLayout.addSpacing(10)
+            self.hBoxLayout.addWidget(self.augmentRow)
+            self.hBoxLayout.addSpacing(10)
+        else:
+            self.hBoxLayout.addSpacing(15)
         self.hBoxLayout.addWidget(self.mapTime)
+        # 全队 5 档评级徽章 (仅当本局有评级数据时显示)
+        if self.gradeLabel:
+            from app.components.grade_badge import GradeBadge
+            self.hBoxLayout.addSpacing(8)
+            self.hBoxLayout.addWidget(
+                GradeBadge(self.grade, self.gradeLabel, self.isCurrent,
+                           self.gradeEvidence, self.gradeComment))

@@ -1,22 +1,20 @@
 from typing import List
+import re as _re
 
-from PyQt5.QtWidgets import (QHBoxLayout, QWidget, QFrame, QVBoxLayout, QSpacerItem,
-                             QSizePolicy, QLabel, QHBoxLayout, QWidget, QLabel, QFrame,
+from PyQt5.QtWidgets import (QHBoxLayout, QWidget, QLabel, QFrame,
                              QVBoxLayout, QSpacerItem, QSizePolicy, QLayout, QGridLayout)
-from PyQt5.QtCore import Qt, pyqtSignal, QEasingCurve
-from PyQt5.QtGui import QPixmap, QColor, QCursor
+from PyQt5.QtCore import Qt
+from PyQt5.QtGui import QColor, QCursor
 from qasync import asyncSlot
 
-from app.lol.tools import ToolsTranslator, createAndSetRunePage
+from app.lol.tools import ToolsTranslator
 from app.components.animation_frame import (ColorAnimationFrame,
-                                            NoBorderColorAnimationFrame, CardWidget)
+                                            NoBorderColorAnimationFrame)
 from app.components.transparent_button import PrimaryButton
 from app.components.champion_icon_widget import RoundIcon, RoundedLabel
 from app.common.style_sheet import StyleSheet
 from app.common.qfluentwidgets import (SmoothScrollArea, IconWidget, isDarkTheme,
-                                       ToolTipFilter, ToolTipPosition, PushButton,
-                                       PrimaryToolButton, FluentIcon, PillToolButton,
-                                       TransparentToolButton, ThemeColor)
+                                       ToolTipFilter, ToolTipPosition, ThemeColor)
 from app.common.icons import Icon
 from app.common.config import qconfig, cfg
 from app.common.signals import signalBus
@@ -84,14 +82,12 @@ class BuildInterface(QFrame):
         return self.championId
 
     def updateInterface(self, data: dict):
-        summary = data.get('summary')
-
-        self.titleBar.updateWidget(summary)
+        self.titleBar.updateWidget(data.get('summary'))
         self.summonerSpells.updateWidget(data.get('summonerSpells'))
-        self.championPerks.updateWidget(data.get('perks'), summary)
+        self.championPerks.updateWidget(data.get('perks'), data.get('summary'))
         self.championSkills.updateWidget(data.get('championSkills'))
         self.championItems.updateWidget(data.get('items'))
-        self.championCounters.updateWidget(data.get('counters'), summary)
+        self.championCounters.updateWidget(data.get('counters'))
         self.championAugments.updateWidget(data.get('augments'))
         self.championSynergies.updateWidget(data.get('synergies'))
 
@@ -159,17 +155,23 @@ class ChampionTitleBar(ColorAnimationFrame):
             self.pickRateLabel.setText(f"{data['averagePlace']:.2f}")
 
             self.banRateTextLabel.setText(self.tr("Pick Rate"))
-            self.banRateLabel.setText(f"{data['pickRate']*100:.2f}%")
+            if data.get('pickRate') is not None:
+                self.banRateLabel.setText(f"{data['pickRate']*100:.2f}%")
+            else:
+                self.banRateLabel.setText("--")
         else:
+            wr = data.get('winRate')
+            pr = data.get('pickRate')
+            br = data.get('banRate')
             self.winRateTextLabel.setText(self.tr("Win Rate"))
-            self.winRateLabel.setText(f"{data['winRate']*100:.2f}%")
+            self.winRateLabel.setText(f"{wr*100:.2f}%" if wr is not None else "--")
 
             self.pickRateTextLabel.setText(self.tr("Pick Rate"))
-            self.pickRateLabel.setText(f"{data['pickRate']*100:.2f}%")
+            self.pickRateLabel.setText(f"{pr*100:.2f}%" if pr is not None else "--")
 
-            if banRate := data['banRate']:
+            if br is not None:
                 self.banRateTextLabel.setText(self.tr("Ban Rate"))
-                self.banRateLabel.setText(f"{banRate*100:.2f}%")
+                self.banRateLabel.setText(f"{br*100:.2f}%")
             else:
                 self.banRateTextLabel.setVisible(False)
                 self.banRateLabel.setVisible(False)
@@ -606,7 +608,7 @@ class ChampionItemWidget(BuildWidgetBase):
 
         useSeparator = layout is self.coreItems
 
-        if not layout is self.lastItems:
+        if layout is not self.lastItems:
             for i, x in enumerate(data):
                 items = ItemsWidget(x, useSeparator)
                 layout.addWidget(items)
@@ -760,12 +762,9 @@ class ChampionCountersWidget(BuildWidgetBase):
 
         self.hBoxLayout = QHBoxLayout(self)
 
-        self.strongAgainstWidget = QWidget()
-        self.strongAgainstLayout = QVBoxLayout(self.strongAgainstWidget)
+        self.strongAgainstLayout = QVBoxLayout()
         self.separatorLine = SeparatorLine(QFrame.Shape.VLine)
-
-        self.weakAgainstWidget = QWidget()
-        self.weakAgainstLayout = QVBoxLayout(self.weakAgainstWidget)
+        self.weakAgainstLayout = QVBoxLayout()
 
         self.__initWidget()
         self.__initLayout()
@@ -782,11 +781,11 @@ class ChampionCountersWidget(BuildWidgetBase):
         self.weakAgainstLayout.setSpacing(6)
 
         self.hBoxLayout.setContentsMargins(13, 11, 13, 11)
-        self.hBoxLayout.addWidget(self.strongAgainstWidget)
+        self.hBoxLayout.addLayout(self.strongAgainstLayout)
         self.hBoxLayout.addSpacing(4)
         self.hBoxLayout.addWidget(self.separatorLine)
         self.hBoxLayout.addSpacing(4)
-        self.hBoxLayout.addWidget(self.weakAgainstWidget)
+        self.hBoxLayout.addLayout(self.weakAgainstLayout)
 
     def __updateLayout(self, layout: QLayout, data: list):
         for i in reversed(range(layout.count())):
@@ -800,7 +799,7 @@ class ChampionCountersWidget(BuildWidgetBase):
             item = CounterChampionWidget(x)
             layout.addWidget(item)
 
-    def updateWidget(self, data, summary: dict):
+    def updateWidget(self, data):
         if not data:
             self.setVisible(False)
             return
@@ -814,17 +813,6 @@ class ChampionCountersWidget(BuildWidgetBase):
 
         self.__updateLayout(self.strongAgainstLayout, strong)
         self.__updateLayout(self.weakAgainstLayout, weak)
-
-        tooltip = f"<b>{summary.get('name')}</b>" + \
-            self.tr("'s strong against")
-        self.strongAgainstWidget.setToolTip(tooltip)
-        self.strongAgainstWidget.installEventFilter(
-            ToolTipFilter(self.strongAgainstWidget, 300))
-
-        tooltip = f"<b>{summary.get('name')}</b>" + self.tr("'s weak against")
-        self.weakAgainstWidget.setToolTip(tooltip)
-        self.weakAgainstWidget.installEventFilter(
-            ToolTipFilter(self.weakAgainstWidget))
 
         self.setVisible(True)
 
@@ -913,25 +901,10 @@ class ChampionPerksWidget(BuildWidgetBase):
     async def __onSetRunePageButtonClicked(self, _):
         data = self.data[self.selectedIndex]
         name = "Seraphine" + self.tr(": ") + self.summary['name']
-        primaryId = data['primaryId']
-        secondaryId = data['secondaryId']
-        perks = data['perks']
 
-        pages = await connector.getRunePages()
-
-        if not len(pages):
-            await createAndSetRunePage(name, primaryId, secondaryId, perks)
-            return
-
-        pageId = next((page.get("id")
-                      for page in pages
-                      if page.get("current") and page.get("isEditable")), None)
-
-        if not pageId:
-            await createAndSetRunePage(name, primaryId, secondaryId, perks)
-            return
-
-        await connector.putRunePage(pageId, name, primaryId, secondaryId, perks)
+        await connector.deleteCurrentRunePage()
+        await connector.createRunePage(
+            name, data['primaryId'], data['secondaryId'], data['perks'])
 
 
 class PerksSummaryWidget(NoBorderColorAnimationFrame):
@@ -1029,10 +1002,7 @@ class PerksWidget(QFrame):
         self.__initLayout()
 
     def __initWidget(self):
-        self.mainTitleIcon.installEventFilter(ToolTipFilter(
-            self.mainTitleIcon, 200, ToolTipPosition.TOP))
-        self.secondaryTitleIcon.installEventFilter(ToolTipFilter(
-            self.secondaryTitleIcon, 200, ToolTipPosition.TOP))
+        pass
 
     def __initLayout(self):
         self.primaryPerksLayout.setSpacing(8)
@@ -1098,6 +1068,8 @@ class PerksWidget(QFrame):
         main = styles[main]
         self.mainTitleIcon.setIcon(main['icon'])
         self.mainTitleIcon.setToolTip(main['name'])
+        self.mainTitleIcon.installEventFilter(ToolTipFilter(
+            self.mainTitleIcon, 200, ToolTipPosition.TOP))
 
         for i, slot in enumerate(main['slots'][:4]):
             for perk in slot:
@@ -1118,6 +1090,8 @@ class PerksWidget(QFrame):
         sub = styles[sub]
         self.secondaryTitleIcon.setIcon(sub['icon'])
         self.secondaryTitleIcon.setToolTip(sub['name'])
+        self.secondaryTitleIcon.installEventFilter(ToolTipFilter(
+            self.secondaryTitleIcon, 200, ToolTipPosition.TOP))
 
         for i, slot in enumerate(sub['slots'][1:4]):
             for perk in slot:
@@ -1162,8 +1136,19 @@ class ChampionAugmentsWidget(BuildWidgetBase):
     def __init__(self, parent: QWidget = None):
         super().__init__(parent)
 
-        self.hBoxLayout = QHBoxLayout(self)
+        self.vBox = QVBoxLayout(self)
+        self.titleLayout = QHBoxLayout()
+        self.hBoxLayout = QHBoxLayout()
         self.augmentsLayouts = [QVBoxLayout() for _ in range(3)]
+
+        self.tierTitles = [
+            QLabel(self.tr("Silver")),
+            QLabel(self.tr("Gold")),
+            QLabel(self.tr("Prismatic")),
+        ]
+        for t in self.tierTitles:
+            t.setObjectName("subtitleLabel")
+            t.setAlignment(Qt.AlignCenter)
 
         self.vLine1 = SeparatorLine(QFrame.Shape.VLine)
         self.vLine2 = SeparatorLine(QFrame.Shape.VLine)
@@ -1180,13 +1165,31 @@ class ChampionAugmentsWidget(BuildWidgetBase):
             layout.setAlignment(Qt.AlignTop)
             layout.setSpacing(12)
 
+        self.titleLayout.setContentsMargins(0, 0, 0, 6)
+        self.titleLayout.setSpacing(0)
+
         self.hBoxLayout.setSpacing(12)
-        self.hBoxLayout.setContentsMargins(13, 11, 13, 11)
+        self.hBoxLayout.setContentsMargins(13, 0, 13, 11)
         self.hBoxLayout.addLayout(self.augmentsLayouts[0])
         self.hBoxLayout.addWidget(self.vLine1)
         self.hBoxLayout.addLayout(self.augmentsLayouts[1])
         self.hBoxLayout.addWidget(self.vLine2)
         self.hBoxLayout.addLayout(self.augmentsLayouts[2])
+
+        # Place titles above each of the 3 columns (positions correspond to columns in hBoxLayout)
+        # Layout structure: col1 | vline1 | col2 | vline2 | col3
+        colStretches = [1, 0, 1, 0, 1]
+        for i, w in enumerate([self.tierTitles[0], None, self.tierTitles[1], None, self.tierTitles[2]]):
+            if w is not None:
+                self.titleLayout.addWidget(w, stretch=colStretches[i])
+            else:
+                # vLine spacer width ~ 2+24px to align with separators
+                self.titleLayout.addSpacing(16)
+
+        self.vBox.setContentsMargins(0, 11, 0, 0)
+        self.vBox.setSpacing(0)
+        self.vBox.addLayout(self.titleLayout)
+        self.vBox.addLayout(self.hBoxLayout)
 
     def __clearLayouts(self):
         for layout in self.augmentsLayouts:
@@ -1198,7 +1201,7 @@ class ChampionAugmentsWidget(BuildWidgetBase):
                     widget.deleteLater()
 
     def updateWidget(self, data):
-        if data == None:
+        if data is None:
             self.setVisible(False)
             return
 
@@ -1230,32 +1233,110 @@ class AugmentItemBar(QFrame):
         self.name = QLabel(data['name'])
 
         self.firstRateLayout = QHBoxLayout()
-        self.firstRateText = QLabel(f"{data['play']:,} "+self.tr("Games"))
-        self.firstRate = QLabel(
-            f"{data['firstPlace'] / data['play'] * 100:.2f}%")
+
+        is_mayhem = 'winRate' in data and 'pickRate' in data
+        self._isMayhem = is_mayhem
+        if is_mayhem:
+            pick_rate = data.get('pickRate', 0) or 0
+            score = data.get('winRate', 0) or 0
+            # 紧凑两列: 左登场率(带进度条), 右评级(带颜色)
+            self.firstRateText = QLabel(self.tr("Pick Rate"))
+            self.firstRateValue = QLabel(f"{pick_rate:.1f}%")
+            self.firstRate = QLabel(self.tr("Rating"))
+            self.firstRateValue2 = QLabel(f"{score:.0f}")
+            self._pickBar = QFrame()
+            self._pickBar.setFixedHeight(3)
+            self._pickBar.setMaximumWidth(52)
+            self._updatePickBar(pick_rate)
+            self._updateScoreColor(self.firstRateValue2, score)
+            self._winTooltip = self.tr("Rating")
+            self._pickTooltip = self.tr("Pick Rate")
+        else:
+            self.firstRateText = QLabel(f"{data['play']:,} "+self.tr("Games"))
+            self.firstRate = QLabel(
+                f"{data['firstPlace'] / data['play'] * 100:.2f}%")
+            self._winTooltip = self.tr("First Rate")
+            self._pickTooltip = None
+
+        desc = data.get('desc') or data.get('tooltip') or ''
+        if desc:
+            desc = _re.sub(r'<[^>]+>', '', desc)
+            desc = _re.sub(r'\?\s*', '', desc)
+            desc = _re.sub(r'\s+', ' ', desc).strip()
+            self.setToolTip(desc)
+            self.installEventFilter(ToolTipFilter(self, 200))
 
         self.__initWidget()
         self.__initLayout()
+
+    def _updatePickBar(self, pickRate):
+        """根据登场率设置进度条宽度比例和颜色"""
+        ratio = max(0.0, min(1.0, pickRate / 100.0))
+        # 登场率越高颜色越突出
+        if ratio >= 0.3:
+            color = "#46a0fc"
+        elif ratio >= 0.1:
+            color = "#7eb8ef"
+        else:
+            color = "#9aa5b1"
+        width = max(4, int(52 * ratio))
+        self._pickBar.setFixedWidth(width)
+        self._pickBar.setStyleSheet(
+            f"background: {color}; border-radius: 1px;")
+
+    @staticmethod
+    def _updateScoreColor(label, score):
+        """根据表现分着色: 高分绿, 中分橙, 低分灰"""
+        if score >= 80:
+            color = "#3d9d3d"
+        elif score >= 50:
+            color = "#d99a2b"
+        else:
+            color = "#9aa5b1"
+        label.setStyleSheet(
+            f"color: {color}; font-weight: 600;")
 
     def __initWidget(self):
         self.icon.setFixedSize(32, 32)
         self.name.setAlignment(Qt.AlignCenter)
         self.name.setObjectName("bodyLabel")
 
-        self.firstRateText.setObjectName("grayBodyLabel")
-        self.firstRate.setObjectName("boldBodyLabel")
+        if self._isMayhem:
+            self.firstRateText.setObjectName("grayBodyLabel")
+            self.firstRateValue.setObjectName("boldBodyLabel")
+            self.firstRate.setObjectName("grayBodyLabel")
+            self.firstRateValue2.setObjectName("boldBodyLabel")
+        else:
+            self.firstRateText.setObjectName("grayBodyLabel")
+            self.firstRate.setObjectName("boldBodyLabel")
 
-        self.firstRate.setToolTip(self.tr("First Rate"))
+        self.firstRate.setToolTip(self._winTooltip)
         self.firstRate.installEventFilter(ToolTipFilter(self.firstRate, 100))
+        if self._pickTooltip:
+            self.firstRateText.setToolTip(self._pickTooltip)
+            self.firstRateText.installEventFilter(
+                ToolTipFilter(self.firstRateText, 100))
 
     def __initLayout(self):
         self.firstRateLayout.setContentsMargins(0, 0, 0, 0)
         self.firstRateLayout.setAlignment(Qt.AlignLeft)
-        self.firstRateLayout.setSpacing(0)
-        self.firstRateLayout.addWidget(self.firstRateText)
-        self.firstRateLayout.addSpacerItem(QSpacerItem(
-            0, 0, QSizePolicy.Expanding, QSizePolicy.Fixed))
-        self.firstRateLayout.addWidget(self.firstRate)
+        self.firstRateLayout.setSpacing(4)
+
+        if self._isMayhem:
+            # 左: 登场率标签 + 值 + 进度条
+            self.firstRateLayout.addWidget(self.firstRateText)
+            self.firstRateLayout.addWidget(self.firstRateValue)
+            self.firstRateLayout.addWidget(self._pickBar)
+            self.firstRateLayout.addSpacerItem(QSpacerItem(
+                0, 0, QSizePolicy.Expanding, QSizePolicy.Fixed))
+            # 右: 表现分标签 + 值(带颜色)
+            self.firstRateLayout.addWidget(self.firstRate)
+            self.firstRateLayout.addWidget(self.firstRateValue2)
+        else:
+            self.firstRateLayout.addWidget(self.firstRateText)
+            self.firstRateLayout.addSpacerItem(QSpacerItem(
+                0, 0, QSizePolicy.Expanding, QSizePolicy.Fixed))
+            self.firstRateLayout.addWidget(self.firstRate)
 
         self.nameLayout.setContentsMargins(0, 0, 0, 0)
         self.nameLayout.setSpacing(0)

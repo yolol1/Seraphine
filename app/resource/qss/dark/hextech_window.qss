@@ -1,0 +1,36 @@
+/* Hextech Window — Dark Theme */
+#titleLabel {
+    font: bold 20px 'Segoe UI', 'Microsoft YaHei', 'PingFang SC';
+    color: rgba(255, 255, 255, 0.9);
+}
+
+#contentLabel {
+    font: 13px 'Segoe UI', 'Microsoft YaHei', 'PingFang SC';
+    color: rgba(255, 255, 255, 0.6);
+}
+
+#hintLabel {
+    font: 12px 'Segoe UI', 'Microsoft YaHei', 'PingFang SC';
+    color: rgba(255, 255, 255, 0.5);
+}
+
+#quickToggleSection {
+    border: 1px solid rgba(255, 255, 255, 0.075);
+    border-radius: 10px;
+    background-color: rgba(255, 255, 255, 0.035);
+}
+
+#quickSectionTitle {
+    color: rgba(255, 255, 255, 0.82);
+    font: bold 12px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+#quickPhaseLabel {
+    color: --ThemeColorDark1;
+    font: 11px 'Microsoft YaHei UI', 'Segoe UI';
+}
+
+HextechInterface {
+    border: none;
+    background: transparent;
+}

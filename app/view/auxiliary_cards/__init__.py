@@ -1,0 +1,40 @@
+from app.view.auxiliary_cards.profile_cards import (
+    OnlineStatusCard, ProfileBackgroundCard, ProfileTierCard, OnlineAvailabilityCard, RemoveTokensCard, RemovePrestigeCrestCard,
+)
+from app.view.auxiliary_cards.tool_cards import (
+    FixClientDpiCard, RestartClientCard, LeaveQueueCard, CreatePracticeLobbyCard, SpectateCard, LockConfigCard,
+)
+from app.view.auxiliary_cards.automation_cards import (
+    AutoAcceptMatchingCard, AutoAcceptMsCard, AutoHonorCard, AutoAcceptSwapingCard, AutoSelectChampionCard, AutoBanChampionCard, AutoSetSummonerSpellCard,
+)
+from app.view.auxiliary_cards.hextech_cards import (
+    ChampionsCard, HextechChampionCard,
+)
+from app.view.auxiliary_cards.death_switch_cards import (
+    DeathSwitchCard,
+)
+
+__all__ = [
+    "OnlineStatusCard",
+    "ProfileBackgroundCard",
+    "ProfileTierCard",
+    "OnlineAvailabilityCard",
+    "RemoveTokensCard",
+    "RemovePrestigeCrestCard",
+    "FixClientDpiCard",
+    "RestartClientCard",
+    "LeaveQueueCard",
+    "CreatePracticeLobbyCard",
+    "SpectateCard",
+    "AutoAcceptMatchingCard",
+    "AutoAcceptMsCard",
+    "AutoHonorCard",
+    "AutoAcceptSwapingCard",
+    "LockConfigCard",
+    "AutoSelectChampionCard",
+    "AutoBanChampionCard",
+    "ChampionsCard",
+    "HextechChampionCard",
+    "AutoSetSummonerSpellCard",
+    "DeathSwitchCard",
+]

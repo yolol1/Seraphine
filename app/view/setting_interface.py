@@ -2,23 +2,24 @@
 import os
 
 from app.common.qfluentwidgets import (SettingCardGroup, SwitchSettingCard, ComboBoxSettingCard,
-                                       PushSettingCard, ExpandLayout, InfoBar,
-                                       setTheme, setThemeColor, PrimaryPushSettingCard, HyperlinkCard,
+                                       PushSettingCard, InfoBar,
+                                       PrimaryPushSettingCard, HyperlinkCard,
                                        TeachingTip, TeachingTipTailPosition, TeachingTipView, PushButton)
 from PyQt5.QtCore import Qt, QUrl
 from PyQt5.QtGui import QDesktopServices
-from PyQt5.QtWidgets import QWidget, QLabel, QFileDialog
 
 from app.common.icons import Icon
-from app.common.config import (cfg, YEAR, AUTHOR, VERSION, FEEDBACK_URL, GITHUB_URL, isWin11,
+from app.common.config import (cfg, YEAR, AUTHOR, MAINTAINER, VERSION, FEEDBACK_URL, GITHUB_URL, isWin11,
                                BETA)
+from app.common.theme import applyTheme
 from app.common.style_sheet import StyleSheet
 from app.components.seraphine_interface import SeraphineInterface
 from app.components.setting_cards import (LineEditSettingCard, GameTabColorSettingCard,
                                           LooseSwitchSettingCard, ProxySettingCard,
                                           DeathsNumberColorSettingCard, ThemeColorSettingCard,
-                                          QueueFilterCard)
+                                          TeamColorSettingCard)
 from app.components.message_box import MultiPathSettingMsgBox
+from app.common.signals import signalBus
 
 
 class SettingInterface(SeraphineInterface):
@@ -27,74 +28,21 @@ class SettingInterface(SeraphineInterface):
     def __init__(self, parent=None):
         super().__init__(parent=parent)
 
-        self.scrollWidget = QWidget()
-        self.expandLayout = ExpandLayout(self.scrollWidget)
+        self._initCommon(self.tr("Settings"), StyleSheet.SETTING_INTERFACE)
+        # setting_interface.qss 使用 #settingLabel, 保留兼容
+        self.titleLabel.setObjectName('settingLabel')
+        self.settingLabel = self.titleLabel
 
-        self.settingLabel = QLabel(self.tr("Settings"), self)
+        self.personalizationGroup = SettingCardGroup(
+            self.tr("个性化"), self.scrollWidget)
 
-        self.functionGroup = SettingCardGroup(self.tr("Functions"),
-                                              self.scrollWidget)
-
-        self.apiConcurrencyCount = LineEditSettingCard(
-            cfg.apiConcurrencyNumber,
-            self.tr("LCU API concurrency number"),
-            self.tr("Number of concurrency:"),
-            1, 1, 20,
-            Icon.APPLIST,
-            self.tr("Setting the maximum number of API concurrency."),
-            self.functionGroup)
-
-        self.careerGamesCount = LineEditSettingCard(
-            cfg.careerGamesNumber,
-            self.tr("Default games number"),
-            self.tr("Number of games:"),
-            10, 10, 100,
-            Icon.SLIDESEARCH,
-            self.tr(
-                "Setting the maximum number of games shows in the career interface"),
-            self.functionGroup)
-
-        self.gameInfoFilterCard = QueueFilterCard(
-            self.tr("Game Infomation filter"),
-            self.tr(
-                "Show game modes in Game Infomation interface based on your current game mode"),
-            cfg.queueFilter
-        )
-
-        self.gameInfoShowTierCard = SwitchSettingCard(
-            Icon.TROPHY, self.tr("Show tier in game information"),
-            self.tr(
-                "Show tier icon in game information interface. Enabling this option affects APP's performance"),
-            cfg.showTierInGameInfo)
-
-        self.autoClearGameinfoCard = SwitchSettingCard(
-            Icon.ATTACHTEXT, self.tr("Reserve Game Information interface"),
-            self.tr(
-                "Reserve Game Information interface until the next champion selection starts"),
-            cfg.enableReserveGameinfo
-        )
-
-        self.opggGroup = SettingCardGroup(self.tr("OP.GG"),
-                                          self.scrollWidget)
-
-        self.autoShowOpggCard = SwitchSettingCard(
-            Icon.WINDOW, self.tr("Show OP.GG window automatically"),
-            self.tr("Show OP.GG window automatically when champion selection starts"),
-            cfg.autoShowOpgg, self.opggGroup)
-        self.opggOnTopCard = SwitchSettingCard(
-            Icon.PADDINGTOP, self.tr(
-                "Show OP.GG window on top"),
-            self.tr(
-                "Show OP.GG window in front of other windows while selecting champions"),
-            cfg.enableOpggOnTop, self.opggGroup)
-        self.opggProxyCard = ProxySettingCard(
-            self.tr("OP.GG HTTP proxy"), self.tr(
-                "Using a proxy when connecting to OP.GG"),
-            cfg.enableOpggProxy, cfg.opggProxyAddr, self.opggGroup)
-
-        self.generalGroup = SettingCardGroup(self.tr("General"),
+        self.generalGroup = SettingCardGroup(self.tr("通用"),
                                              self.scrollWidget)
 
+        self.aboutGroup = SettingCardGroup(self.tr("关于"),
+                                           self.scrollWidget)
+
+        # --- 通用组卡片 ---
         self.lolFolderCard = PushSettingCard(self.tr("Choose folder"),
                                              Icon.FOLDER,
                                              self.tr("Client Path"),
@@ -105,39 +53,27 @@ class SettingInterface(SeraphineInterface):
         self.lolFolderCard.button.setStyleSheet(
             "QPushButton {padding-left: 0; padding-right: 0;}")
 
-        self.silentCard = SwitchSettingCard(
-            Icon.SNOOZE, self.tr("Silently start"),
-            self.tr(
-                "Show Seraphine window minimized when it starts"),
-            cfg.enableSilent
-        )
-
-        self.logGroup = SettingCardGroup(self.tr("Log"), self.scrollWidget)
-
-        self.logLevelCard = ComboBoxSettingCard(
-            cfg.logLevel,
-            Icon.LOG,
-            self.tr('Log Level'),
-            self.tr('The level of logging for Seraphine (take effect after restart)'),
-            texts=["Debug", "Info", "Warning", "Error"],
-            parent=self.logGroup)
-        self.viewLogCard = PushSettingCard(
-            self.tr("Open"), Icon.DOCUMENT, self.tr("Log file"),
-            self.
-            tr("Open log directory"),
-            self.logGroup)
-        self.viewLogCard.button.setFixedWidth(100)
-
-        # 这玩意左右 padding 大的离谱，手动给它改了
-        self.viewLogCard.button.setStyleSheet(
-            "QPushButton {padding-left: 0; padding-right: 0;}")
-
         self.enableStartLolWithApp = SwitchSettingCard(
             Icon.CIRCLERIGHT,
             self.tr("Auto-start LOL"),
             self.tr("Launch LOL client upon opening Seraphine automatically"),
             configItem=cfg.enableStartLolWithApp,
             parent=self.generalGroup)
+
+        self.enableCloseToTray = LooseSwitchSettingCard(
+            Icon.EXIT,
+            self.tr("Minimize to tray on close"),
+            self.tr("Minimize to system tray when clicking close"),
+            configItem=cfg.enableCloseToTray,
+            parent=self.generalGroup)
+
+        self.silentCard = SwitchSettingCard(
+            Icon.SNOOZE, self.tr("Silently start"),
+            self.tr(
+                "Show Seraphine window minimized when it starts"),
+            cfg.enableSilent,
+            parent=self.generalGroup)
+
         self.deleteResourceCard = PushSettingCard(
             self.tr("Delete"), Icon.DELETE, self.tr("Delete cache"),
             self.
@@ -148,16 +84,26 @@ class SettingInterface(SeraphineInterface):
         self.deleteResourceCard.button.setStyleSheet(
             "QPushButton {padding-left: 0; padding-right: 0;}")
 
-        self.enableCloseToTray = LooseSwitchSettingCard(
-            Icon.EXIT,
-            self.tr("Minimize to tray on close"),
-            self.tr("Minimize to system tray when clicking close"),
-            configItem=cfg.enableCloseToTray,
-            parent=self.generalGroup)
+        self.apiConcurrencyCount = LineEditSettingCard(
+            cfg.apiConcurrencyNumber,
+            self.tr("LCU API concurrency number"),
+            self.tr("Number of concurrency:"),
+            1, 1, 20,
+            Icon.APPLIST,
+            self.tr("Setting the maximum number of API concurrency."),
+            self.generalGroup)
 
-        self.personalizationGroup = SettingCardGroup(
-            self.tr("Personalization"), self.scrollWidget)
+        self.careerGamesCount = LineEditSettingCard(
+            cfg.careerGamesNumber,
+            self.tr("Default games number"),
+            self.tr("Number of games:"),
+            10, 10, 100,
+            Icon.SLIDESEARCH,
+            self.tr(
+                "Setting the maximum number of games shows in the career interface"),
+            self.generalGroup)
 
+        # --- 个性化组卡片 ---
         self.micaCard = SwitchSettingCard(
             Icon.BLUR,
             self.tr('Mica effect'),
@@ -177,10 +123,6 @@ class SettingInterface(SeraphineInterface):
                 self.tr("Use system setting")
             ],
             parent=self.personalizationGroup)
-        # self.themeColorCard = CustomColorSettingCard(
-        #     cfg.themeColor, Icon.PALETTE, self.tr("Theme color"),
-        #     self.tr("Change the theme color of Seraphine"),
-        #     self.personalizationGroup)
         self.themeColorCard = ThemeColorSettingCard(
             self.tr("Theme color"), self.tr(
                 "Change the theme color of Seraphine"),
@@ -195,6 +137,12 @@ class SettingInterface(SeraphineInterface):
             self.tr("Deaths number color"),
             self.tr("Change the color of Deaths number of KDA"),
             cfg.lightDeathsNumberColor, cfg.darkDeathsNumberColor,
+            self.personalizationGroup
+        )
+        self.teamColorSettingCard = TeamColorSettingCard(
+            self.tr("Team color"),
+            self.tr("Change the highlight color of premade teams in game info"),
+            cfg.team1Color, cfg.team2Color,
             self.personalizationGroup
         )
         self.zoomCard = ComboBoxSettingCard(
@@ -212,25 +160,46 @@ class SettingInterface(SeraphineInterface):
             Icon.LANGUAGE,
             self.tr('Language'),
             self.tr('Set your preferred language for Seraphine'),
-            texts=['简体中文', 'English', 'Português',
+            texts=['简体中文', 'English',
                    self.tr('Use system setting')],
             parent=self.personalizationGroup)
 
-        self.updateGroup = SettingCardGroup(
-            self.tr("Update"), self.scrollWidget)
-
-        self.checkUpdateCard = SwitchSettingCard(
+        # --- 关于组卡片 ---
+        self.checkUpdateCard = PushSettingCard(
+            self.tr("Check now"),
             Icon.UPDATE, self.tr("Check for updates"),
             self.tr(
                 "Automatically check for updates when software starts"),
-            cfg.enableCheckUpdate
-        )
-        self.httpProxyCard = ProxySettingCard(
-            self.tr("GitHub HTTP proxy"), self.tr(
-                "Using a proxy when connecting to GitHub"),
-            cfg.enableGithubProxy, cfg.githubProxyAddr, self.updateGroup)
+            self.aboutGroup)
 
-        self.aboutGroup = SettingCardGroup(self.tr("About"), self.scrollWidget)
+        self.autoCheckUpdateCard = SwitchSettingCard(
+            Icon.SNOOZE, self.tr("Auto check on startup"),
+            self.tr("Check for updates automatically when Seraphine starts"),
+            cfg.enableCheckUpdate,
+            parent=self.aboutGroup)
+
+        self.httpProxyCard = ProxySettingCard(
+            self.tr("HTTP proxy"), self.tr(
+                "Using a proxy when connecting to GitHub"),
+            cfg.enableProxy, cfg.proxyAddr, self.aboutGroup)
+
+        self.logLevelCard = ComboBoxSettingCard(
+            cfg.logLevel,
+            Icon.LOG,
+            self.tr('Log Level'),
+            self.tr('The level of logging for Seraphine (take effect after restart)'),
+            texts=["Debug", "Info", "Warning", "Error"],
+            parent=self.aboutGroup)
+
+        self.viewLogCard = PushSettingCard(
+            self.tr("Open"), Icon.DOCUMENT, self.tr("Log file"),
+            self.
+            tr("Open log directory"),
+            self.aboutGroup)
+        self.viewLogCard.button.setFixedWidth(100)
+        # 这玩意左右 padding 大的离谱，手动给它改了
+        self.viewLogCard.button.setStyleSheet(
+            "QPushButton {padding-left: 0; padding-right: 0;}")
 
         self.feedbackCard = PrimaryPushSettingCard(
             self.tr('Provide feedback'), Icon.FEEDBACK,
@@ -244,6 +213,7 @@ class SettingInterface(SeraphineInterface):
         self.aboutCard = HyperlinkCard(
             GITHUB_URL, self.tr("View GitHub"), Icon.INFO, self.tr('About'),
             self.tr('Copyright') + ' © ' + f"{YEAR}, {AUTHOR}. " +
+            self.tr('维护者：') + f"{MAINTAINER}. " +
             self.tr('Version') + f" {BETA or VERSION}", self.aboutGroup)
         self.aboutCard.linkButton.setIcon(Icon.GITHUB)
 
@@ -251,86 +221,63 @@ class SettingInterface(SeraphineInterface):
 
     def __initWidget(self):
         self.resize(1000, 800)
-        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.setViewportMargins(0, 90, 0, 20)
-        # self.scrollDelagate.vScrollBar.setContentsMargins(0, 50, 0, 0)
-        self.setWidget(self.scrollWidget)
-        self.setWidgetResizable(True)
-
         self.micaCard.switchButton.setEnabled(isWin11())
-
-        # initialize style sheet
-        self.scrollWidget.setObjectName('scrollWidget')
-        self.settingLabel.setObjectName('settingLabel')
-        StyleSheet.SETTING_INTERFACE.apply(self)
-
-        # initialize layout
         self.__initLayout()
         self.__connectSignalToSlot()
 
     def __initLayout(self):
-        self.settingLabel.move(36, 30)
-
-        # add cards to group
-        self.functionGroup.addSettingCard(self.apiConcurrencyCount)
-        self.functionGroup.addSettingCard(self.careerGamesCount)
-        self.functionGroup.addSettingCard(self.gameInfoFilterCard)
-        self.functionGroup.addSettingCard(self.autoClearGameinfoCard)
-        self.functionGroup.addSettingCard(self.gameInfoShowTierCard)
-
-        self.opggGroup.addSettingCard(self.autoShowOpggCard)
-        self.opggGroup.addSettingCard(self.opggOnTopCard)
-        self.opggGroup.addSettingCard(self.opggProxyCard)
-
-        self.generalGroup.addSettingCard(self.lolFolderCard)
-        self.generalGroup.addSettingCard(self.enableStartLolWithApp)
-        self.generalGroup.addSettingCard(self.deleteResourceCard)
-        self.generalGroup.addSettingCard(self.enableCloseToTray)
-        self.generalGroup.addSettingCard(self.silentCard)
-
-        self.logGroup.addSettingCard(self.logLevelCard)
-        self.logGroup.addSettingCard(self.viewLogCard)
-
+        # 个性化组
         self.personalizationGroup.addSettingCard(self.micaCard)
         self.personalizationGroup.addSettingCard(self.themeCard)
         self.personalizationGroup.addSettingCard(self.themeColorCard)
         self.personalizationGroup.addSettingCard(self.gameTabColorSettingCard)
         self.personalizationGroup.addSettingCard(
             self.deathNumberColorSettingCard)
+        self.personalizationGroup.addSettingCard(self.teamColorSettingCard)
         self.personalizationGroup.addSettingCard(self.zoomCard)
         self.personalizationGroup.addSettingCard(self.languageCard)
 
-        self.updateGroup.addSettingCard(self.checkUpdateCard)
-        self.updateGroup.addSettingCard(self.httpProxyCard)
+        # 通用组
+        self.generalGroup.addSettingCard(self.lolFolderCard)
+        self.generalGroup.addSettingCard(self.enableStartLolWithApp)
+        self.generalGroup.addSettingCard(self.enableCloseToTray)
+        self.generalGroup.addSettingCard(self.silentCard)
+        self.generalGroup.addSettingCard(self.deleteResourceCard)
+        self.generalGroup.addSettingCard(self.apiConcurrencyCount)
+        self.generalGroup.addSettingCard(self.careerGamesCount)
 
+        # 关于组
+        self.aboutGroup.addSettingCard(self.checkUpdateCard)
+        self.aboutGroup.addSettingCard(self.autoCheckUpdateCard)
+        self.aboutGroup.addSettingCard(self.httpProxyCard)
+        self.aboutGroup.addSettingCard(self.logLevelCard)
+        self.aboutGroup.addSettingCard(self.viewLogCard)
         self.aboutGroup.addSettingCard(self.feedbackCard)
         self.aboutGroup.addSettingCard(self.aboutCard)
 
         # add setting card group to layout
         self.expandLayout.setSpacing(30)
         self.expandLayout.setContentsMargins(36, 0, 36, 0)
-        self.expandLayout.addWidget(self.functionGroup)
-        self.expandLayout.addWidget(self.opggGroup)
-        self.expandLayout.addWidget(self.generalGroup)
-        self.expandLayout.addWidget(self.logGroup)
         self.expandLayout.addWidget(self.personalizationGroup)
-        self.expandLayout.addWidget(self.updateGroup)
+        self.expandLayout.addWidget(self.generalGroup)
         self.expandLayout.addWidget(self.aboutGroup)
 
     def __connectSignalToSlot(self):
         self.lolFolderCard.clicked.connect(self.__onLolFolderCardClicked)
 
         self.themeCard.comboBox.currentIndexChanged.connect(
-            lambda: setTheme(cfg.get(cfg.themeMode)))
+            lambda: applyTheme())
 
         cfg.appRestartSig.connect(self.__showRestartToolTip)
         self.careerGamesCount.pushButton.clicked.connect(
             self.__showUpdatedSuccessfullyToolTip)
+        self.checkUpdateCard.clicked.connect(
+            lambda: signalBus.checkUpdateRequested.emit())
         self.feedbackCard.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(FEEDBACK_URL)))
         self.deleteResourceCard.clicked.connect(self.__showFlyout)
         self.viewLogCard.clicked.connect(
-            lambda: os.system(f'explorer {os.getcwd()}\\log')
+            lambda: os.startfile(os.path.join(os.getcwd(), 'log'))
         )
 
     def __onLolFolderCardClicked(self):

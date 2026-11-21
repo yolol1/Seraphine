@@ -1,17 +1,16 @@
 
-from PyQt5.QtWidgets import (QHBoxLayout, QWidget, QFrame, QVBoxLayout, QSpacerItem,
-                             QSizePolicy, QLabel, QHBoxLayout, QWidget, QLabel, QFrame,
+from PyQt5.QtWidgets import (QHBoxLayout, QWidget, QLabel, QFrame,
                              QVBoxLayout, QSpacerItem, QSizePolicy)
 from PyQt5.QtCore import Qt, pyqtSignal, QEasingCurve
-from PyQt5.QtGui import QPixmap
 from qasync import asyncSlot
 
 from app.components.animation_frame import ColorAnimationFrame
-from app.components.transparent_button import TransparentButton
 from app.components.champion_icon_widget import RoundIcon, RoundedLabel
 from app.common.signals import signalBus
 from app.common.style_sheet import StyleSheet
-from app.common.qfluentwidgets import BodyLabel, SmoothScrollArea, FlowLayout, IconWidget
+from app.common.qfluentwidgets import (
+    BodyLabel, SmoothScrollArea, FlowLayout, isDarkTheme, qconfig,
+    themeColor)
 
 
 class TierInterface(QFrame):
@@ -102,7 +101,7 @@ class TierListWidget(QFrame):
 
     @asyncSlot(str)
     async def __onSortRequested(self, key: str):
-        if self.items[0].info.get(key) == None:
+        if self.items[0].info.get(key) is None:
             return
 
         if key == 'rank':
@@ -140,6 +139,44 @@ class TierListWidget(QFrame):
             item.setVisible(True)
 
 
+class SortLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def __init__(self, text, parent=None):
+        super().__init__(text, parent)
+        self._selected = False
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(32)
+        self.setAlignment(Qt.AlignCenter)
+        qconfig.themeChangedFinished.connect(self._refreshStyle)
+        self._refreshStyle()
+
+    def setSelected(self, selected: bool):
+        self._selected = bool(selected)
+        self._refreshStyle()
+
+    def _refreshStyle(self):
+        dark = isDarkTheme()
+        accent = themeColor().name()
+        if self._selected:
+            color = accent
+            border = f"2px solid {accent}"
+        else:
+            color = "rgba(255,255,255,0.72)" if dark else "rgba(0,0,0,0.66)"
+            border = "2px solid transparent"
+        self.setStyleSheet(
+            "SortLabel {"
+            f" color: {color}; background-color: transparent;"
+            f" border: none; border-bottom: {border}; padding: 5px 4px 7px 4px;"
+            " font: bold 13px 'Microsoft YaHei UI', 'Segoe UI';"
+            "}")
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class ListTitleBar(QFrame):
     sortRequested = pyqtSignal(str)
 
@@ -151,13 +188,13 @@ class ListTitleBar(QFrame):
 
         self.counterLabel = QLabel("#")
         self.championLabel = QLabel(self.tr("Champion"))
-        self.rankLabel = TransparentButton(self.tr("Tier"))
-        self.winRateLabel = TransparentButton(self.tr("Win Rate"))
-        self.pickRateLabel = TransparentButton(self.tr("Pick Rate"))
-        self.banRateLabel = TransparentButton(self.tr("Ban Rate"))
+        self.rankLabel = SortLabel(self.tr("Tier"))
+        self.winRateLabel = SortLabel(self.tr("Win Rate"))
+        self.pickRateLabel = SortLabel(self.tr("Pick Rate"))
+        self.banRateLabel = SortLabel(self.tr("Ban Rate"))
         self.countersLabel = QLabel(self.tr("Counters"))
 
-        self.selected: TransparentButton = self.rankLabel
+        self.selected: SortLabel = self.rankLabel
 
         self.__initWidget()
         self.__initLayout()
@@ -171,7 +208,7 @@ class ListTitleBar(QFrame):
         self.hBoxLayout.addSpacerItem(QSpacerItem(
             0, 0, QSizePolicy.Expanding, QSizePolicy.Fixed))
         self.hBoxLayout.addWidget(self.rankLabel, alignment=Qt.AlignCenter)
-        # self.hBoxLayout.addSpacing(1)
+        self.hBoxLayout.addSpacing(13)
         self.hBoxLayout.addWidget(self.winRateLabel, alignment=Qt.AlignCenter)
         self.hBoxLayout.addSpacing(1)
         self.hBoxLayout.addWidget(self.pickRateLabel, alignment=Qt.AlignCenter)
@@ -188,12 +225,14 @@ class ListTitleBar(QFrame):
         self.championLabel.setAlignment(Qt.AlignCenter)
         self.championLabel.setObjectName("championLabel")
 
-        width = 70
+        for button in (self.rankLabel, self.winRateLabel,
+                       self.pickRateLabel, self.banRateLabel):
+            button.setObjectName("tierSortButton")
 
         self.rankLabel.setFixedWidth(50)
-        self.winRateLabel.setFixedWidth(width)
-        self.pickRateLabel.setFixedWidth(width)
-        self.banRateLabel.setFixedWidth(width)
+        self.winRateLabel.setFixedWidth(70)
+        self.pickRateLabel.setFixedWidth(70)
+        self.banRateLabel.setFixedWidth(70)
         self.countersLabel.setFixedWidth(80)
 
         self.rankLabel.clicked.connect(
@@ -208,17 +247,14 @@ class ListTitleBar(QFrame):
         self.resetSelected()
 
     def __onSortButtonClicked(self, type):
-        widget: TransparentButton = getattr(self, f"{type}Label")
+        widget: SortLabel = getattr(self, f"{type}Label")
         self.__setSelected(widget)
 
         self.sortRequested.emit(type)
 
-    def __setSelected(self, widget: TransparentButton):
-        self.selected.setProperty("selected", False)
-        self.selected.style().polish(self.selected)
-
-        widget.setProperty("selected", True)
-        widget.style().polish(widget)
+    def __setSelected(self, widget: SortLabel):
+        self.selected.setSelected(False)
+        widget.setSelected(True)
 
         self.selected = widget
 
@@ -289,7 +325,7 @@ class ListItem(ColorAnimationFrame):
 
         width = 70
 
-        # self.tierLabel.setFixedWidth(50)
+        self.tierLabel.setFixedWidth(50)
         self.winRateLabel.setFixedWidth(width)
         self.pickRateLabel.setFixedWidth(width)
         self.banRateLabel.setFixedWidth(width)
@@ -304,6 +340,8 @@ class ListItem(ColorAnimationFrame):
         self.clicked.connect(self.__onClicked)
 
     def __initLayout(self):
+        self.hBoxLayout.setContentsMargins(17, 6, 28, 6)
+        self.hBoxLayout.setSpacing(0)
         self.countersLayout.setContentsMargins(0, 0, 0, 0)
         self.countersLayout.setSpacing(2)
 

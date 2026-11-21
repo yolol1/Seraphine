@@ -1,7 +1,6 @@
 import re
-import threading
 import time
-from asyncio import CancelledError, LifoQueue
+from asyncio import LifoQueue
 from collections import OrderedDict
 
 import pyperclip
@@ -16,8 +15,7 @@ from ..common.logger import logger
 from ..common.qfluentwidgets import (SmoothScrollArea, PushButton, ToolButton, InfoBar,
                                      InfoBarPosition, ToolTipFilter, ToolTipPosition,
                                      isDarkTheme, FlyoutViewBase, Flyout, Theme,
-                                     IndeterminateProgressRing, ComboBox, StateToolTip,
-                                     setCustomStyleSheet, TransparentPushButton)
+                                     IndeterminateProgressRing, ComboBox, TransparentPushButton)
 
 from app.common.style_sheet import StyleSheet, ColorChangeable
 from app.common.icons import Icon
@@ -26,12 +24,14 @@ from app.common.signals import signalBus
 from app.components.champion_icon_widget import RoundIcon, RoundedLabel
 from app.components.search_line_edit import SearchLineEdit
 from app.components.summoner_name_button import SummonerName
-from app.components.animation_frame import ColorAnimationFrame, CardWidget
+from app.components.animation_frame import ColorAnimationFrame
 from app.components.color_label import ColorLabel, DeathsLabel
+from app.components.game_infobar_widget import AugmentRow
 from app.lol.connector import connector
-from app.lol.exceptions import SummonerGamesNotFound, SummonerNotFound
-from app.lol.tools import parseGameData, parseGameDetailData, parseGamesDataConcurrently
+from app.lol.exceptions import SummonerGamesNotFound
+from app.lol.tools import parseGameDetailData, parseGamesDataConcurrently
 from ..components.seraphine_interface import SeraphineInterface
+from .analysis_page import AnalysisPage
 
 
 TAG = "SearchInterface"
@@ -127,12 +127,12 @@ class GamesTab(QFrame):
             self.games.append(game)
             queueId = game['queueId']
 
-            l: list = self.queueIdMap.get(queueId)
+            lst: list = self.queueIdMap.get(queueId)
 
-            if not l:
+            if not lst:
                 self.queueIdMap[queueId] = [index]
             else:
-                l.append(index)
+                lst.append(index)
 
             self.queueIdMap[-1].append(index)
 
@@ -171,7 +171,7 @@ class GamesTab(QFrame):
         self.resetButtonEnabled()
 
     def resetButtonEnabled(self):
-        prevEnable = not self.currentPageNum in [0, 1]
+        prevEnable = self.currentPageNum not in [0, 1]
         self.prevButton.setEnabled(prevEnable)
 
         nextEnable = len(
@@ -261,10 +261,13 @@ class GameDetailView(QFrame):
         super().__init__(parent)
         self.hBoxLayout = QHBoxLayout(self)
         self.stackedWidget = QStackedWidget()
+        self.outerStack = QStackedWidget()
+        self._game = None
 
         self.infoPage = QWidget()
         self.vBoxLayout = QVBoxLayout(self.infoPage)
         self.titleBar = GameTitleBar()
+        self.titleBar.analysisRequested.connect(self._showAnalysis)
 
         self.scrollWidget = QWidget()
         self.scrollArea = SmoothScrollArea()
@@ -286,6 +289,20 @@ class GameDetailView(QFrame):
 
         self.__initLayout()
 
+        self.stackedWidget.addWidget(self.loadingPage)
+        self.stackedWidget.addWidget(self.infoPage)
+        self.stackedWidget.setCurrentIndex(1)
+
+        self.analysisPage = AnalysisPage()
+        self.analysisPage.backRequested.connect(self.__showGameInfo)
+
+        self.outerStack.addWidget(self.stackedWidget)   # index 0
+        self.outerStack.addWidget(self.analysisPage)     # index 1
+        self.outerStack.setCurrentIndex(0)
+
+        self.hBoxLayout.setContentsMargins(0, 0, 0, 0)
+        self.hBoxLayout.addWidget(self.outerStack)
+
     def clear(self):
         for i in reversed(range(self.vBoxLayout.count())):
             item = self.vBoxLayout.itemAt(i)
@@ -295,6 +312,7 @@ class GameDetailView(QFrame):
                 item.widget().deleteLater()
 
         self.titleBar = GameTitleBar()
+        self.titleBar.analysisRequested.connect(self._showAnalysis)
 
         self.scrollWidget = QWidget()
         self.scrollArea = SmoothScrollArea()
@@ -314,8 +332,6 @@ class GameDetailView(QFrame):
 
     def __initLayout(self):
         self.scrollArea.setObjectName("gameScrollArea")
-        # self.scrollArea.setVerticalScrollBarPolicy(
-        #     Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scrollWidget.setObjectName("scrollWidget")
 
         self.scrollWidget.setLayout(self.scrollLayout)
@@ -346,16 +362,6 @@ class GameDetailView(QFrame):
         self.extraTeamView5.setVisible(False)
         self.extraTeamView6.setVisible(False)
 
-        self.stackedWidget.addWidget(self.loadingPage)
-        self.stackedWidget.addWidget(self.infoPage)
-        self.stackedWidget.setCurrentIndex(1)
-
-        self.hBoxLayout.setContentsMargins(0, 0, 0, 0)
-        self.hBoxLayout.addWidget(self.stackedWidget)
-
-        # self.vBoxLayout.addSpacerItem(
-        #     QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
-
     def setLoadingPageEnabled(self, enable: bool):
         index = 0 if enable else 1
         self.stackedWidget.setCurrentIndex(index)
@@ -371,17 +377,28 @@ class GameDetailView(QFrame):
 
             return
 
+        self._game = game
         isCherry = game["queueId"] == 1700
+        isMayhem = game["queueId"] == 2400
         self.titleBar.updateTitleBar(game)
 
-        team1 = game["teams"][100]
-        team2 = game["teams"][200]
+        teams = game.get("teams", {})
+        team1 = teams.get(100) or teams.get("100") or {}
+        team2 = teams.get(200) or teams.get("200") or {}
 
-        self.teamView1.updateTeam(team1, isCherry, self.tr("1st"))
-        self.teamView1.updateSummoners(team1["summoners"])
+        # 全队 5 档评级: 每个队友一个档位标签
+        ratingList1 = self.__getTeamRating(game.get('gameId'),
+                                            team1.get('win'))
+        ratingList2 = self.__getTeamRating(game.get('gameId'),
+                                            team2.get('win'))
 
-        self.teamView2.updateTeam(team2, isCherry, self.tr("2nd"))
-        self.teamView2.updateSummoners(team2["summoners"])
+        self.teamView1.updateTeam(team1, isCherry, self.tr("1st"), isMayhem)
+        self.teamView1.updateSummoners(team1["summoners"],
+                                        ratingList=ratingList1)
+
+        self.teamView2.updateTeam(team2, isCherry, self.tr("2nd"), isMayhem)
+        self.teamView2.updateSummoners(team2["summoners"],
+                                        ratingList=ratingList2)
 
         self.extraTeamView1.setVisible(isCherry)
         self.extraTeamView2.setVisible(isCherry)
@@ -391,30 +408,83 @@ class GameDetailView(QFrame):
         self.extraTeamView6.setVisible(isCherry)
 
         if isCherry:
-            team3 = game["teams"][300]
-            team4 = game["teams"][400]
-            team5 = game["teams"][500]
-            team6 = game["teams"][600]
-            team7 = game["teams"][700]
-            team8 = game["teams"][800]
+            teams = game.get("teams", {})
+            team3 = teams.get(300) or teams.get("300") or {}
+            team4 = teams.get(400) or teams.get("400") or {}
+            team5 = teams.get(500) or teams.get("500") or {}
+            team6 = teams.get(600) or teams.get("600") or {}
+            team7 = teams.get(700) or teams.get("700") or {}
+            team8 = teams.get(800) or teams.get("800") or {}
+
+            rl3 = self.__getTeamRating(game.get('gameId'), team3.get('win'))
+            rl4 = self.__getTeamRating(game.get('gameId'), team4.get('win'))
+            rl5 = self.__getTeamRating(game.get('gameId'), team5.get('win'))
+            rl6 = self.__getTeamRating(game.get('gameId'), team6.get('win'))
+            rl7 = self.__getTeamRating(game.get('gameId'), team7.get('win'))
+            rl8 = self.__getTeamRating(game.get('gameId'), team8.get('win'))
 
             self.extraTeamView1.updateTeam(team3, isCherry, self.tr("3rd"))
-            self.extraTeamView1.updateSummoners(team3["summoners"])
+            self.extraTeamView1.updateSummoners(team3["summoners"],
+                                                 ratingList=rl3)
 
             self.extraTeamView2.updateTeam(team4, isCherry, self.tr("4th"))
-            self.extraTeamView2.updateSummoners(team4["summoners"])
+            self.extraTeamView2.updateSummoners(team4["summoners"],
+                                                 ratingList=rl4)
 
             self.extraTeamView3.updateTeam(team5, isCherry, self.tr("5th"))
-            self.extraTeamView3.updateSummoners(team5["summoners"])
+            self.extraTeamView3.updateSummoners(team5["summoners"],
+                                                 ratingList=rl5)
 
             self.extraTeamView4.updateTeam(team6, isCherry, self.tr("6th"))
-            self.extraTeamView4.updateSummoners(team6["summoners"])
+            self.extraTeamView4.updateSummoners(team6["summoners"],
+                                                 ratingList=rl6)
 
             self.extraTeamView5.updateTeam(team7, isCherry, self.tr("7th"))
-            self.extraTeamView5.updateSummoners(team7["summoners"])
+            self.extraTeamView5.updateSummoners(team7["summoners"],
+                                                 ratingList=rl7)
 
             self.extraTeamView6.updateTeam(team8, isCherry, self.tr("8th"))
-            self.extraTeamView6.updateSummoners(team8["summoners"])
+            self.extraTeamView6.updateSummoners(team8["summoners"],
+                                                 ratingList=rl8)
+
+    def __getTeamRating(self, gameId, winField):
+        """查询评级缓存, 返回对应队伍 (胜方/败方) 的全队 5 档评级列表.
+
+        胜方队 (win=True) -> 缓存的 winnerRating 字段
+        败方队 (win=False) -> 缓存的 loserRating 字段
+
+        配置关闭 (enableTeamRating=False) 时返回 None.
+        """
+        if not gameId or not cfg.get(cfg.enableTeamRating):
+            return None
+        # winField 可能是 'Win'/'Loss' 字符串或布尔值
+        if isinstance(winField, str):
+            isWin = winField.lower() in ('win', 'true')
+        elif winField is None:
+            return None
+        else:
+            isWin = bool(winField)
+        try:
+            from app.lol.war_criminal_cache import getTeamRating
+            return getTeamRating(gameId, isWin)
+        except Exception:
+            return None
+
+    def _showAnalysis(self):
+        logger.info("GameAnalysis: _showAnalysis called, _game=%s" % (self._game is not None), TAG)
+        if not self._game:
+            logger.warning("GameAnalysis: self._game is None", TAG)
+            return
+        try:
+            self.analysisPage.loadGame(self._game)
+            self.outerStack.setCurrentIndex(1)
+        except Exception as e:
+            logger.error(f"GameAnalysis: page failed: {e}", TAG)
+            import traceback
+            logger.error(traceback.format_exc(), TAG)
+
+    def __showGameInfo(self):
+        self.outerStack.setCurrentIndex(0)
 
 
 class TeamView(QFrame, ColorChangeable):
@@ -443,6 +513,8 @@ class TeamView(QFrame, ColorChangeable):
         self.csIconLabel = RoundedLabel(radius=0, borderWidth=0)
         self.goldIconLabel = RoundedLabel(radius=0, borderWidth=0)
         self.dmgIconLabel = QLabel()
+        # 海克斯强化表头列 (仅海克斯大乱斗模式显示, 与 SummonerInfoBar.augmentRow 等宽对齐)
+        self.augmentHeaderLabel = QLabel(self.tr("Hextech"))
 
         self.kills = QLabel()
         self.slash1 = QLabel()
@@ -493,6 +565,13 @@ class TeamView(QFrame, ColorChangeable):
 
         self.dmgIconLabel.setObjectName("dmgIconLabel")
         self.bansButton.clicked.connect(self.__onBansButtonClicked)
+
+        # 海克斯表头列: 固定宽度与 AugmentRow.FIXED_WIDTH 对齐, 默认隐藏
+        from app.components.game_infobar_widget import AugmentRow
+        self.augmentHeaderLabel.setFixedWidth(AugmentRow.FIXED_WIDTH)
+        self.augmentHeaderLabel.setAlignment(Qt.AlignCenter)
+        self.augmentHeaderLabel.setObjectName("augmentHeaderLabel")
+        self.augmentHeaderLabel.setVisible(False)
 
     def __initToolTip(self):
         self.towerIconLabel.setToolTip(self.tr("Tower destroyed"))
@@ -592,6 +671,8 @@ class TeamView(QFrame, ColorChangeable):
         self.titleBarLayout.addSpacing(28)
         self.titleBarLayout.addWidget(self.dmgIconLabel)
         self.titleBarLayout.addSpacing(7)
+        # 海克斯表头列 (与 SummonerInfoBar 的 augmentRow 对齐, 默认隐藏)
+        self.titleBarLayout.addWidget(self.augmentHeaderLabel)
 
         self.summonersLayout.setContentsMargins(2, 4, 2, 2)
         self.summonersLayout.setSpacing(4)
@@ -602,10 +683,13 @@ class TeamView(QFrame, ColorChangeable):
         self.vBoxLayout.addSpacing(8)
         self.vBoxLayout.addLayout(self.summonersLayout)
 
-    def updateTeam(self, team, isCherry, result):
+    def updateTeam(self, team, isCherry, result, isMayhem=False):
         if not self.isToolTipInit:
             self.isToolTipInit = True
             self.__initToolTip()
+
+        # 海克斯大乱斗模式: 显示海克斯表头列
+        self.augmentHeaderLabel.setVisible(isMayhem)
 
         win = team['win']
         baronIcon = team['baronIcon']
@@ -672,15 +756,24 @@ class TeamView(QFrame, ColorChangeable):
         self.slash1.setText("/")
         self.slash2.setText("/")
 
-    def updateSummoners(self, summoners):
+    def updateSummoners(self, summoners, ratingList=None):
         for i in reversed(range(self.summonersLayout.count())):
             item = self.summonersLayout.itemAt(i)
             self.summonersLayout.removeItem(item)
             if (widget := item.widget()):
                 widget.deleteLater()
 
+        # ratingList: 全队评级列表, 按 puuid 索引建立映射
+        ratingMap = {}
+        if ratingList:
+            for r in ratingList:
+                pid = r.get('puuid')
+                if pid:
+                    ratingMap[pid] = r
+
         for summoner in summoners:
-            infoBar = SummonerInfoBar(summoner)
+            ratingInfo = ratingMap.get(summoner.get('puuid'))
+            infoBar = SummonerInfoBar(summoner, ratingInfo=ratingInfo)
 
             self.summonersLayout.addWidget(infoBar, stretch=1)
 
@@ -722,7 +815,8 @@ class BansFlyoutView(FlyoutViewBase):
 
 
 class SummonerInfoBar(QFrame):
-    def __init__(self, summoner, parent=None):
+    def __init__(self, summoner, parent=None,
+                 ratingInfo=None):
         super().__init__(parent)
         # self._pressedBackgroundColor = self._hoverBackgroundColor
 
@@ -756,6 +850,31 @@ class SummonerInfoBar(QFrame):
         self.goldLabel = QLabel()
         self.demageLabel = QLabel()
 
+        # 海克斯大乱斗: 强化图标行 (仅 queueId=2400 时有数据)
+        augmentIds = summoner.get("augmentIds") or []
+        championId = summoner.get("championId")
+        self.augmentRow = AugmentRow(
+            augmentIds, championId=championId) if augmentIds else None
+
+        # 全队 5 档评级徽章: 每个玩家都显示自己的档位
+        self.gradeBadge = None
+        if ratingInfo:
+            from app.components.grade_badge import GradeBadge
+            from app.lol.war_criminal import (RANDOM_TEAM_KEY, gradeLabel as _gLabel,
+                                              gradeComment as _gComment)
+            # label/评语按当前风格现算; 随机风格用缓存烘焙的实际方案
+            grade = ratingInfo.get('grade') or 3
+            style = cfg.get(cfg.teamRatingStyle)
+            if style == RANDOM_TEAM_KEY:
+                style = ratingInfo.get('scheme')
+            isWin = bool(ratingInfo.get('isWin', False))
+            self.gradeBadge = GradeBadge(
+                grade=grade,
+                label=_gLabel(grade, isWin, style),
+                isCurrent=ratingInfo.get('isCurrent', False),
+                evidence=ratingInfo.get('evidence'),
+                comment=_gComment(grade, isWin, style))
+
         self.__initWidget(summoner)
         self.__initLayout()
 
@@ -772,7 +891,12 @@ class SummonerInfoBar(QFrame):
         self.summonerName.setSizePolicy(
             QSizePolicy.Expanding, QSizePolicy.Minimum)
 
-        self.runeIcon.setPicture(QPixmap(summoner["runeIcon"]))
+        rune_pm = QPixmap(summoner["runeIcon"]) if summoner["runeIcon"] else QPixmap()
+        if not rune_pm.isNull():
+            self.runeIcon.setPixmap(rune_pm)
+            self.runeIcon.havePic = True
+        else:
+            self.runeIcon.havePic = False
         self.runeIcon.setFixedSize(23, 23)
         self.spell1Icon.setFixedSize(18, 18)
         self.spell1Icon.setPicture(summoner["spell1Icon"])
@@ -791,7 +915,7 @@ class SummonerInfoBar(QFrame):
             self.items.append(label)
 
         if summoner["rankInfo"]:
-            if summoner['rankIcon'] != None and summoner['rankIcon'] != '':
+            if summoner['rankIcon'] is not None and summoner['rankIcon'] != '':
                 self.rankIcon.setPicture(summoner["rankIcon"])
                 self.rankIcon.setFixedSize(30, 30)
 
@@ -831,7 +955,7 @@ class SummonerInfoBar(QFrame):
         self.goldLabel.setAlignment(Qt.AlignCenter)
         self.goldLabel.setFixedWidth(60)
 
-        self.demageLabel.setText(str(summoner["demage"]))
+        self.demageLabel.setText(str(summoner.get("damage", 0)))
         self.demageLabel.setAlignment(Qt.AlignCenter)
         self.demageLabel.setFixedWidth(70)
 
@@ -853,6 +977,10 @@ class SummonerInfoBar(QFrame):
         self.hBoxLayout.addWidget(self.levelLabel)
         self.hBoxLayout.addWidget(self.championIconLabel)
         self.hBoxLayout.addWidget(self.summonerName, alignment=Qt.AlignVCenter)
+        # 全队 5 档评级徽章: 紧跟召唤师名右侧 (每个玩家都显示)
+        if self.gradeBadge:
+            self.hBoxLayout.addSpacing(6)
+            self.hBoxLayout.addWidget(self.gradeBadge)
         self.hBoxLayout.addSpacing(4)
         self.hBoxLayout.addSpacerItem(QSpacerItem(
             1, 1, QSizePolicy.Minimum, QSizePolicy.Minimum))
@@ -874,9 +1002,15 @@ class SummonerInfoBar(QFrame):
         self.hBoxLayout.addWidget(self.csLabel)
         self.hBoxLayout.addWidget(self.goldLabel)
         self.hBoxLayout.addWidget(self.demageLabel)
+        # 海克斯强化图标 (仅在海克斯大乱斗对局详情中显示)
+        if self.augmentRow:
+            self.hBoxLayout.addSpacing(8)
+            self.hBoxLayout.addWidget(self.augmentRow)
 
 
 class GameTitleBar(QFrame, ColorChangeable):
+    analysisRequested = pyqtSignal()
+
     def __init__(self, type: str = None, parent=None):
         QFrame.__init__(self, parent=parent)
         ColorChangeable.__init__(self, type)
@@ -888,8 +1022,9 @@ class GameTitleBar(QFrame, ColorChangeable):
         self.mapIcon = RoundedLabel(borderWidth=0, radius=0)
         self.resultLabel = QLabel()
         self.infoLabel = QLabel()
-        self.copyGameIdButton = ToolButton(Icon.COPY)
+        self.copyGameIdButton = PushButton(self.tr("Copy ID"))
         self.gameId = None
+        self.analysisButton = PushButton(self.tr("Game Analysis"))
 
         self.remake = None
         self.win = None
@@ -902,10 +1037,13 @@ class GameTitleBar(QFrame, ColorChangeable):
         self.resultLabel.setObjectName("resultLabel")
         self.infoLabel.setObjectName("infoLabel")
         self.copyGameIdButton.setVisible(False)
-        self.copyGameIdButton.setFixedSize(36, 36)
+        self.copyGameIdButton.setObjectName("copyGameIdButton")
+        self.copyGameIdButton.setFixedHeight(30)
+        self.copyGameIdButton.setMinimumWidth(86)
         self.copyGameIdButton.setToolTip(self.tr("Copy game ID"))
         self.copyGameIdButton.installEventFilter(ToolTipFilter(
             self.copyGameIdButton, 500, ToolTipPosition.LEFT))
+        self.analysisButton.setFixedHeight(30)
 
     def __initLayout(self):
         self.infoLayout.setSpacing(0)
@@ -917,9 +1055,12 @@ class GameTitleBar(QFrame, ColorChangeable):
         self.titleBarLayout.addWidget(self.mapIcon)
         self.titleBarLayout.addSpacing(5)
         self.titleBarLayout.addLayout(self.infoLayout)
+        self.titleBarLayout.addSpacing(8)
         self.titleBarLayout.addSpacerItem(QSpacerItem(
             1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.titleBarLayout.addWidget(self.copyGameIdButton)
+        self.titleBarLayout.addSpacing(6)
+        self.titleBarLayout.addWidget(self.analysisButton)
         self.titleBarLayout.addSpacing(10)
 
     def updateTitleBar(self, game):
@@ -967,6 +1108,9 @@ class GameTitleBar(QFrame, ColorChangeable):
             + self.tr("Game ID: ") + f"{self.gameId}")
 
         self.copyGameIdButton.setVisible(True)
+        self.copyGameIdButton.setToolTip(
+            self.tr("Copy game ID") + f" {self.gameId}")
+        self.analysisButton.setVisible(True)
 
     def setColor(self, c1: QColor, c2, c3, c4):
         self.setStyleSheet(f"""
@@ -976,8 +1120,17 @@ class GameTitleBar(QFrame, ColorChangeable):
         """)
 
     def __connectSignalToSlot(self):
-        self.copyGameIdButton.clicked.connect(
-            lambda: pyperclip.copy(self.gameId))
+        self.copyGameIdButton.clicked.connect(self.__copyGameId)
+        self.analysisButton.clicked.connect(
+            self.analysisRequested.emit)
+
+    def __copyGameId(self):
+        if self.gameId is None:
+            return
+        pyperclip.copy(str(self.gameId))
+        InfoBar.success(
+            "", self.tr("Game ID copied"), duration=1200,
+            parent=self.window(), position=InfoBarPosition.BOTTOM_RIGHT)
 
 
 class GamesView(QFrame):
@@ -1154,7 +1307,8 @@ class SearchInterface(SeraphineInterface):
         self.filterComboBox.addItems([
             self.tr('All'),
             self.tr('Normal'),
-            self.tr("A.R.A.M."),
+            self.tr("大乱斗"),
+            self.tr("海克斯大乱斗"),
             self.tr("Ranked Solo"),
             self.tr("Ranked Flex")
         ])
@@ -1172,10 +1326,8 @@ class SearchInterface(SeraphineInterface):
         self.vBoxLayout.setContentsMargins(30, 32, 30, 30)
 
     def setEnabled(self, a0: bool) -> None:
-        self.gamesView.gameDetailView.clear()
-        self.gamesView.gamesTab.clear()
-        self.searchLineEdit.clear()
-
+        # 仅禁用交互控件, 不清空已加载的战绩数据
+        # (客户端断开后保留数据供查看, 符合 "保留最后用户数据" 的需求)
         self.searchLineEdit.setEnabled(a0)
         self.searchLineEdit.searchButton.setEnabled(a0)
 
@@ -1196,6 +1348,17 @@ class SearchInterface(SeraphineInterface):
 
         signalBus.gameTabClicked.connect(self.__onGameTabClicked)
 
+        # LCU 冷启动 stale cache 后台恢复成功: 若正在展示该召唤师则自动重刷,
+        # 避免搜索页停留在冷启动时拿到的残缺战绩 (如只有 2 条)
+        signalBus.matchHistoryRecovered.connect(self.__onMatchHistoryRecovered)
+
+    @asyncSlot(str)
+    async def __onMatchHistoryRecovered(self, puuid: str):
+        if puuid and self.puuid == puuid:
+            logger.info(
+                "match history recovered, refresh search page", TAG)
+            await self.searchAndShowFirstPage(force=True)
+
     def __showSummonerNotFoundMsg(self):
         InfoBar.error(
             title=self.tr("Summoner not found"),
@@ -1208,15 +1371,30 @@ class SearchInterface(SeraphineInterface):
 
     # Fix: 超快速的在候选栏选中两次同样puuid会起两个task加载战绩, 100%干掉客户端 -- By Hpero4
     @asyncLockDecorator('loadFirstPageLock')
-    async def searchAndShowFirstPage(self, puuid=None):
-        name = self.searchLineEdit.text()
-        if name == "":
-            return False
-
-        if re.match(r"\S+-\S+-\S+-\S+-\S+", name):
-            summoner = await connector.getSummonerByPuuid(name)
+    async def searchAndShowFirstPage(self, puuid=None, force=False):
+        # force 模式: 不依赖搜索框内容, 直接用已知 puuid 查 summoner
+        #   - 显式传入 puuid (生涯页点对局进来) 必须优先用传入值,
+        #     否则会被搜索页上一次的目标覆盖 (查完队友后从自己生涯点进来
+        #     仍显示队友战绩)
+        #   - 未传 puuid (生涯页刷新后同步/冷启动恢复) 才回退搜索页当前目标
+        name = None
+        target_puuid = puuid or self.puuid
+        if force and target_puuid and target_puuid != 0:
+            summoner = await connector.getSummonerByPuuid(target_puuid)
         else:
-            summoner = await connector.getSummonerByName(name)
+            name = self.searchLineEdit.text()
+            if name == "":
+                return False
+
+            if re.match(r"\S+-\S+-\S+-\S+-\S+", name):
+                summoner = await connector.getSummonerByPuuid(name)
+            else:
+                summoner = await connector.getSummonerByName(name)
+
+        # LCU 未就绪时 @retry 统一拦截 ReferenceError 并返回 None
+        # (已通过 signalBus.lcuNotConnected 发射统一提示, 这里直接退出)
+        if summoner is None:
+            return False
 
         if 'errorCode' in summoner:
             self.__showSummonerNotFoundMsg()
@@ -1229,45 +1407,63 @@ class SearchInterface(SeraphineInterface):
 
         self.gamesView.gameDetailView.clear()
 
-        # NOTE 如果是生涯和搜索反复横跳, 就不重新启 loadgames 任务了
-        if puuid != self.puuid:
-            if self.gameLoadingTask:
-                self.gameLoadingTask.cancel()
+        try:
+            # NOTE 如果是生涯和搜索反复横跳, 就不重新启 loadgames 任务了
+            # force=True 时强制重新加载 (生涯页刷新后同步)
+            if force or puuid != self.puuid:
+                if self.gameLoadingTask:
+                    self.gameLoadingTask.cancel()
 
-                while not self.gameLoadingTask.cancelled() \
-                        and not self.gameLoadingTask.done():
-                    await asyncio.sleep(.3)
+                    while not self.gameLoadingTask.cancelled() \
+                            and not self.gameLoadingTask.done():
+                        await asyncio.sleep(.3)
 
-            self.puuid = summoner['puuid']
-            self.gamesView.gamesTab.clear()
+                self.puuid = summoner['puuid']
+                self.gamesView.gamesTab.clear()
 
-            # 先加载两页，让用户看着
-            try:
-                games = await connector.getSummonerGamesByPuuid(self.puuid, 0, 19)
-            except SummonerGamesNotFound:
-                games = []
-            else:
-                games = await parseGamesDataConcurrently(games['games'])
+                # 先加载两页，让用户看着
+                try:
+                    games = await connector.getSummonerGamesByPuuid(self.puuid, 0, 19)
+                except SummonerGamesNotFound:
+                    games = []
+                else:
+                    # LCU 未就绪时 @retry 返回 None (统一提示已发射)
+                    if games is None:
+                        self.gamesView.setLoadingPageEnable(False)
+                        return False
+                    games = await parseGamesDataConcurrently(games['games'], self.puuid)
 
-            if len(games) == 0:
-                self.gamesView.gamesTab.nextButton.setVisible(False)
-                self.gamesView.gamesTab.prevButton.setVisible(False)
-                self.filterComboBox.setEnabled(False)
-                self.gamesView.setLoadingPageEnable(False)
-                return False
+                if len(games) == 0:
+                    self.gamesView.gamesTab.nextButton.setVisible(False)
+                    self.gamesView.gamesTab.prevButton.setVisible(False)
+                    self.filterComboBox.setEnabled(False)
+                    self.gamesView.setLoadingPageEnable(False)
+                    return False
 
-            self.gamesView.gamesTab.updateQueueIdMap(games)
+                self.gamesView.gamesTab.updateQueueIdMap(games)
 
-            # 启动任务，往 gamesTab 里丢数据
-            # NOTE 既然创建新任务, 并且刷新了self.puuid 就应该用self的, 否则就违背了loadGames判断的初衷
+                # 启动任务，往 gamesTab 里丢数据
+                # NOTE 既然创建新任务, 并且刷新了self.puuid 就应该用self的, 否则就违背了loadGames判断的初衷
 
-            self.gameLoadingTask = asyncio.create_task(
-                self.__loadGames(self.puuid))
+                self.gameLoadingTask = asyncio.create_task(
+                    self.__loadGames(self.puuid))
 
-        self.gamesView.gamesTab.showTheFirstPage()
-        self.gamesView.setLoadingPageEnable(False)
+            self.gamesView.gamesTab.showTheFirstPage()
+        except Exception as e:
+            logger.error(f"searchAndShowFirstPage failed: {e}", TAG)
+            InfoBar.error(
+                self.tr("Search failed"),
+                self.tr("Failed to load match history data."),
+                orient=Qt.Vertical,
+                duration=5000,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                parent=self)
+            return False
+        finally:
+            self.gamesView.setLoadingPageEnable(False)
 
-        self.__addSearchHistroy(name)
+        if name:
+            self.__addSearchHistroy(name)
 
         return True
 
@@ -1277,21 +1473,23 @@ class SearchInterface(SeraphineInterface):
         '''
         tabs = self.gamesView.gamesTab
 
-        # 遍历一下目前已经画好的第一页有没有这个 tab，有的话就直接画上
-        # FIXME -- By Hpero4
-        #  如果在绘制前Tabs的StackWidget改变, 会导致画错框甚至找不到绘制对象 AttributeError
-        #  必须保证绘制时界面没有被改变; (目前暂时是将耗时操作移到画框后面)
-        # FIXME -- By Hpero4
-        #  如果选中的对局不在第一页中(> 11), 将不会画上选择框
-        layout = tabs.stackWidget.widget(1).layout()
-        for i in range(layout.count()):
-            item = layout.itemAt(i)
-
-            if not item.widget():
+        # 先收集所有页面上的 widget，避免遍历时 StackWidget 改变导致 AttributeError
+        all_widgets = []
+        for pageIdx in range(1, tabs.stackWidget.count()):
+            page = tabs.stackWidget.widget(pageIdx)
+            if page is None:
                 continue
+            layout = page.layout()
+            if layout is None:
+                continue
+            for i in range(layout.count()):
+                item = layout.itemAt(i)
+                if item and item.widget():
+                    all_widgets.append(item.widget())
 
-            widget: GameTab = item.widget()
-
+        for widget in all_widgets:
+            if not hasattr(widget, 'gameId'):
+                continue
             if widget.gameId == int(gameId):
                 tabs.currentTabSelected = widget
                 widget.setProperty("selected", True)
@@ -1326,7 +1524,9 @@ class SearchInterface(SeraphineInterface):
 
         logger.debug(f"start load {puuid}", TAG)
         # 连续查多个人时, 将前面正在查的task给release掉
-        while self.puuid == puuid:
+        # ponytail: 最多后台拉 80 场 (8 批 × 10), 减少 LCU 限流风险
+        load_count = 0
+        while self.puuid == puuid and load_count < 8:
             # 为加载战绩详情让行
             while (
                 (self.detailViewLoadTask and not self.detailViewLoadTask.done())
@@ -1355,7 +1555,7 @@ class SearchInterface(SeraphineInterface):
                 return
 
             # 处理数据，交给 gamesTab，更新其 games 成员以及 queueIdMap
-            games = await parseGamesDataConcurrently(games['games'])
+            games = await parseGamesDataConcurrently(games['games'], puuid)
 
             if self.puuid != puuid:
                 return
@@ -1373,9 +1573,10 @@ class SearchInterface(SeraphineInterface):
 
             begIdx = endIdx + 1
             endIdx = begIdx + 9
+            load_count += 1
 
-            # 睡不睡都行
-            await asyncio.sleep(.1)
+            # ponytail: 背压 — 每批之间等 0.5s, 避免冲刷 LCU match-history 限流
+            await asyncio.sleep(.5)
 
     @asyncSlot(QWidget)
     async def __onGameTabClicked(self, tab: GameTab):
@@ -1408,11 +1609,42 @@ class SearchInterface(SeraphineInterface):
             connector.getGameDetailByGameId(gameId))
         game = await self.detailViewLoadTask
 
+        # LCU 未就绪时 @retry 统一拦截 ReferenceError 并返回 None
+        # (已通过 signalBus.lcuNotConnected 发射统一提示)
+        if game is None:
+            # 尝试从缓存读取
+            cached = await connector.getGameDetailCached(gameId)
+            if cached:
+                game = cached
+                self.gamesView.gameDetailView.setLoadingPageEnabled(False)
+                # 直接从缓存显示
+                self.gamesView.gameDetailView.updateGame(cached)
+                return
+            if True:
+                self.gamesView.gameDetailView.setLoadingPageEnabled(False)
+            return
+
         # 加载GameDetail的过程中, 切换了搜索对象(self.puuid变更), 将后续任务pass -- By Hpero4
         if puuid == self.puuid:
             self.detailViewLoadTask = asyncio.create_task(
                 parseGameDetailData(puuid, game))
             game = await self.detailViewLoadTask
+
+            # 全队 5 档评级: 点进战绩详情时自动诊断 (不依赖插件运行)
+            # 缓存未命中, 或缺少 winnerRating/loserRating 字段 (旧版本写入) 时重新诊断
+            if cfg.get(cfg.enableTeamRating):
+                from app.lol.war_criminal_cache import getVerdict
+                cached = getVerdict(gameId)
+                needDiag = (not cached
+                            or 'winnerRating' not in cached
+                            or 'loserRating' not in cached)
+                if needDiag:
+                    from app.lol.war_criminal import diagnoseGameFromParsed
+                    ratingStyle = cfg.get(cfg.teamRatingStyle)
+                    await diagnoseGameFromParsed(
+                        game, puuid, gameId,
+                        ratingStyle=ratingStyle)
+
             self.gamesView.gameDetailView.updateGame(game)
 
         # if cfg.get(cfg.showTierInGameInfo):
@@ -1425,13 +1657,23 @@ class SearchInterface(SeraphineInterface):
         tabs = self.gamesView.gamesTab
         tabs.clearTabs()
 
-        ids = (-1, 430, 450, 420, 440)
+        ids = (-1, 430, 450, 2400, 420, 440)
         tabs.queueId = ids[index]
 
         self.gamesView.setLoadingPageEnable(True)
 
+        # 等待数据加载, 但设置超时避免死循环
+        # 原代码 while < 10 在数据不足 10 条且 __loadGames 已 return 时会无限挂起
+        max_wait = 50  # 50 * 0.2s = 10s 超时
+        waited = 0
         while len(self.gamesView.gamesTab.queueIdMap.get(tabs.queueId, [])) < 10:
             await asyncio.sleep(.2)
+            waited += 1
+            # 数据加载完成或超时后退出
+            # (gameLoadingTask 为 None 或 done 表示不会再有更多数据了)
+            if (self.gameLoadingTask is None
+                    or self.gameLoadingTask.done()) or waited >= max_wait:
+                break
 
         enable = tabs.queueIdMap.get(tabs.queueId) is not None
         tabs.prevButton.setVisible(enable)
@@ -1450,5 +1692,11 @@ class SearchInterface(SeraphineInterface):
             history.remove(name)
 
         history.insert(0, name)
-        cfg.set(cfg.searchHistory, ",".join(
-            [t for t in history if t][:10]), True)
+        val = ",".join([t for t in history if t][:10])
+        cfg.set(cfg.searchHistory, val, save=False)
+        if not hasattr(self, '_historySaveTimer'):
+            from PyQt5.QtCore import QTimer
+            self._historySaveTimer = QTimer()
+            self._historySaveTimer.setSingleShot(True)
+            self._historySaveTimer.timeout.connect(lambda: cfg.save())
+        self._historySaveTimer.start(500)

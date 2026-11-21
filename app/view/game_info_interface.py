@@ -1,25 +1,27 @@
-import copy
 from typing import Dict
 
-from PyQt5.QtCore import pyqtSignal, Qt, QPropertyAnimation, QRect, QTimer
+from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import (QHBoxLayout, QLabel, QFrame, QVBoxLayout,
                              QSpacerItem, QSizePolicy, QStackedWidget,
-                             QGridLayout, QSplitter, QApplication, QWidget)
-from PyQt5.QtGui import QPixmap, QFont, QPainter, QColor, QPalette, QImage, QFontMetrics
+                             QGridLayout, QSplitter)
+from PyQt5.QtGui import QPixmap, QColor, QPalette
 from qasync import asyncSlot
 
-from ..common.qfluentwidgets import (SmoothScrollArea, TransparentTogglePushButton,
-                                     ToolTipFilter, ToolTipPosition, setCustomStyleSheet)
+from ..common.qfluentwidgets import (TransparentTogglePushButton,
+                                     ToolTipFilter, ToolTipPosition, setCustomStyleSheet,
+                                     PushButton, Flyout)
 
-from app.common.icons import Icon
 from app.common.style_sheet import StyleSheet
-from app.common.signals import signalBus
 from app.common.config import cfg
+from app.common.signals import signalBus
+from app.lol.horse_rating import (GRADE_HORSE, grade_from_score, grade_label)
+from app.components.grade_badge import GradeBadge
 from app.components.champion_icon_widget import RoundIcon
 from app.components.profile_level_icon_widget import RoundLevelAvatar
 from app.components.summoner_name_button import SummonerName
-from app.components.animation_frame import CardWidget, ColorAnimationFrame
+from app.components.animation_frame import ColorAnimationFrame
 from app.components.color_label import DeathsLabel
+from app.components.mode_filter_widget import ModeFilterWidget
 from app.lol.tools import parseSummonerOrder
 from app.lol.connector import connector
 from app.lol.aram import AramBuff
@@ -27,18 +29,34 @@ from app.components.seraphine_interface import SeraphineInterface
 
 
 class GameInfoInterface(SeraphineInterface):
+    manualSendHorseReport = pyqtSignal()
+    # 手动刷新对局信息 (战绩服务故障恢复后由用户触发重拉)
+    refreshRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setFrameShape(QFrame.NoFrame)
+        self.viewport().setObjectName("gameInfoViewport")
+        self.viewport().setAutoFillBackground(False)
 
         self.isAram = False
         self.hBoxLayout = QHBoxLayout(self)
+
+        self._allyInfo = None
 
         self.summonersView = SummonersView()
         self.summonersGamesView = QStackedWidget()
 
         self.allyGamesView = SummonersGamesView()
         self.enemyGamesView = SummonersGamesView()
+
+        self.filterButton = PushButton(self.tr("Filter"))
+        self.filterButton.setFixedHeight(32)
+        self.manualSendButton = PushButton(self.tr("Send rating"))
+        self.manualSendButton.setFixedHeight(32)
+        self.refreshButton = PushButton(self.tr("Refresh"))
+        self.refreshButton.setFixedHeight(32)
+        self.modeFilterWidget = ModeFilterWidget()
 
         # 保存召唤师的英雄信息
         # {summonerId: championId}
@@ -57,6 +75,12 @@ class GameInfoInterface(SeraphineInterface):
 
     def __initWidget(self):
         self.summonersGamesView.setObjectName("summonersGamesView")
+        for button in (self.refreshButton, self.manualSendButton,
+                       self.filterButton):
+            button.setObjectName("gameInfoActionButton")
+        self.refreshButton.setMinimumWidth(82)
+        self.manualSendButton.setMinimumWidth(108)
+        self.filterButton.setMinimumWidth(76)
 
         self.summonersGamesView.addWidget(self.allyGamesView)
         self.summonersGamesView.addWidget(self.enemyGamesView)
@@ -64,14 +88,47 @@ class GameInfoInterface(SeraphineInterface):
         self.summonersGamesView.setCurrentIndex(0)
 
     def __initLayout(self):
-        self.hBoxLayout.setContentsMargins(30, 32, 30, 30)
+        self.hBoxLayout.setContentsMargins(24, 24, 24, 24)
+        self.hBoxLayout.setSpacing(16)
 
+        self.rightVBoxLayout = QVBoxLayout()
+        self.rightVBoxLayout.setContentsMargins(0, 0, 0, 0)
+        self.rightVBoxLayout.setSpacing(10)
+
+        self.filterLayout = QHBoxLayout()
+        self.filterLayout.setContentsMargins(0, 0, 0, 0)
+        self.filterLayout.setSpacing(8)
+        self.filterLayout.addStretch(1)
+        self.filterLayout.addWidget(self.refreshButton, alignment=Qt.AlignRight)
+        self.filterLayout.addWidget(self.manualSendButton,
+                                    alignment=Qt.AlignRight)
+        self.filterLayout.addWidget(self.filterButton, alignment=Qt.AlignRight)
+
+        self.rightVBoxLayout.addLayout(self.filterLayout)
+        self.rightVBoxLayout.addWidget(self.summonersGamesView, stretch=1)
+
+        self.summonersView.setMinimumWidth(280)
+        self.summonersView.setMaximumWidth(390)
+        self.summonersGamesView.setMinimumWidth(700)
         self.hBoxLayout.addWidget(self.summonersView, stretch=2)
-        self.hBoxLayout.addWidget(self.summonersGamesView, stretch=7)
+        self.hBoxLayout.addLayout(self.rightVBoxLayout, stretch=7)
 
     def __connectSignalToSlot(self):
         self.summonersView.currentTeamChanged.connect(
             self.__onCurrentTeamChanged)
+        self.filterButton.clicked.connect(self.__onFilterButtonClicked)
+        self.manualSendButton.clicked.connect(self.manualSendHorseReport.emit)
+        self.refreshButton.clicked.connect(self.refreshRequested.emit)
+        self.modeFilterWidget.setCallback(self.__onFilterChanged)
+
+    def __onFilterButtonClicked(self):
+        Flyout.make(self.modeFilterWidget, self.filterButton, self)
+
+    def __onFilterChanged(self):
+        queueIds = self.modeFilterWidget.getFilterMode()
+        view = self.summonersGamesView.currentWidget()
+        if isinstance(view, SummonersGamesView):
+            view.applyFilter(queueIds)
 
     def updateAllySummonersOrder(self, team: list):
         if len(self.allyOrder) == 0:
@@ -90,6 +147,7 @@ class GameInfoInterface(SeraphineInterface):
 
         self.isAram = info.get("isAram", False)
 
+        self._allyInfo = info
         self.allyChampions = info['champions']
         self.allyOrder = info['order']
 
@@ -106,7 +164,9 @@ class GameInfoInterface(SeraphineInterface):
         if not info or len(info['summoners']) > 5:
             return
 
-        self.summonersView.enemy.updateSummoners(info['summoners'])
+        # 敌方头像也展示 ARAM 平衡 Buff (对齐 Sona: 全员可 hover 查看平衡调整)
+        self.summonersView.enemy.updateSummoners(
+            info['summoners'], info.get("isAram", False))
         self.enemyGamesView.updateSummoners(info['summoners'])
 
         self.summonersView.allyButton.setVisible(True)
@@ -115,14 +175,15 @@ class GameInfoInterface(SeraphineInterface):
 
     async def updateAllyIcon(self, team):
         for new in team:
-            if not new['championId'] or not new['summonerId']:
+            # 防御: 条目字段可能缺失 (不完整 session), 用 .get 避免 KeyError
+            if not new.get('championId') or not new.get('summonerId'):
                 continue
 
             summonerId = new['summonerId']
             view = self.summonersView.ally.items.get(summonerId)
             orig = self.allyChampions.get(summonerId)
 
-            if not view or orig == None:
+            if not view or orig is None:
                 continue
 
             newChampionId = new['championId']
@@ -140,6 +201,8 @@ class GameInfoInterface(SeraphineInterface):
         self.allyOrder = []
 
         self.isAram = False
+
+        self._allyInfo = None
 
         self.summonersView.ally.clear()
         self.summonersView.enemy.clear()
@@ -227,25 +290,30 @@ class SummonersView(QFrame):
             self.enemyButton.setChecked(True)
 
     def __setStyleSheet(self):
-        light = "rgba(0, 0, 0, 0.073)"
-        dark = "rgba(255, 255, 255, 0.053)"
-
         qss = '''
             TransparentTogglePushButton,
             TransparentTogglePushButton:hover,
             TransparentTogglePushButton:disabled {{
                 border: 1px solid {};
+                color: {};
+                background-color: {};
             }}
 
             TransparentTogglePushButton:checked,
             TransparentTogglePushButton:checked:hover {{
-                border: none;
+                border: 1px solid transparent;
+                color: #ffffff;
+                background-color: #16b8c8;
             }}
-        
+
         '''
 
-        light = qss.format(light)
-        dark = qss.format(dark)
+        light = qss.format(
+            "rgba(0, 0, 0, 0.10)", "rgba(0, 0, 0, 0.72)",
+            "rgba(255, 255, 255, 0.72)")
+        dark = qss.format(
+            "rgba(255, 255, 255, 0.10)", "rgba(255, 255, 255, 0.82)",
+            "rgba(255, 255, 255, 0.06)")
 
         setCustomStyleSheet(self.allyButton, light, dark)
         setCustomStyleSheet(self.enemyButton, light, dark)
@@ -274,7 +342,9 @@ class TeamSummoners(QFrame):
 
         for summonerId in order:
             view = self.items[summonerId]
-            self.vBoxLayout.addWidget(view)
+            # stretch=1 与 updateSummoners 保持一致, 否则重排序后
+            # 行高退回 sizeHint, 少人时与右侧战绩列错位
+            self.vBoxLayout.addWidget(view, stretch=1)
 
         if len(order) < 5:
             self.vBoxLayout.addStretch(5 - len(order))
@@ -363,7 +433,7 @@ class SummonerInfoView(ColorAnimationFrame):
         soloRank = info['rankInfo']['solo']
         self.rankSolo = QLabel(f"{soloRank['tier']} {soloRank['division']}")
 
-        self.kdaLabel = QLabel(f"KDA: ")
+        self.kdaLabel = QLabel("KDA: ")
         self.kdaLabel.setObjectName("kdaLabel")
 
         k, d, a = info['kda']
@@ -391,9 +461,10 @@ class SummonerInfoView(ColorAnimationFrame):
         else:
             sacle, scroll, lp = 15, -2, '--'
 
-        self.rankSoloIcon.setPixmap(
-            QPixmap(soloRank['icon']).scaled(sacle, sacle, Qt.KeepAspectRatio,
-                                             Qt.SmoothTransformation))
+        solo_pm = QPixmap(soloRank['icon']) if soloRank['icon'] else QPixmap()
+        if not solo_pm.isNull():
+            self.rankSoloIcon.setPixmap(
+                solo_pm.scaled(sacle, sacle, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.rankSoloIcon.setFixedSize(24, 24)
         self.rankSoloIcon.scroll(0, scroll)
         self.rankSoloIcon.setAlignment(Qt.AlignCenter)
@@ -411,14 +482,20 @@ class SummonerInfoView(ColorAnimationFrame):
         sacle, scroll = (24,
                          -10) if flexRank['tier'] not in ["Unranked", '未定级'
                                                           ] else (15, 0)
-        self.rankFlexIcon.setPixmap(
-            QPixmap(flexRank['icon']).scaled(sacle, sacle, Qt.KeepAspectRatio,
-                                             Qt.SmoothTransformation))
+        flex_pm = QPixmap(flexRank['icon']) if flexRank['icon'] else QPixmap()
+        if not flex_pm.isNull():
+            self.rankFlexIcon.setPixmap(
+                flex_pm.scaled(sacle, sacle, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.rankFlexIcon.setFixedSize(24, 24)
         self.rankFlexIcon.scroll(0, scroll)
         self.rankFlexIcon.setAlignment(Qt.AlignCenter)
 
         self.rankFlexLp = QLabel(lp)
+
+        # 上等马赛前评级徽章 (基于可见段位本地计算, 异步填充)
+        self.horseBadgeBox = QHBoxLayout()
+        self.horseBadgeBox.setContentsMargins(0, 0, 0, 0)
+        self.horseBadgeBox.setSpacing(0)
 
         self.rankSolo.setToolTip(self.tr("Ranked Solo / Duo"))
         self.rankSolo.installEventFilter(
@@ -454,6 +531,8 @@ class SummonerInfoView(ColorAnimationFrame):
         self.gridLayout.addWidget(self.rankFlex, 1, 2, Qt.AlignCenter)
         self.gridLayout.addWidget(self.rankFlexLp, 1, 3, Qt.AlignCenter)
 
+        self.gridLayout.addLayout(self.horseBadgeBox, 1, 4, Qt.AlignCenter)
+
         self.gridHBoxLayout.addSpacerItem(
             QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.gridHBoxLayout.addLayout(self.gridLayout)
@@ -464,8 +543,7 @@ class SummonerInfoView(ColorAnimationFrame):
         self.infoVBoxLayout.addSpacerItem(
             QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
         self.infoVBoxLayout.addSpacing(-6)
-        self.infoVBoxLayout.addWidget(self.summonerName,
-                                      alignment=Qt.AlignCenter)
+        self.infoVBoxLayout.addWidget(self.summonerName)
         self.kdaHBoxLayout.addWidget(QSplitter())
         self.kdaHBoxLayout.addWidget(self.kdaLabel)
         self.kdaHBoxLayout.addWidget(self.kdaValLabel)
@@ -494,6 +572,40 @@ class SummonerInfoView(ColorAnimationFrame):
     def updateAramInfo(self, info):
         self.icon.updateAramInfo(info)
 
+    def updateEloInfo(self, verdict: dict):
+        """填充上等马赛前评级徽章 (基于可见段位本地计算, 异步回调).
+
+        标签与颜色统一按分数阈值定档 (同口径, 标签/颜色/分数永远一致,
+        与 BP 聊天播报 formatHorseReport 一致).
+        """
+        self.__clearHorseBadge()
+        score = (verdict or {}).get('score')
+        if score is None:
+            return
+        style = str(cfg.get(cfg.horseRatingStyle))
+        from app.lol.horse_rating import HORSE_RANDOM_KEY
+        # '随机' 风格: 用该召唤师本局缓存的实际方案 (fetchVerdictsForTeam 已烘焙)
+        if style == HORSE_RANDOM_KEY:
+            style = (verdict or {}).get('scheme') or 'horse'
+        label = grade_label(score, style=style)
+        if not label:
+            return
+        grade = GRADE_HORSE.index(grade_from_score(score)) + 1
+        badge = GradeBadge(grade, label, parent=self)
+        reason = (verdict or {}).get('reason')
+        tip = f"{label} ({score}分)"
+        if reason:
+            tip = f"{tip}\n{reason}"
+        badge.setToolTip(tip)
+        self.horseBadgeBox.addWidget(badge)
+
+    def __clearHorseBadge(self):
+        for i in reversed(range(self.horseBadgeBox.count())):
+            item = self.horseBadgeBox.itemAt(i)
+            if widget := item.widget():
+                widget.deleteLater()
+            self.horseBadgeBox.removeItem(item)
+
 
 class SummonersGamesView(QFrame):
 
@@ -519,14 +631,18 @@ class SummonersGamesView(QFrame):
 
         for i, summonerId in enumerate(order):
             view = self.items[summonerId]
-            self.hBoxLayout.addWidget(view)
+            # stretch=1 与 updateSummoners 保持一致, 否则重排序后
+            # 列宽退回 sizeHint, 少人时排列不齐
+            self.hBoxLayout.addWidget(view, stretch=1)
 
             view.setProperty("isFirst", False)
             view.setProperty("isLast", False)
 
             if i == 0:
                 view.setProperty("isFirst", True)
-            elif i == 4:
+            # isLast 标记实际最后一列 (不足 5 人时 i==4 永远不成立,
+            # 末列会残留分隔线且 hover 圆角错误)
+            if i == len(order) - 1:
                 view.setProperty("isLast", True)
 
             view.style().polish(view)
@@ -539,9 +655,10 @@ class SummonersGamesView(QFrame):
     def updateSummoners(self, summoners):
         self.clear()
 
-        for i, summoner in enumerate(summoners):
-            if not summoner:
-                continue
+        # 可能含 None 条目 (HIDDEN 玩家), 按实际渲染的列计算首尾与补偿
+        valid = [s for s in summoners if s]
+
+        for i, summoner in enumerate(valid):
             games = Games(summoner)
             self.items[summoner["summonerId"]] = games
 
@@ -549,13 +666,13 @@ class SummonersGamesView(QFrame):
 
             if i == 0:
                 games.setProperty("isFirst", True)
-            elif i == 4:
+            if i == len(valid) - 1:
                 games.setProperty("isLast", True)
 
-        if len(summoners) < 5:
-            self.hBoxLayout.addStretch(5 - len(summoners))
+        if len(valid) < 5:
+            self.hBoxLayout.addStretch(5 - len(valid))
             spacing = self.hBoxLayout.spacing()
-            self.hBoxLayout.addSpacing(spacing * (5 - len(summoners)))
+            self.hBoxLayout.addSpacing(spacing * (5 - len(valid)))
 
     def clear(self):
         for i in reversed(range(self.hBoxLayout.count())):
@@ -566,6 +683,10 @@ class SummonersGamesView(QFrame):
                 item.widget().deleteLater()
 
         self.items = {}
+
+    def applyFilter(self, queueIds: set):
+        for games in self.items.values():
+            games.applyFilter(queueIds)
 
 
 class Games(QFrame):
@@ -598,25 +719,41 @@ class Games(QFrame):
 
         self.summonerName.clicked.connect(self.__onSummonerNameClicked)
 
-        self.summonerName.setFixedHeight(60)
+        self.summonerName.setFixedHeight(44)
+        self.setMinimumWidth(140)
 
         # self.vBoxLayout.addSpacing(8)
-        self.vBoxLayout.addWidget(self.summonerName, alignment=Qt.AlignCenter)
+        self.vBoxLayout.addWidget(self.summonerName)
         # self.vBoxLayout.addSpacing(11)
 
         self.vBoxLayout.addLayout(self.gamesLayout)
         self.gamesLayout.setContentsMargins(0, 0, 0, 0)
 
-        games = summoner['gamesInfo']
+        self.allGames = summoner['gamesInfo']
+        self.applyFilter(set())
+
+    def applyFilter(self, queueIds: set):
+        """按 queueId 筛选对局; 空集合表示显示全部. 最多显示 10 条 (评级用满 20 场)."""
+        # 清空现有 GameTab
+        while self.gamesLayout.count():
+            item = self.gamesLayout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        games = self.allGames
+        if queueIds:
+            games = [g for g in games if g.get('queueId') in queueIds]
+
+        games = games[:10]
 
         for game in games:
             tab = GameTab(game)
             self.gamesLayout.addWidget(tab, stretch=1)
 
-        if len(games) < 11:
-            self.gamesLayout.addStretch(11-len(games))
+        if len(games) < 10:
+            self.gamesLayout.addStretch(10 - len(games))
             spacing = self.gamesLayout.spacing()
-            self.gamesLayout.addSpacing(spacing * (11 - len(games)))
+            self.gamesLayout.addSpacing(spacing * (10 - len(games)))
 
     @asyncSlot()
     async def __onSummonerNameClicked(self):
@@ -627,6 +764,10 @@ class Games(QFrame):
                 # 现在全区都有编号了 万一对局信息中没包含编号 走别的接口单独查一次
                 if self.summonerPuuid and len(str(self.summonerPuuid).strip()) != 0:
                     summonerForTagLine = await connector.getSummonerByPuuid(self.summonerPuuid)
+                    # LCU 未就绪时 @retry 返回 None
+                    if summonerForTagLine is None:
+                        self.summonerName.setEnabled(True)
+                        return
                     if summonerForTagLine['tagLine'] and len(str(summonerForTagLine['tagLine'])) != 0:
                         self.summonerName.tagLine = summonerForTagLine['tagLine']
                     else:
@@ -643,6 +784,7 @@ class Games(QFrame):
 class GameTab(ColorAnimationFrame):
 
     def __init__(self, game=None, parent=None):
+        self._gameData = game
         if game['remake']:
             type = 'remake'
         elif game['win']:
@@ -661,6 +803,7 @@ class GameTab(ColorAnimationFrame):
         self.championIcon = RoundIcon(game['championIcon'], 30, 2, 2)
 
         self.modeName = QLabel(game['name'].replace("排位赛 ", ""))
+        self.modeName.setObjectName("modeName")
 
         self.kills = QLabel(str(game['kills']))
         self.slash1 = QLabel("/")
@@ -694,27 +837,28 @@ class GameTab(ColorAnimationFrame):
 
         self.time.setObjectName("time")
 
-        self.kills.setFixedWidth(12)
-        self.slash1.setFixedWidth(6)
-        self.deaths.setFixedWidth(12)
-        self.slash2.setFixedWidth(6)
-        self.assists.setFixedWidth(12)
-
         self.kills.setAlignment(Qt.AlignCenter)
         self.slash1.setAlignment(Qt.AlignCenter)
         self.deaths.setAlignment(Qt.AlignCenter)
         self.slash2.setAlignment(Qt.AlignCenter)
         self.assists.setAlignment(Qt.AlignCenter)
+        self.modeName.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.modeName.setToolTip(self._gameData['name'])
+        self.setToolTip(
+            f"{self._gameData['name']} · {self._gameData['shortTime']}\n"
+            f"{self._gameData['kills']} / {self._gameData['deaths']} / "
+            f"{self._gameData['assists']}")
+        self.setMinimumWidth(132)
 
     def __initLayout(self):
-        self.hBoxLayout.setContentsMargins(7, 7, 7, 7)
-        self.hBoxLayout.setSpacing(5)
+        self.hBoxLayout.setContentsMargins(8, 7, 8, 7)
+        self.hBoxLayout.setSpacing(7)
 
         self.infoLayout.setContentsMargins(0, 0, 0, 0)
-        self.infoLayout.setSpacing(0)
+        self.infoLayout.setSpacing(1)
 
         self.infoLayout.addWidget(self.time)
-        self.infoLayout.addSpacing(5)
+        self.infoLayout.addStretch(1)
         self.infoLayout.addWidget(self.kills)
         self.infoLayout.addWidget(self.slash1)
         self.infoLayout.addWidget(self.deaths)
@@ -726,8 +870,4 @@ class GameTab(ColorAnimationFrame):
         self.nameTimeKdaLayout.addLayout(self.infoLayout)
 
         self.hBoxLayout.addWidget(self.championIcon)
-        # self.hBoxLayout.addSpacing(1)
-        self.hBoxLayout.addLayout(self.nameTimeKdaLayout)
-
-        self.hBoxLayout.addSpacerItem(
-            QSpacerItem(1, 1, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        self.hBoxLayout.addLayout(self.nameTimeKdaLayout, stretch=1)
