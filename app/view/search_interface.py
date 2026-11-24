@@ -48,6 +48,21 @@ from .detail_request import isCurrentDetailRequest
 TAG = "SearchInterface"
 
 
+def _cleanupGradeBadgeToolTips(widget):
+    """Close rating tooltips before deleting widgets from the search page."""
+    if widget is None:
+        return
+
+    try:
+        from app.components.grade_badge import GradeBadge
+        badges = widget.findChildren(GradeBadge)
+    except RuntimeError:
+        return
+
+    for badge in badges:
+        badge.cleanupToolTip()
+
+
 def asyncLockDecorator(lockName):
     """
     给任何一个方法加锁, return时释放
@@ -240,6 +255,7 @@ class GamesTab(QFrame):
                 continue
 
             widget = self.stackWidget.widget(i)
+            _cleanupGradeBadgeToolTips(widget)
             self.stackWidget.removeWidget(widget)
 
         self.stackWidget.setCurrentIndex(0)
@@ -325,6 +341,7 @@ class GameDetailView(QFrame):
             self.vBoxLayout.removeItem(item)
 
             if item.widget():
+                _cleanupGradeBadgeToolTips(item.widget())
                 item.widget().deleteLater()
 
         self.titleBar = GameTitleBar()
@@ -817,6 +834,7 @@ class TeamView(QFrame, ColorChangeable):
             item = self.summonersLayout.itemAt(i)
             self.summonersLayout.removeItem(item)
             if (widget := item.widget()):
+                _cleanupGradeBadgeToolTips(widget)
                 widget.deleteLater()
 
         # ratingList: 全队评级列表, 按 puuid 索引建立映射
