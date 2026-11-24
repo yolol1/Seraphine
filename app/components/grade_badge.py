@@ -15,6 +15,7 @@ class GradeBadge(QFrame):
         self.label = label
         self.isCurrent = isCurrent
         self.comment = comment
+        self._toolTipFilter = None
 
         self.hBoxLayout = QHBoxLayout(self)
         self.hBoxLayout.setContentsMargins(6, 1, 6, 1)
@@ -30,8 +31,33 @@ class GradeBadge(QFrame):
         tip = self._formatTooltip(comment, evidence)
         if tip:
             self.setToolTip(tip)
-            self.installEventFilter(ToolTipFilter(
-                self, 0, ToolTipPosition.TOP))
+            self._toolTipFilter = ToolTipFilter(
+                self, 0, ToolTipPosition.TOP)
+            self.installEventFilter(self._toolTipFilter)
+
+    def cleanupToolTip(self):
+        """Close the floating tooltip before this badge is deleted.
+
+        ToolTipFilter is parented to this badge, but the tooltip itself is
+        parented to the window. Deleting the badge alone can therefore leave
+        a visible orphan tooltip after a search-page refresh.
+        """
+        toolTipFilter = self._toolTipFilter
+        self._toolTipFilter = None
+        if toolTipFilter is None:
+            return
+
+        try:
+            self.removeEventFilter(toolTipFilter)
+            toolTipFilter.hideToolTip()
+            tooltip = getattr(toolTipFilter, '_tooltip', None)
+            if tooltip is not None:
+                toolTipFilter._tooltip = None
+                tooltip.setParent(None)
+                tooltip.deleteLater()
+        except RuntimeError:
+            # The filter or tooltip may already have been deleted by Qt.
+            pass
 
     @staticmethod
     def _formatTooltip(comment: str, evidence: list) -> str:

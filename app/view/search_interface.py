@@ -48,6 +48,37 @@ from .detail_request import isCurrentDetailRequest
 TAG = "SearchInterface"
 
 
+def _cleanupWidgetToolTips(widget):
+    """Close descendant tooltips before deleting widgets from the search page.
+
+    ToolTipFilter is parented to its target widget, while the tooltip window is
+    parented to the main window. deleteLater() on the target alone can leave
+    the separate tooltip window visible.
+    """
+    if widget is None:
+        return
+
+    try:
+        toolTipFilters = widget.findChildren(ToolTipFilter)
+    except RuntimeError:
+        return
+
+    for toolTipFilter in toolTipFilters:
+        try:
+            parent = toolTipFilter.parent()
+            if parent is not None:
+                parent.removeEventFilter(toolTipFilter)
+            toolTipFilter.hideToolTip()
+            tooltip = getattr(toolTipFilter, '_tooltip', None)
+            if tooltip is not None:
+                toolTipFilter._tooltip = None
+                tooltip.setParent(None)
+                tooltip.deleteLater()
+        except RuntimeError:
+            # The filter or its tooltip may already have been destroyed.
+            continue
+
+
 def asyncLockDecorator(lockName):
     """
     给任何一个方法加锁, return时释放
@@ -240,6 +271,7 @@ class GamesTab(QFrame):
                 continue
 
             widget = self.stackWidget.widget(i)
+            _cleanupWidgetToolTips(widget)
             self.stackWidget.removeWidget(widget)
 
         self.stackWidget.setCurrentIndex(0)
@@ -325,6 +357,7 @@ class GameDetailView(QFrame):
             self.vBoxLayout.removeItem(item)
 
             if item.widget():
+                _cleanupWidgetToolTips(item.widget())
                 item.widget().deleteLater()
 
         self.titleBar = GameTitleBar()
@@ -817,6 +850,7 @@ class TeamView(QFrame, ColorChangeable):
             item = self.summonersLayout.itemAt(i)
             self.summonersLayout.removeItem(item)
             if (widget := item.widget()):
+                _cleanupWidgetToolTips(widget)
                 widget.deleteLater()
 
         # ratingList: 全队评级列表, 按 puuid 索引建立映射
