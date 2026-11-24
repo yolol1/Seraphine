@@ -21,9 +21,11 @@ from app.components.profile_level_icon_widget import RoundLevelAvatar
 from app.components.summoner_name_button import SummonerName
 from app.components.animation_frame import ColorAnimationFrame
 from app.components.color_label import DeathsLabel
+from app.components.encounter_badge import makeEncounterBadge
 from app.components.mode_filter_widget import ModeFilterWidget
 from app.lol.tools import parseSummonerOrder
 from app.lol.connector import connector
+from app.lol.persistent_cache import cache as sqlite_cache
 from app.lol.aram import AramBuff
 from app.components.seraphine_interface import SeraphineInterface
 
@@ -66,6 +68,7 @@ class GameInfoInterface(SeraphineInterface):
         self.allyOrder = []
 
         self.queueId = 0
+        self.viewerPuuid = None
 
         self.__initWidget()
         self.__initLayout()
@@ -146,6 +149,7 @@ class GameInfoInterface(SeraphineInterface):
             return
 
         self.isAram = info.get("isAram", False)
+        self.__attachEncounterInfo(info['summoners'])
 
         self._allyInfo = info
         self.allyChampions = info['champions']
@@ -164,6 +168,8 @@ class GameInfoInterface(SeraphineInterface):
         if not info or len(info['summoners']) > 5:
             return
 
+        self.__attachEncounterInfo(info['summoners'])
+
         # 敌方头像也展示 ARAM 平衡 Buff (对齐 Sona: 全员可 hover 查看平衡调整)
         self.summonersView.enemy.updateSummoners(
             info['summoners'], info.get("isAram", False))
@@ -172,6 +178,20 @@ class GameInfoInterface(SeraphineInterface):
         self.summonersView.allyButton.setVisible(True)
         self.summonersView.enemyButton.setVisible(True)
         self.summonersView.enemyButton.setEnabled(True)
+
+    def setViewerPuuid(self, puuid):
+        self.viewerPuuid = puuid or None
+
+    def __attachEncounterInfo(self, summoners):
+        marks = {}
+        if self.viewerPuuid:
+            marks = sqlite_cache.get_encounter_marks(
+                self.viewerPuuid,
+                [summoner.get("puuid") for summoner in summoners])
+        for summoner in summoners:
+            summoner["encounterInfo"] = marks.get(
+                summoner.get("puuid"), {})
+            summoner["encounterSubjectPuuid"] = self.viewerPuuid
 
     async def updateAllyIcon(self, team):
         for new in team:
@@ -424,6 +444,8 @@ class SummonerInfoView(ColorAnimationFrame):
             name, isPublic=info["isPublic"], color=nameColor, tagLine=info['tagLine'], tips=info["recentlyChampionName"])
         self.summonerName.clicked.connect(
             lambda: signalBus.toCareerInterface.emit(info['puuid']))
+        self.encounterBadge = makeEncounterBadge(
+            info, info.get("encounterSubjectPuuid"))
 
         self.gridHBoxLayout = QHBoxLayout()
         self.kdaHBoxLayout = QHBoxLayout()
@@ -543,7 +565,15 @@ class SummonerInfoView(ColorAnimationFrame):
         self.infoVBoxLayout.addSpacerItem(
             QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
         self.infoVBoxLayout.addSpacing(-6)
-        self.infoVBoxLayout.addWidget(self.summonerName)
+        nameRow = QHBoxLayout()
+        nameRow.setContentsMargins(0, 0, 0, 0)
+        nameRow.setSpacing(5)
+        nameRow.addStretch(1)
+        nameRow.addWidget(self.summonerName)
+        if self.encounterBadge:
+            nameRow.addWidget(self.encounterBadge)
+        nameRow.addStretch(1)
+        self.infoVBoxLayout.addLayout(nameRow)
         self.kdaHBoxLayout.addWidget(QSplitter())
         self.kdaHBoxLayout.addWidget(self.kdaLabel)
         self.kdaHBoxLayout.addWidget(self.kdaValLabel)

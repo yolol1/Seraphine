@@ -47,6 +47,8 @@ SERVERS_SUBSET = {
     "TJ101": ["德玛西亚", "无畏先锋", "恕瑞玛", "巨龙之巢"]
 }
 
+_ENCOUNTER_DETAIL_TASKS = {}
+
 
 class ToolsTranslator(QObject):
     def __init__(self, parent=None):
@@ -79,6 +81,31 @@ def translateTier(orig: str, short=False) -> str:
     return _translateTier_pure(orig, short, is_english)
 
 
+async def _getEncounterGameDetail(game_id):
+    """Share one in-flight detail request between career and search views."""
+    key = str(game_id)
+    task = _ENCOUNTER_DETAIL_TASKS.get(key)
+    if task is None:
+        async def fetch():
+            detail = await connector.getGameDetailByGameId(game_id)
+            if detail:
+                try:
+                    sqlite_cache.set_encounters_from_raw_game(detail)
+                except Exception as e:
+                    logger.warning(
+                        f"encounter cache write failed for {game_id}: {e}",
+                        "tools")
+            return detail
+
+        task = asyncio.create_task(fetch())
+        _ENCOUNTER_DETAIL_TASKS[key] = task
+    try:
+        return await task
+    finally:
+        if task.done() and _ENCOUNTER_DETAIL_TASKS.get(key) is task:
+            _ENCOUNTER_DETAIL_TASKS.pop(key, None)
+
+
 async def getRecentTeammates(games, puuid):
     summoners = {}
 
@@ -86,7 +113,7 @@ async def getRecentTeammates(games, puuid):
     # semaphore 统一限流; 单场失败跳过, 不拖垮整个最近队友面板
     async def _safe_detail(game):
         try:
-            return await connector.getGameDetailByGameId(game['gameId'])
+            return await _getEncounterGameDetail(game['gameId'])
         except Exception as e:
             logger.warning(
                 f"getRecentTeammates: skipping game {game.get('gameId')} "
@@ -126,6 +153,37 @@ async def getRecentTeammates(games, puuid):
                               key=lambda x: x['total'], reverse=True)[:5]
 
     return ret
+
+
+async def indexEncountersForGames(games, puuid: str):
+    """Best-effort encounter import for a player's visible match history."""
+    if not puuid:
+        return 0
+
+    pending = []
+    for game in games or []:
+        game_id = game.get("gameId") if isinstance(game, dict) else None
+        if not game_id:
+            continue
+        if sqlite_cache.has_game_encounters(puuid, game_id):
+            continue
+        pending.append(game)
+
+    async def _index(game):
+        try:
+            detail = await _getEncounterGameDetail(game["gameId"])
+        except Exception as e:
+            logger.warning(
+                f"indexEncountersForGames: skipping game "
+                f"{game.get('gameId')} ({type(e).__name__}: {e})", "tools")
+            return False
+        if not detail:
+            return False
+        return True
+
+    results = await asyncio.gather(
+        *[_index(game) for game in pending], return_exceptions=True)
+    return sum(1 for result in results if result is True)
 
 
 async def parseSummonerData(summoner, rankTask, gameTask) -> SummonerParsedData:
@@ -586,6 +644,7 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
         'gameId': game['gameId'],
         'mapIcon': mapIcon,
         'gameCreation': timeStampToStr(game['gameCreation']),
+        'gameCreationTimestamp': game['gameCreation'],
         'gameDuration': secsToStr(game['gameDuration']),
         'modeName': modeName,
         'mapName': mapName,
@@ -1053,12 +1112,15 @@ async def parseSummonerGameInfo(item, queueId, currentSummonerId) -> Optional[Te
     # 冒泡打断整个对局信息解析 (2026-10-24 海克斯窗口不消失的中断源之一)
     teammatesInfo = []
     try:
-        teammatesInfo = [
-            getTeammates(
-                await connector.getGameDetailByGameId(game["gameId"]),
-                puuid
-            ) for game in gamesInfo[:1]  # 避免空报错, 查上一局的队友(对手)
-        ]
+        for game in gamesInfo[:1]:  # 避免空报错, 查上一局的队友(对手)
+            detail = await connector.getGameDetailByGameId(game["gameId"])
+            if detail:
+                try:
+                    sqlite_cache.set_encounters_from_raw_game(detail)
+                except Exception as e:
+                    logger.warning(
+                        f"encounter cache write failed: {e}", "tools")
+                teammatesInfo.append(getTeammates(detail, puuid))
     except Exception as e:
         logger.warning(
             f"parseSummonerGameInfo: fetch last-game teammates failed "
@@ -1170,6 +1232,11 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
 
     # origGamesInfo 在 SGP 战绩拉取失败时为 None, 不能裸下标
     sgpRawGames = (origGamesInfo or {}).get('games') or []
+    for game in sgpRawGames[:1]:
+        try:
+            sqlite_cache.set_encounters_from_raw_game(game)
+        except Exception as e:
+            logger.warning(f"encounter cache write failed: {e}", "tools")
     teammatesInfo = [
         getTeammatesFromSGPGame(
             game,

@@ -296,7 +296,7 @@ AUTHOR = "Zzaphkiel"
 # 二次开发维护者信息 (fork 维护者署名, 与原作者 AUTHOR 区分)
 MAINTAINER = "Li-Qifeng"
 MAINTAINER_URL = "https://github.com/Li-Qifeng/Seraphine"
-VERSION = os.environ.get("SERAPHINE_DEV_VERSION") or "1.3.13"  # 2026-11-20: auto-start matchmaking hot toggle
+VERSION = os.environ.get("SERAPHINE_DEV_VERSION") or "1.3.16"  # 2026-11-23: refresh analysis on game switch
 BETA = None
 # 以下 URL 指向当前维护者的 fork 仓库 (接管 Release / Issue 反馈)
 FEEDBACK_URL = "https://github.com/Li-Qifeng/Seraphine/issues?q=is%3Aissue"

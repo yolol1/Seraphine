@@ -4,13 +4,16 @@ import asyncio
 import math
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QPixmap, QPainter, QPainterPath, QColor, QFont, QPen
+from PyQt5.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont,
+                         QLinearGradient, QPen)
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout,
                              QLabel, QFrame, QWidget, QSizePolicy,
-                             QSpacerItem)
+                             QSpacerItem, QPushButton)
 
 from app.common.qfluentwidgets import (isDarkTheme, SmoothScrollArea)
+from app.components.encounter_badge import makeEncounterBadge
 from app.lol.connector import connector
+from app.lol.persistent_cache import cache as sqlite_cache
 from app.lol.war_criminal_cache import getVerdict
 from app.lol.war_criminal_ui import METRIC_NAMES
 
@@ -212,6 +215,96 @@ def _formatTimestamp(timestampMs) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+def _asInt(value, default=0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _teamParticipantIds(gameData: dict, teamId: int) -> set:
+    teams = (gameData or {}).get('teams') or {}
+    team = teams.get(teamId) or teams.get(str(teamId)) or {}
+    ids = {
+        _asInt(player.get('participantId'))
+        for player in (team.get('summoners') or [])
+        if _asInt(player.get('participantId')) > 0
+    }
+    return ids
+
+
+def _economySeries(timeline: dict, gameData: dict) -> list:
+    """Build cumulative team-gold samples from match-v5 timeline frames.
+
+    Each sample totals participantFrames.totalGold for team 100 and team 200.
+    currentGold is intentionally ignored because it only reflects unspent gold.
+    """
+    if not isinstance(timeline, dict):
+        return []
+
+    frames = timeline.get('frames') or []
+    if not isinstance(frames, list) or not frames:
+        return []
+
+    blueIds = _teamParticipantIds(gameData, 100)
+    redIds = _teamParticipantIds(gameData, 200)
+
+    if not blueIds or not redIds:
+        frameIds = set()
+        for frame in frames:
+            participantFrames = frame.get('participantFrames') or {}
+            if isinstance(participantFrames, dict):
+                frameIds.update(
+                    _asInt(participantId)
+                    for participantId in participantFrames
+                    if _asInt(participantId) > 0
+                )
+        if not blueIds:
+            blueIds = {participantId for participantId in frameIds
+                       if participantId <= 5}
+        if not redIds:
+            redIds = {participantId for participantId in frameIds
+                      if participantId > 5}
+
+    if not blueIds and not redIds:
+        return []
+
+    samples = []
+    for frame in frames:
+        participantFrames = frame.get('participantFrames') or {}
+        if not isinstance(participantFrames, dict) or not participantFrames:
+            continue
+
+        byParticipant = {
+            _asInt(participantId): participant
+            for participantId, participant in participantFrames.items()
+            if isinstance(participant, dict)
+        }
+
+        def teamGold(ids):
+            return sum(
+                max(0, _asInt((byParticipant.get(participantId) or {})
+                              .get('totalGold')))
+                for participantId in ids
+            )
+
+        blueGold = teamGold(blueIds)
+        redGold = teamGold(redIds)
+        if blueGold == 0 and redGold == 0:
+            continue
+
+        timestamp = max(0, _asInt(frame.get('timestamp')))
+        samples.append({
+            'timestamp': timestamp,
+            'blue': blueGold,
+            'red': redGold,
+            'diff': blueGold - redGold,
+        })
+
+    samples.sort(key=lambda sample: sample['timestamp'])
+    return samples
+
+
 def _timelineEvents(timeline: dict, gameData: dict) -> list:
     """Convert raw match-v5 timeline frames into readable analysis events."""
     if not isinstance(timeline, dict):
@@ -397,6 +490,10 @@ class AnalysisStatTable(QFrame):
                     f"color: {_TEXTP if dark else '#222'}; background: transparent;"
                     "font: bold 12px 'Microsoft YaHei UI', 'Segoe UI';")
                 playerLayout.addWidget(nameLabel)
+                encounter_badge = makeEncounterBadge(
+                    player, player.get("encounterSubjectPuuid"))
+                if encounter_badge:
+                    playerLayout.addWidget(encounter_badge)
                 playerLayout.addStretch(1)
                 rowLayout.addWidget(playerWidget, 1)
 
@@ -588,7 +685,16 @@ class PlayerCard(QFrame):
         nameLabel.setStyleSheet(
             f"font-family: {font}; font-size: 11px; font-weight: bold; "
             f"color: {nl_color}; background: transparent;")
-        vi.addWidget(nameLabel)
+        name_row = QHBoxLayout()
+        name_row.setContentsMargins(0, 0, 0, 0)
+        name_row.setSpacing(5)
+        name_row.addWidget(nameLabel)
+        encounter_badge = makeEncounterBadge(
+            data, data.get("encounterSubjectPuuid"))
+        if encounter_badge:
+            name_row.addWidget(encounter_badge)
+        name_row.addStretch(1)
+        vi.addLayout(name_row)
 
         # KDA + CS + Gold
         k = data.get('kills', 0)
@@ -891,6 +997,354 @@ def _renderBuf(widget, drawFn):
     p2.end()
 
 
+def _chartToggleStyle(dark: bool, checked: bool) -> str:
+    color = _BLUE if checked else (_TEXTS if dark else '#666')
+    bg = 'rgba(46,167,255,0.16)' if checked else (
+        'rgba(255,255,255,0.04)' if dark else 'rgba(0,0,0,0.035)')
+    border = 'rgba(46,167,255,0.55)' if checked else (
+        'rgba(255,255,255,0.10)' if dark else 'rgba(0,0,0,0.10)')
+    return (
+        f"QPushButton {{ color: {color}; background: {bg}; "
+        f"border: 1px solid {border}; border-radius: 5px; "
+        "padding: 4px 12px; font: bold 11px 'Microsoft YaHei UI'; }"
+    )
+
+
+class EconomyChart(QWidget):
+    """Cumulative team gold chart with total and differential views."""
+
+    def __init__(self, series: list, mode: str = "total", parent=None):
+        super().__init__(parent)
+        self._series = series or []
+        self._mode = mode
+        self._hoverIndex = -1
+        self._plotRect = (0, 0, 0, 0)
+        self.setMouseTracking(True)
+        self.setMinimumHeight(300)
+        self.setFixedHeight(300)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def setMode(self, mode: str):
+        if mode not in ("total", "diff") or mode == self._mode:
+            return
+        self._mode = mode
+        self._hoverIndex = -1
+        self.update()
+
+    def _range(self):
+        if self._mode == "diff":
+            maximum = max(
+                (abs(sample.get('diff', 0)) for sample in self._series),
+                default=1,
+            )
+            maximum = max(maximum * 1.12, 1000)
+            return -maximum, maximum
+
+        maximum = max(
+            (max(sample.get('blue', 0), sample.get('red', 0))
+             for sample in self._series),
+            default=1,
+        )
+        return 0, max(maximum * 1.08, 1000)
+
+    def _nearestIndex(self, x: float) -> int:
+        if not self._series:
+            return -1
+        left, _, width, _ = self._plotRect
+        if width <= 0:
+            return -1
+        start = 0
+        end = max(self._series[-1]['timestamp'], 1)
+        target = start + (x - left) / width * (end - start)
+        return min(
+            range(len(self._series)),
+            key=lambda index: abs(self._series[index]['timestamp'] - target),
+        )
+
+    def mouseMoveEvent(self, event):
+        left, top, width, height = self._plotRect
+        if (
+            width > 0
+            and height > 0
+            and left <= event.pos().x() <= left + width
+            and top <= event.pos().y() <= top + height
+        ):
+            index = self._nearestIndex(event.pos().x())
+            if index != self._hoverIndex:
+                self._hoverIndex = index
+                self.update()
+        elif self._hoverIndex >= 0:
+            self._hoverIndex = -1
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hoverIndex = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        _renderBuf(self, self._draw)
+
+    def _draw(self, p, w, h):
+        dark = isDarkTheme()
+        text = _TEXTP if dark else '#25303B'
+        muted = _TEXTS if dark else '#707B86'
+        grid = QColor('#FFFFFF')
+        grid.setAlpha(24 if dark else 20)
+        panel = QColor('#FFFFFF')
+        panel.setAlpha(8 if dark else 14)
+
+        left, right = 64, 20
+        top, bottom = 38, 34
+        plotWidth = max(1, w - left - right)
+        plotHeight = max(1, h - top - bottom)
+        plotRight = left + plotWidth
+        plotBottom = top + plotHeight
+        self._plotRect = (left, top, plotWidth, plotHeight)
+
+        p.fillRect(left, top, plotWidth, plotHeight, panel)
+        p.setFont(QFont('Microsoft YaHei UI', 9))
+
+        lower, upper = self._range()
+        span = max(upper - lower, 1)
+        startMs = 0
+        endMs = max(
+            self._series[-1]['timestamp'] if self._series else 1,
+            1,
+        )
+
+        def mapX(timestamp):
+            return left + (timestamp - startMs) / (endMs - startMs) * plotWidth
+
+        def mapY(value):
+            return top + (upper - value) / span * plotHeight
+
+        for step in range(5):
+            y = top + plotHeight * step / 4
+            p.setPen(QPen(grid, 1))
+            p.drawLine(left, int(y), plotRight, int(y))
+            value = upper - span * step / 4
+            suffix = "k" if abs(value) >= 1000 else ""
+            labelValue = value / 1000 if suffix else value
+            label = f"{labelValue:.1f}{suffix}" if suffix else f"{int(value)}"
+            p.setPen(QColor(muted))
+            p.drawText(4, int(y + 4), label)
+
+        for step in range(5):
+            x = left + plotWidth * step / 4
+            p.setPen(QPen(grid, 1))
+            p.drawLine(int(x), top, int(x), plotBottom)
+            timestamp = startMs + (endMs - startMs) * step / 4
+            label = _formatTimestamp(timestamp)
+            labelWidth = p.fontMetrics().horizontalAdvance(label)
+            p.setPen(QColor(muted))
+            p.drawText(
+                int(min(max(x - labelWidth / 2, left),
+                        plotRight - labelWidth)),
+                plotBottom + 20,
+                label,
+            )
+
+        if not self._series:
+            p.setPen(QColor(muted))
+            p.setFont(QFont('Microsoft YaHei UI', 11))
+            message = "暂无经济时间线"
+            messageWidth = p.fontMetrics().horizontalAdvance(message)
+            p.drawText(
+                int(left + (plotWidth - messageWidth) / 2),
+                int(top + plotHeight / 2),
+                message,
+            )
+            return
+
+        if self._mode == "total":
+            self._drawTotal(p, left, top, plotWidth, plotHeight,
+                            mapX, mapY, dark)
+        else:
+            self._drawDifference(p, left, top, plotWidth, plotHeight,
+                                 mapX, mapY)
+
+        if 0 <= self._hoverIndex < len(self._series):
+            self._drawHover(p, left, top, plotWidth, plotHeight,
+                            mapX, mapY, dark, text)
+
+    def _seriesPath(self, key, mapX, mapY):
+        path = QPainterPath()
+        for index, sample in enumerate(self._series):
+            pointX = mapX(sample['timestamp'])
+            pointY = mapY(sample[key])
+            if index == 0:
+                path.moveTo(pointX, pointY)
+            else:
+                path.lineTo(pointX, pointY)
+        return path
+
+    def _drawTotal(self, p, left, top, width, height, mapX, mapY, dark):
+        baseline = top + height
+
+        for key, color, label in (
+            ('blue', _BLUE, '蓝队'),
+            ('red', _RED, '红队'),
+        ):
+            path = self._seriesPath(key, mapX, mapY)
+            area = QPainterPath(path)
+            area.lineTo(mapX(self._series[-1]['timestamp']), baseline)
+            area.lineTo(mapX(self._series[0]['timestamp']), baseline)
+            area.closeSubpath()
+
+            gradient = QLinearGradient(0, top, 0, baseline)
+            fill = QColor(color)
+            fill.setAlpha(80 if dark else 55)
+            transparent = QColor(color)
+            transparent.setAlpha(4)
+            gradient.setColorAt(0, fill)
+            gradient.setColorAt(1, transparent)
+            p.fillPath(area, gradient)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(color), 2.4))
+            p.drawPath(path)
+
+        legendX = left + 8
+        p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
+        for label, color, offset in (
+            ('蓝队', _BLUE, 0),
+            ('红队', _RED, 60),
+        ):
+            p.setPen(QColor(color))
+            p.drawText(legendX + offset, 22, f"● {label}")
+
+    def _drawDifference(self, p, left, top, width, height, mapX, mapY):
+        zeroY = mapY(0)
+        p.setPen(QPen(QColor('#8B95A5'), 1, Qt.DashLine))
+        p.drawLine(left, int(zeroY), left + width, int(zeroY))
+
+        points = [
+            (mapX(sample['timestamp']), mapY(sample['diff']))
+            for sample in self._series
+        ]
+        for (x1, y1), (x2, y2), sample in zip(
+            points, points[1:], self._series[1:]
+        ):
+            color = _BLUE if sample['diff'] >= 0 else _RED
+            p.setPen(QPen(QColor(color), 2.6))
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+        if len(points) == 1:
+            p.setBrush(QColor(_BLUE))
+            p.setPen(Qt.NoPen)
+            p.drawEllipse(int(points[0][0] - 3), int(points[0][1] - 3), 6, 6)
+
+        p.setFont(QFont('Microsoft YaHei UI', 9, QFont.Bold))
+        p.setPen(QColor(_BLUE))
+        p.drawText(left + 8, 22, "▲ 蓝方领先")
+        p.setPen(QColor(_RED))
+        p.drawText(left + 118, 22, "▼ 红方领先")
+
+    def _drawHover(self, p, left, top, width, height, mapX, mapY,
+                   dark, text):
+        sample = self._series[self._hoverIndex]
+        x = mapX(sample['timestamp'])
+        p.setPen(QPen(QColor('#FFFFFF' if dark else '#5C6975'),
+                      1, Qt.DashLine))
+        p.drawLine(int(x), top, int(x), top + height)
+
+        for key, color in (('blue', _BLUE), ('red', _RED)):
+            if self._mode == 'diff' and key != 'blue':
+                continue
+            valueKey = 'diff' if self._mode == 'diff' else key
+            y = mapY(sample[valueKey])
+            if self._mode == 'diff':
+                color = _BLUE if sample['diff'] >= 0 else _RED
+            p.setBrush(QColor(color))
+            p.setPen(QPen(QColor('#FFFFFF' if dark else '#F7F9FB'), 1.5))
+            p.drawEllipse(int(x - 4), int(y - 4), 8, 8)
+
+        blueText = f"蓝队 {_formatNumber(sample['blue'])}"
+        redText = f"红队 {_formatNumber(sample['red'])}"
+        diff = sample['diff']
+        diffText = f"经济差 {'+' if diff >= 0 else ''}{_formatNumber(diff)}"
+        lines = [_formatTimestamp(sample['timestamp']), blueText, redText, diffText]
+
+        boxWidth = 152
+        boxHeight = 82
+        boxX = int(x + 12)
+        if boxX + boxWidth > left + width:
+            boxX = int(x - boxWidth - 12)
+        boxY = top + 10
+
+        bg = QColor('#132235' if dark else '#FFFFFF')
+        bg.setAlpha(245 if dark else 235)
+        p.setBrush(bg)
+        p.setPen(QPen(QColor('#FFFFFF' if dark else '#B8C2CC'), 1))
+        p.drawRoundedRect(boxX, boxY, boxWidth, boxHeight, 7, 7)
+
+        p.setFont(QFont('Microsoft YaHei UI', 9))
+        for index, line in enumerate(lines):
+            if index == 0:
+                p.setPen(QColor(_TEXTS if dark else '#6F7A85'))
+            elif index == 1:
+                p.setPen(QColor(_BLUE))
+            elif index == 2:
+                p.setPen(QColor(_RED))
+            else:
+                p.setPen(QColor(text))
+            p.drawText(boxX + 10, boxY + 18 + index * 17, line)
+
+
+class EconomyChartPanel(QFrame):
+    def __init__(self, series: list, status: str = "", parent=None):
+        super().__init__(parent)
+        self._dark = isDarkTheme()
+        bg = _PANEL_BG if self._dark else '#F0F2F5'
+        border = _BORDER if self._dark else 'rgba(0,0,0,0.08)'
+        self.setStyleSheet(
+            f"EconomyChartPanel {{ background: {bg}; "
+            f"border: 1px solid {border}; border-radius: 10px; }}")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 10)
+        layout.setSpacing(5)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        title = QLabel("经济走势")
+        title.setStyleSheet(
+            f"color: {_TEXTP if self._dark else '#222'}; background: transparent;"
+            "font: bold 17px 'Microsoft YaHei UI', 'Segoe UI';")
+        header.addWidget(title)
+        header.addStretch(1)
+
+        self.totalButton = QPushButton("总经济")
+        self.diffButton = QPushButton("经济差")
+        for button in (self.totalButton, self.diffButton):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setFixedHeight(27)
+            header.addWidget(button)
+        layout.addLayout(header)
+
+        note = status or "每帧汇总双方累计总经济；悬停曲线可查看具体数值"
+        self.noteLabel = QLabel(note)
+        self.noteLabel.setWordWrap(True)
+        self.noteLabel.setStyleSheet(
+            f"color: {_TEXTS if self._dark else '#777'}; background: transparent;"
+            "font: 11px 'Microsoft YaHei UI', 'Segoe UI';")
+        layout.addWidget(self.noteLabel)
+
+        self.chart = EconomyChart(series, mode="total", parent=self)
+        layout.addWidget(self.chart)
+
+        self.totalButton.clicked.connect(lambda: self._setMode("total"))
+        self.diffButton.clicked.connect(lambda: self._setMode("diff"))
+        self._setMode("total")
+
+    def _setMode(self, mode: str):
+        self.chart.setMode(mode)
+        self.totalButton.setStyleSheet(
+            _chartToggleStyle(self._dark, mode == "total"))
+        self.diffButton.setStyleSheet(
+            _chartToggleStyle(self._dark, mode == "diff"))
+
+
 # ── AnalysisPage ───────────────────────────────────────────
 
 class AnalysisPage(QFrame):
@@ -1023,8 +1477,11 @@ class AnalysisPage(QFrame):
         elif idx == 5:
             self._buildTimelineTab()
 
-    def loadGame(self, gameData: dict):
+    def loadGame(self, gameData: dict, preserveTab: bool = False,
+                 subjectPuuid: str = None):
+        activeTab = self._activeTab if preserveTab else 0
         self._game = gameData
+        self._subjectPuuid = subjectPuuid
         self._timelineLoading = False
         self._timelineStatus = ""
 
@@ -1057,12 +1514,26 @@ class AnalysisPage(QFrame):
             self._redPlayers = _mergeTeam(
                 loseTeam.get('summoners', []), loserRating)
 
+        if subjectPuuid:
+            player_puuids = [
+                player.get("puuid")
+                for player in self._bluePlayers + self._redPlayers
+            ]
+            marks = sqlite_cache.get_encounter_marks(
+                subjectPuuid, player_puuids,
+                exclude_game_id=gameData.get("gameId"))
+            for player in self._bluePlayers + self._redPlayers:
+                player["encounterInfo"] = marks.get(
+                    player.get("puuid"), {})
+                player["encounterSubjectPuuid"] = subjectPuuid
+
         modeName = gameData.get('modeName', '')
         mapName = gameData.get('mapName', '')
         duration = gameData.get('gameDuration', '')
         self.infoLabel.setText(f"{mapName}  ·  {modeName}  ·  {duration}")
-        self._setActiveTab(0)
-        self._renderTab(0)
+        activeTab = min(max(activeTab, 0), len(_TAB_NAMES) - 1)
+        self._setActiveTab(activeTab)
+        self._renderTab(activeTab)
 
     def _buildOverview(self):
         bluePlayers = self._bluePlayers
@@ -1118,6 +1589,17 @@ class AnalysisPage(QFrame):
             "伤害为对英雄伤害，参团率按队伍总击杀计算")
 
     def _buildEconomyTab(self):
+        timeline = self._game.get('timeline') if self._game else None
+        series = _economySeries(timeline, self._game or {})
+        if self._timelineLoading:
+            chartStatus = "正在从 SGP 获取对局时间线…"
+        elif self._timelineStatus:
+            chartStatus = self._timelineStatus
+        elif series:
+            chartStatus = "每帧汇总双方累计总经济；悬停曲线可查看具体数值"
+        else:
+            chartStatus = "该对局暂未包含经济时间线，正在尝试获取…"
+
         columns = [
             ("获得金币", 92, lambda p, _: _formatNumber(p.get('gold', 0))),
             ("花费金币", 92, lambda p, _: _formatNumber(p.get('goldSpent', 0))),
@@ -1127,13 +1609,25 @@ class AnalysisPage(QFrame):
         ]
         blueGold = sum(p.get('gold', 0) for p in self._bluePlayers)
         redGold = sum(p.get('gold', 0) for p in self._redPlayers)
-        return AnalysisStatTable(
+        table = AnalysisStatTable(
             "经济与资源",
             [("蓝队", self._bluePlayers, _BLUE),
              ("红队", self._redPlayers, _RED)],
             columns,
             f"团队获得金币：蓝队 {_formatNumber(blueGold)} · "
             f"红队 {_formatNumber(redGold)}")
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        layout.addWidget(EconomyChartPanel(series, chartStatus))
+        layout.addWidget(table)
+
+        if not timeline and not self._timelineLoading:
+            self._timelineLoading = True
+            asyncio.ensure_future(self._loadTimeline())
+        return container
 
     def _buildRuneTab(self):
         dark = isDarkTheme()
@@ -1217,9 +1711,10 @@ class AnalysisPage(QFrame):
         self._timelineLoading = False
         if timeline:
             self._game['timeline'] = timeline
+            self._timelineStatus = ""
         else:
             self._timelineStatus = (
                 "无法获取时间线：LCU 对局详情不包含回放事件，"
                 "且当前 SGP 服务未返回该局的 DETAILS 数据。")
-        if self._activeTab == 5:
-            self._renderTab(5)
+        if self._activeTab in (2, 5):
+            self._renderTab(self._activeTab)

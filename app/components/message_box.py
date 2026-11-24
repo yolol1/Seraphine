@@ -342,7 +342,8 @@ class ExceptionMessageBox(MessageBoxBase):
 class MultiChampionSelectMsgBox(MessageBoxBase):
     completed = pyqtSignal(list)
 
-    def __init__(self, champions: dict, selected: list, maxCount=6, parent=None):
+    def __init__(self, champions: dict, selected: list, *, maxCount=6,
+                 parent=None):
         super().__init__(parent)
 
         self.myYesButton = PrimaryPushButton(self.tr('OK'), self.buttonGroup)

@@ -1,6 +1,14 @@
 # coding:utf-8
 import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
+import sys
+
+# PyInstaller sets __file__ to a bundled module under _internal. Resources and
+# runtime files live next to the executable, so frozen builds must use the
+# executable directory as their working directory.
+if getattr(sys, "frozen", False):
+    os.chdir(os.path.dirname(os.path.abspath(sys.executable)))
+else:
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt, QTranslator, QTimer
@@ -9,7 +17,6 @@ from app.common.theme import applyTheme
 from qasync import QApplication, QEventLoop
 import asyncio
 import signal
-import sys
 from app.common.config import cfg, VERSION, BETA
 from app.common.logger import logger
 from app.common.shutdown_filter import ShutdownFilter

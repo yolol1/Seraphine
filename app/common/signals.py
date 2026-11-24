@@ -34,6 +34,7 @@ class SignalBus(QObject):
     # jumps:
     toCareerInterface = pyqtSignal(str)
     toSearchInterface = pyqtSignal(str)
+    encounterHistoryRequested = pyqtSignal(str, str, str)
 
     # style:
     customColorChanged = pyqtSignal(str)

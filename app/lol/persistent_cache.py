@@ -11,9 +11,14 @@ from typing import Optional
 
 from app.common.config import LOCAL_PATH
 from app.common.logger import logger
+from app.lol.encounters import (
+    encounter_game_from_parsed,
+    encounter_game_from_raw,
+    normalize_game_id,
+)
 TAG = "PersistentCache"
 DB_NAME = "seraphine_cache.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_GAMES_PER_PUUID = 1000
 MAX_GAME_DETAILS = 500
 
@@ -27,12 +32,27 @@ class PersistentCache:
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
             os.makedirs(os.path.dirname(self._path), exist_ok=True)
-            self._conn = sqlite3.connect(self._path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._init_schema()
+            try:
+                self._conn = self._open(self._path)
+                self._init_schema()
+            except sqlite3.OperationalError as e:
+                if "readonly" not in str(e).lower():
+                    raise
+                # Packaged/read-only profiles must not crash gameplay. Keep the
+                # current session usable with an in-memory cache.
+                if self._conn is not None:
+                    self._conn.close()
+                self._conn = self._open(":memory:")
+                self._init_schema()
         return self._conn
+
+    @staticmethod
+    def _open(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
     def _init_schema(self):
         c = self._conn.cursor()
@@ -43,17 +63,18 @@ class PersistentCache:
             )
         """)
         version = c.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        self._create_tables()
         if version is None:
-            self._create_tables()
             c.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
                       (str(SCHEMA_VERSION),))
-            self._conn.commit()
         elif int(version["value"]) < SCHEMA_VERSION:
-            self._drop_tables()
-            self._create_tables()
+            # Schema upgrades are additive. Rebuilding the cache here would
+            # discard match details and idle-game history from older builds.
+            if int(version["value"]) < 2:
+                self._backfill_encounters(c)
             c.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)",
                       (str(SCHEMA_VERSION),))
-            self._conn.commit()
+        self._conn.commit()
         c.close()
 
     def _create_tables(self):
@@ -95,15 +116,103 @@ class PersistentCache:
                 profile_icon TEXT, level INTEGER,
                 updated_at REAL NOT NULL DEFAULT (julianday('now'))
             );  -- ponytail: summoners table unused, no write-through from connector
+
+            CREATE TABLE IF NOT EXISTS encounters (
+                game_id INTEGER NOT NULL,
+                subject_puuid TEXT NOT NULL,
+                player_puuid TEXT NOT NULL,
+                relationship TEXT NOT NULL,
+                player_name TEXT,
+                tag_line TEXT,
+                team_id INTEGER,
+                win INTEGER,
+                game_time TEXT,
+                game_creation INTEGER,
+                queue_id INTEGER,
+                game_duration TEXT,
+                mode_name TEXT,
+                player_json TEXT,
+                updated_at REAL NOT NULL DEFAULT (julianday('now')),
+                PRIMARY KEY (game_id, subject_puuid, player_puuid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_encounters_subject
+                ON encounters(subject_puuid, player_puuid);
+            CREATE INDEX IF NOT EXISTS idx_encounters_game
+                ON encounters(game_id);
         """)
         self._conn.commit()
         c.close()
 
     def _drop_tables(self):
         c = self._conn.cursor()
-        c.executescript("DROP TABLE IF EXISTS games; DROP TABLE IF EXISTS game_details; DROP TABLE IF EXISTS verdicts; DROP TABLE IF EXISTS summoners;")
+        c.executescript(
+            "DROP TABLE IF EXISTS games; "
+            "DROP TABLE IF EXISTS game_details; "
+            "DROP TABLE IF EXISTS verdicts; "
+            "DROP TABLE IF EXISTS summoners; "
+            "DROP TABLE IF EXISTS encounters;"
+        )
         self._conn.commit()
         c.close()
+
+    def _backfill_encounters(self, c: sqlite3.Cursor):
+        """Populate the encounter index from match details cached by v1."""
+        rows = c.execute("SELECT detail_json FROM game_details").fetchall()
+        for row in rows:
+            try:
+                detail = json.loads(row["detail_json"])
+            except (JSONDecodeError, TypeError):
+                continue
+            normalized = encounter_game_from_parsed(detail)
+            if normalized:
+                self._replace_encounters(c, normalized)
+
+    @staticmethod
+    def _replace_encounters(c: sqlite3.Cursor, game: dict):
+        game_id = game.get("gameId")
+        if game_id is None:
+            return
+        participants = game.get("participants") or []
+        c.execute("DELETE FROM encounters WHERE game_id=?", (game_id,))
+        rows = []
+        for subject in participants:
+            subject_puuid = subject.get("puuid")
+            if not subject_puuid:
+                continue
+            for player in participants:
+                player_puuid = player.get("puuid")
+                if not player_puuid or player_puuid == subject_puuid:
+                    continue
+                relationship = (
+                    "ally"
+                    if subject.get("teamId") == player.get("teamId")
+                    else "enemy"
+                )
+                rows.append((
+                    game_id,
+                    subject_puuid,
+                    player_puuid,
+                    relationship,
+                    player.get("name", ""),
+                    player.get("tagLine", ""),
+                    player.get("teamId"),
+                    1 if player.get("win") else 0,
+                    game.get("gameTime", ""),
+                    game.get("gameCreation", 0) or 0,
+                    game.get("queueId"),
+                    game.get("gameDuration", ""),
+                    game.get("modeName", ""),
+                    json.dumps(player, ensure_ascii=False),
+                ))
+        if rows:
+            c.executemany("""
+                INSERT OR REPLACE INTO encounters
+                (game_id, subject_puuid, player_puuid, relationship,
+                 player_name, tag_line, team_id, win, game_time,
+                 game_creation, queue_id, game_duration, mode_name,
+                 player_json, updated_at)
+                VALUES (?,?,?,?, ?,?,?,?,?, ?,?,?,?,?,julianday('now'))
+            """, rows)
 
     # ---- games (match history) ----
 
@@ -175,6 +284,9 @@ class PersistentCache:
                 (game_id, detail_json, updated_at)
                 VALUES (?,?,julianday('now'))
             """, (game_id, json.dumps(detail, ensure_ascii=False)))
+            normalized = encounter_game_from_parsed(detail)
+            if normalized:
+                self._replace_encounters(c, normalized)
             self._prune_game_details(c)
             conn.commit()
             c.close()
@@ -205,6 +317,131 @@ class PersistentCache:
                 LIMIT -1 OFFSET ?
             )
         """, (MAX_GAME_DETAILS,))
+
+    # ---- encounters ----
+
+    def set_encounters_from_raw_game(self, raw_game: dict) -> int:
+        """Index every co-participant relationship in one LCU/SGP match."""
+        normalized = encounter_game_from_raw(raw_game)
+        if not normalized:
+            return 0
+        with self._lock:
+            conn = self._get_conn()
+            c = conn.cursor()
+            self._replace_encounters(c, normalized)
+            conn.commit()
+            c.close()
+        return len(normalized.get("participants") or [])
+
+    def has_game_encounters(self, subject_puuid: str, game_id: int) -> bool:
+        game_id = normalize_game_id(game_id)
+        with self._lock:
+            c = self._get_conn().cursor()
+            row = c.execute("""
+                SELECT 1 FROM encounters
+                WHERE subject_puuid=? AND game_id=?
+                LIMIT 1
+            """, (subject_puuid, game_id)).fetchone()
+            c.close()
+        return row is not None
+
+    def get_encounter_marks(self, subject_puuid: str, player_puuids: list,
+                            exclude_game_id: int = None) -> dict:
+        """Return previous-meeting counts for several players at once."""
+        players = [
+            puuid for puuid in dict.fromkeys(player_puuids or [])
+            if puuid and puuid != subject_puuid
+        ]
+        if not subject_puuid or not players:
+            return {}
+        exclude_game_id = (
+            normalize_game_id(exclude_game_id)
+            if exclude_game_id is not None else None
+        )
+
+        placeholders = ",".join("?" for _ in players)
+        params = [subject_puuid] + players
+        exclude_sql = ""
+        if exclude_game_id is not None:
+            exclude_sql = " AND game_id<>?"
+            params.append(exclude_game_id)
+        query = f"""
+            SELECT player_puuid, game_id, relationship, game_time,
+                   game_creation, queue_id, mode_name
+            FROM encounters
+            WHERE subject_puuid=? AND player_puuid IN ({placeholders})
+            {exclude_sql}
+            ORDER BY game_creation DESC, game_id DESC
+        """
+        try:
+            with self._lock:
+                c = self._get_conn().cursor()
+                rows = c.execute(query, params).fetchall()
+                c.close()
+        except sqlite3.Error as e:
+            logger.warning(f"get_encounter_marks failed: {e}", TAG)
+            return {}
+
+        marks = {}
+        for row in rows:
+            player_puuid = row["player_puuid"]
+            mark = marks.get(player_puuid)
+            if mark is None:
+                mark = {
+                    "count": 0,
+                    "lastGameId": row["game_id"],
+                    "lastRelationship": row["relationship"],
+                    "lastGameTime": row["game_time"],
+                    "lastQueueId": row["queue_id"],
+                    "lastModeName": row["mode_name"],
+                }
+                marks[player_puuid] = mark
+            mark["count"] += 1
+        return marks
+
+    def get_encounter_history(self, subject_puuid: str, player_puuid: str,
+                              exclude_game_id: int = None,
+                              limit: int = 30) -> list:
+        """Return the other player's performance in shared matches."""
+        if not subject_puuid or not player_puuid:
+            return []
+        exclude_game_id = (
+            normalize_game_id(exclude_game_id)
+            if exclude_game_id is not None else None
+        )
+        params = [subject_puuid, player_puuid]
+        exclude_sql = ""
+        if exclude_game_id is not None:
+            exclude_sql = " AND game_id<>?"
+            params.append(exclude_game_id)
+        params.append(max(1, int(limit)))
+        try:
+            with self._lock:
+                c = self._get_conn().cursor()
+                rows = c.execute(f"""
+                    SELECT game_id, relationship, player_name, tag_line, win,
+                           game_time, queue_id, game_duration, mode_name,
+                           player_json
+                    FROM encounters
+                    WHERE subject_puuid=? AND player_puuid=?
+                    {exclude_sql}
+                    ORDER BY game_creation DESC, game_id DESC
+                    LIMIT ?
+                """, params).fetchall()
+                c.close()
+        except sqlite3.Error as e:
+            logger.warning(f"get_encounter_history failed: {e}", TAG)
+            return []
+
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["player"] = json.loads(item.pop("player_json") or "{}")
+            except (JSONDecodeError, TypeError):
+                item["player"] = {}
+            result.append(item)
+        return result
 
     # ---- verdicts ----
 
@@ -271,6 +508,7 @@ class PersistentCache:
             c.execute("DELETE FROM game_details")
             c.execute("DELETE FROM verdicts")
             c.execute("DELETE FROM summoners")
+            c.execute("DELETE FROM encounters")
             self._get_conn().commit()
             c.close()
 
@@ -290,8 +528,15 @@ class PersistentCache:
             games = c.execute("SELECT COUNT(*) as n FROM games").fetchone()["n"]
             details = c.execute("SELECT COUNT(*) as n FROM game_details").fetchone()["n"]
             verdicts = c.execute("SELECT COUNT(*) as n FROM verdicts").fetchone()["n"]
+            encounters = c.execute(
+                "SELECT COUNT(*) as n FROM encounters").fetchone()["n"]
             c.close()
-        return {"games": games, "game_details": details, "verdicts": verdicts}
+        return {
+            "games": games,
+            "game_details": details,
+            "verdicts": verdicts,
+            "encounters": encounters,
+        }
 
 
 cache = PersistentCache()

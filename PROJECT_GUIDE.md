@@ -924,6 +924,8 @@ README FAQ 已明确：**英雄联盟客户端未提供**以下数据，Seraphin
 | 海克斯强化推荐 | `app\lol\augment_recommender.py` + `app\lol\augment_live.py` |
 | Live Client 数据（对局中实时数据） | `app\lol\live_client.py`（`liveClient`，经 `signalBus.liveGameDataUpdated` 推送） |
 | 持久化缓存 | `app\lol\persistent_cache.py` |
+| 玩家共同对局索引 | `app\lol\encounters.py` + `persistent_cache.py`（`encounters` 表，按双方 puuid 索引队友/对手） |
+| 玩家相遇标记 / 跳转 | `app\components\encounter_badge.py` + `encounter_history_dialog.py` |
 | 关机事件过滤器 | `app\common\shutdown_filter.py`（`ShutdownFilter`，防"应用阻止关机"） |
 | 全队评级 UI | `app\lol\war_criminal_ui.py` |
 | 海克斯抢人窗口 | `app\view\hextech_window.py` + `app\view\opgg_hextech_assist_interface.py` |

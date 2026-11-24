@@ -1,5 +1,5 @@
 from app.view.analysis_page import (
-    _formatTimestamp, _mergeTeam, _timelineEvents,
+    _economySeries, _formatTimestamp, _mergeTeam, _timelineEvents,
 )
 
 
@@ -76,3 +76,66 @@ def test_timeline_events_are_readable_and_localized():
 def test_empty_timeline_is_safe():
     assert _timelineEvents(None, {}) == []
     assert _timelineEvents({}, {}) == []
+
+
+def test_economy_series_sums_total_gold_by_team():
+    game = {
+        "teams": {
+            100: {"summoners": [
+                {"participantId": 1}, {"participantId": 2},
+            ]},
+            200: {"summoners": [
+                {"participantId": 6}, {"participantId": 7},
+            ]},
+        },
+    }
+    timeline = {
+        "frames": [
+            {
+                "timestamp": 60_000,
+                "participantFrames": {
+                    "1": {"totalGold": 3000, "currentGold": 500},
+                    "2": {"totalGold": 2500, "currentGold": 100},
+                    "6": {"totalGold": 2800, "currentGold": 50},
+                    "7": {"totalGold": 2600, "currentGold": 0},
+                },
+            },
+            {
+                "timestamp": 120_000,
+                "participantFrames": {
+                    1: {"totalGold": 6000},
+                    2: {"totalGold": 5000},
+                    6: {"totalGold": 5500},
+                    7: {"totalGold": 5200},
+                },
+            },
+        ],
+    }
+
+    series = _economySeries(timeline, game)
+    assert series == [
+        {"timestamp": 60_000, "blue": 5500, "red": 5400, "diff": 100},
+        {"timestamp": 120_000, "blue": 11000, "red": 10700, "diff": 300},
+    ]
+
+
+def test_economy_series_falls_back_to_standard_participant_ids():
+    timeline = {
+        "frames": [{
+            "timestamp": 0,
+            "participantFrames": {
+                "1": {"totalGold": 500},
+                "6": {"totalGold": 500},
+            },
+        }],
+    }
+
+    assert _economySeries(timeline, {}) == [
+        {"timestamp": 0, "blue": 500, "red": 500, "diff": 0},
+    ]
+
+
+def test_economy_series_handles_missing_or_empty_timelines():
+    assert _economySeries(None, {}) == []
+    assert _economySeries({}, {}) == []
+    assert _economySeries({"frames": [{"participantFrames": {}}]}, {}) == []

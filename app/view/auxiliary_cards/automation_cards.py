@@ -578,7 +578,7 @@ class AutoSelectChampionCard(ExpandGroupSettingCard):
         selected = qconfig.get(configItem)
 
         box = MultiChampionSelectMsgBox(
-            self.champions, selected, self.window())
+            self.champions, selected, parent=self.window())
         box.completed.connect(
             lambda champions, t=type: self.__onChampionsChanged(champions, t))
         box.exec()
@@ -858,7 +858,7 @@ class AutoBanChampionCard(ExpandGroupSettingCard):
         selected = qconfig.get(configItem)
 
         box = MultiChampionSelectMsgBox(
-            self.champions, selected, self.window())
+            self.champions, selected, parent=self.window())
         box.completed.connect(
             lambda champions, t=type: self.__onChampionsChanged(champions, t))
         box.exec()

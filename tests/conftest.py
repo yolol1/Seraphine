@@ -87,6 +87,7 @@ if 'PyQt5' not in sys.modules:
     _pyqt5.QtGui.QPainterPath = MagicMock()
     _pyqt5.QtGui.QColor = MagicMock()
     _pyqt5.QtGui.QFont = MagicMock()
+    _pyqt5.QtGui.QLinearGradient = MagicMock()
     _pyqt5.QtGui.QPen = MagicMock()
     _pyqt5.QtWidgets = types.ModuleType('PyQt5.QtWidgets')
     _pyqt5.QtWidgets.QVBoxLayout = MagicMock()
@@ -96,6 +97,7 @@ if 'PyQt5' not in sys.modules:
     _pyqt5.QtWidgets.QWidget = MagicMock()
     _pyqt5.QtWidgets.QSizePolicy = MagicMock()
     _pyqt5.QtWidgets.QSpacerItem = MagicMock()
+    _pyqt5.QtWidgets.QPushButton = MagicMock()
     sys.modules['PyQt5'] = _pyqt5
     sys.modules['PyQt5.QtCore'] = _pyqt5.QtCore
     sys.modules['PyQt5.QtGui'] = _pyqt5.QtGui

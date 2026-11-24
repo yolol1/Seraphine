@@ -27,11 +27,18 @@ from app.components.summoner_name_button import SummonerName
 from app.components.animation_frame import ColorAnimationFrame
 from app.components.color_label import ColorLabel, DeathsLabel
 from app.components.game_infobar_widget import AugmentRow
+from app.components.encounter_badge import makeEncounterBadge
 from app.lol.connector import connector
 from app.lol.exceptions import SummonerGamesNotFound
-from app.lol.tools import parseGameDetailData, parseGamesDataConcurrently
+from app.lol.persistent_cache import cache as sqlite_cache
+from app.lol.tools import (
+    indexEncountersForGames,
+    parseGameDetailData,
+    parseGamesDataConcurrently,
+)
 from ..components.seraphine_interface import SeraphineInterface
 from .analysis_page import AnalysisPage
+from .detail_request import isCurrentDetailRequest
 
 
 TAG = "SearchInterface"
@@ -267,7 +274,7 @@ class GameDetailView(QFrame):
         self.infoPage = QWidget()
         self.vBoxLayout = QVBoxLayout(self.infoPage)
         self.titleBar = GameTitleBar()
-        self.titleBar.analysisRequested.connect(self._showAnalysis)
+        self.titleBar.analysisRequested.connect(self.showAnalysis)
 
         self.scrollWidget = QWidget()
         self.scrollArea = SmoothScrollArea()
@@ -304,6 +311,11 @@ class GameDetailView(QFrame):
         self.hBoxLayout.addWidget(self.outerStack)
 
     def clear(self):
+        self._game = None
+        self._subjectPuuid = None
+        self.outerStack.setCurrentIndex(0)
+        self.stackedWidget.setCurrentIndex(0)
+
         for i in reversed(range(self.vBoxLayout.count())):
             item = self.vBoxLayout.itemAt(i)
             self.vBoxLayout.removeItem(item)
@@ -312,7 +324,7 @@ class GameDetailView(QFrame):
                 item.widget().deleteLater()
 
         self.titleBar = GameTitleBar()
-        self.titleBar.analysisRequested.connect(self._showAnalysis)
+        self.titleBar.analysisRequested.connect(self.showAnalysis)
 
         self.scrollWidget = QWidget()
         self.scrollArea = SmoothScrollArea()
@@ -366,7 +378,7 @@ class GameDetailView(QFrame):
         index = 0 if enable else 1
         self.stackedWidget.setCurrentIndex(index)
 
-    def updateGame(self, game):
+    def updateGame(self, game, subjectPuuid=None):
         if not game:
             InfoBar.error(self.tr("Get game infomation failed"),
                           self.tr("The server returned abnormal content."),
@@ -378,6 +390,8 @@ class GameDetailView(QFrame):
             return
 
         self._game = game
+        self._subjectPuuid = subjectPuuid or getattr(
+            self, "_subjectPuuid", None)
         isCherry = game["queueId"] == 1700
         isMayhem = game["queueId"] == 2400
         self.titleBar.updateTitleBar(game)
@@ -385,20 +399,40 @@ class GameDetailView(QFrame):
         teams = game.get("teams", {})
         team1 = teams.get(100) or teams.get("100") or {}
         team2 = teams.get(200) or teams.get("200") or {}
+        all_teams = [
+            team for team in teams.values()
+            if isinstance(team, dict)
+        ]
 
         # 全队 5 档评级: 每个队友一个档位标签
         ratingList1 = self.__getTeamRating(game.get('gameId'),
                                             team1.get('win'))
         ratingList2 = self.__getTeamRating(game.get('gameId'),
                                             team2.get('win'))
+        encounter_marks = {}
+        if self._subjectPuuid:
+            player_puuids = [
+                player.get("puuid")
+                for team in all_teams
+                for player in (team.get("summoners") or [])
+            ]
+            encounter_marks = sqlite_cache.get_encounter_marks(
+                self._subjectPuuid, player_puuids,
+                exclude_game_id=game.get("gameId"))
+            for team in all_teams:
+                for player in team.get("summoners") or []:
+                    player["encounterInfo"] = encounter_marks.get(
+                        player.get("puuid"), {})
 
         self.teamView1.updateTeam(team1, isCherry, self.tr("1st"), isMayhem)
         self.teamView1.updateSummoners(team1["summoners"],
-                                        ratingList=ratingList1)
+                                        ratingList=ratingList1,
+                                        subjectPuuid=self._subjectPuuid)
 
         self.teamView2.updateTeam(team2, isCherry, self.tr("2nd"), isMayhem)
         self.teamView2.updateSummoners(team2["summoners"],
-                                        ratingList=ratingList2)
+                                        ratingList=ratingList2,
+                                        subjectPuuid=self._subjectPuuid)
 
         self.extraTeamView1.setVisible(isCherry)
         self.extraTeamView2.setVisible(isCherry)
@@ -423,29 +457,40 @@ class GameDetailView(QFrame):
             rl7 = self.__getTeamRating(game.get('gameId'), team7.get('win'))
             rl8 = self.__getTeamRating(game.get('gameId'), team8.get('win'))
 
+            for team in (team3, team4, team5, team6, team7, team8):
+                for player in team.get("summoners") or []:
+                    player["encounterInfo"] = encounter_marks.get(
+                        player.get("puuid"), {})
+
             self.extraTeamView1.updateTeam(team3, isCherry, self.tr("3rd"))
             self.extraTeamView1.updateSummoners(team3["summoners"],
-                                                 ratingList=rl3)
+                                                 ratingList=rl3,
+                                                 subjectPuuid=self._subjectPuuid)
 
             self.extraTeamView2.updateTeam(team4, isCherry, self.tr("4th"))
             self.extraTeamView2.updateSummoners(team4["summoners"],
-                                                 ratingList=rl4)
+                                                 ratingList=rl4,
+                                                 subjectPuuid=self._subjectPuuid)
 
             self.extraTeamView3.updateTeam(team5, isCherry, self.tr("5th"))
             self.extraTeamView3.updateSummoners(team5["summoners"],
-                                                 ratingList=rl5)
+                                                 ratingList=rl5,
+                                                 subjectPuuid=self._subjectPuuid)
 
             self.extraTeamView4.updateTeam(team6, isCherry, self.tr("6th"))
             self.extraTeamView4.updateSummoners(team6["summoners"],
-                                                 ratingList=rl6)
+                                                 ratingList=rl6,
+                                                 subjectPuuid=self._subjectPuuid)
 
             self.extraTeamView5.updateTeam(team7, isCherry, self.tr("7th"))
             self.extraTeamView5.updateSummoners(team7["summoners"],
-                                                 ratingList=rl7)
+                                                 ratingList=rl7,
+                                                 subjectPuuid=self._subjectPuuid)
 
             self.extraTeamView6.updateTeam(team8, isCherry, self.tr("8th"))
             self.extraTeamView6.updateSummoners(team8["summoners"],
-                                                 ratingList=rl8)
+                                                 ratingList=rl8,
+                                                 subjectPuuid=self._subjectPuuid)
 
     def __getTeamRating(self, gameId, winField):
         """查询评级缓存, 返回对应队伍 (胜方/败方) 的全队 5 档评级列表.
@@ -470,13 +515,18 @@ class GameDetailView(QFrame):
         except Exception:
             return None
 
-    def _showAnalysis(self):
+    def isAnalysisVisible(self) -> bool:
+        return self.outerStack.currentIndex() == 1
+
+    def showAnalysis(self, preserveTab: bool = False):
         logger.info("GameAnalysis: _showAnalysis called, _game=%s" % (self._game is not None), TAG)
         if not self._game:
             logger.warning("GameAnalysis: self._game is None", TAG)
             return
         try:
-            self.analysisPage.loadGame(self._game)
+            self.analysisPage.loadGame(
+                self._game, preserveTab=preserveTab,
+                subjectPuuid=getattr(self, "_subjectPuuid", None))
             self.outerStack.setCurrentIndex(1)
         except Exception as e:
             logger.error(f"GameAnalysis: page failed: {e}", TAG)
@@ -756,7 +806,7 @@ class TeamView(QFrame, ColorChangeable):
         self.slash1.setText("/")
         self.slash2.setText("/")
 
-    def updateSummoners(self, summoners, ratingList=None):
+    def updateSummoners(self, summoners, ratingList=None, subjectPuuid=None):
         for i in reversed(range(self.summonersLayout.count())):
             item = self.summonersLayout.itemAt(i)
             self.summonersLayout.removeItem(item)
@@ -773,7 +823,9 @@ class TeamView(QFrame, ColorChangeable):
 
         for summoner in summoners:
             ratingInfo = ratingMap.get(summoner.get('puuid'))
-            infoBar = SummonerInfoBar(summoner, ratingInfo=ratingInfo)
+            infoBar = SummonerInfoBar(
+                summoner, ratingInfo=ratingInfo,
+                subjectPuuid=subjectPuuid)
 
             self.summonersLayout.addWidget(infoBar, stretch=1)
 
@@ -816,7 +868,7 @@ class BansFlyoutView(FlyoutViewBase):
 
 class SummonerInfoBar(QFrame):
     def __init__(self, summoner, parent=None,
-                 ratingInfo=None):
+                 ratingInfo=None, subjectPuuid=None):
         super().__init__(parent)
         # self._pressedBackgroundColor = self._hoverBackgroundColor
 
@@ -849,6 +901,7 @@ class SummonerInfoBar(QFrame):
         self.csLabel = QLabel()
         self.goldLabel = QLabel()
         self.demageLabel = QLabel()
+        self.encounterBadge = makeEncounterBadge(summoner, subjectPuuid)
 
         # 海克斯大乱斗: 强化图标行 (仅 queueId=2400 时有数据)
         augmentIds = summoner.get("augmentIds") or []
@@ -977,6 +1030,9 @@ class SummonerInfoBar(QFrame):
         self.hBoxLayout.addWidget(self.levelLabel)
         self.hBoxLayout.addWidget(self.championIconLabel)
         self.hBoxLayout.addWidget(self.summonerName, alignment=Qt.AlignVCenter)
+        if self.encounterBadge:
+            self.hBoxLayout.addSpacing(5)
+            self.hBoxLayout.addWidget(self.encounterBadge)
         # 全队 5 档评级徽章: 紧跟召唤师名右侧 (每个玩家都显示)
         if self.gradeBadge:
             self.hBoxLayout.addSpacing(6)
@@ -1287,6 +1343,7 @@ class SearchInterface(SeraphineInterface):
 
         self.detailViewLoadTask = None
         self.loadingGameId = 0
+        self._encounterIndexTasks = {}
 
         self.loadFirstPageLock = asyncio.Lock()
 
@@ -1431,7 +1488,10 @@ class SearchInterface(SeraphineInterface):
                     if games is None:
                         self.gamesView.setLoadingPageEnable(False)
                         return False
-                    games = await parseGamesDataConcurrently(games['games'], self.puuid)
+                    raw_games = games.get('games') or []
+                    self.__scheduleEncounterIndex(self.puuid, raw_games)
+                    games = await parseGamesDataConcurrently(
+                        raw_games, self.puuid)
 
                 if len(games) == 0:
                     self.gamesView.gamesTab.nextButton.setVisible(False)
@@ -1586,6 +1646,8 @@ class SearchInterface(SeraphineInterface):
         if tab is cur:
             return
 
+        keepAnalysis = self.gamesView.gameDetailView.isAnalysisVisible()
+        self.loadingGameId = tab.gameId
         self.gamesView.gameDetailView.clear()
 
         tab.setProperty("selected", True)
@@ -1596,32 +1658,86 @@ class SearchInterface(SeraphineInterface):
             cur.style().polish(cur)
 
         tabs.currentTabSelected = tab
-        self.loadingGameId = tab.gameId
-        await self.updateGameDetailView(tab.gameId, self.puuid)
+        await self.updateGameDetailView(
+            tab.gameId, self.puuid, showAnalysis=keepAnalysis)
 
-    async def updateGameDetailView(self, gameId, puuid):
+    def _isCurrentDetailRequest(self, gameId, puuid) -> bool:
+        return isCurrentDetailRequest(
+            gameId, puuid, self.loadingGameId, self.puuid)
+
+    def __scheduleEncounterIndex(self, puuid, games):
+        if not puuid or not games:
+            return
+        running = self._encounterIndexTasks.get(puuid)
+        if running and not running.done():
+            return
+
+        async def run():
+            try:
+                await indexEncountersForGames(games, puuid)
+            except Exception as e:
+                logger.warning(
+                    f"encounter index failed for {puuid}: "
+                    f"{type(e).__name__}: {e}", TAG)
+            if self.puuid == puuid and self.gamesView.gameDetailView._game:
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, self.__refreshEncounterMarks)
+
+        self._encounterIndexTasks[puuid] = asyncio.create_task(run())
+
+    def __refreshEncounterMarks(self):
+        detail_view = self.gamesView.gameDetailView
+        game = detail_view._game
+        if game and self.puuid:
+            detail_view.updateGame(game, subjectPuuid=self.puuid)
+
+    async def openGameDetailForPuuid(self, gameId, puuid,
+                                     summonerName=""):
+        """Open one match in the current search view for a known puuid."""
+        if not gameId or not puuid:
+            return False
+        if summonerName:
+            self.searchLineEdit.setText(summonerName)
+        self.filterComboBox.setCurrentIndex(0)
+        if not await self.searchAndShowFirstPage(puuid=puuid, force=True):
+            return False
+
+        self.loadingGameId = gameId
+        self.waitingForDrawSelect(gameId)
+        await self.updateGameDetailView(gameId, puuid)
+        return True
+
+    async def updateGameDetailView(self, gameId, puuid,
+                                   showAnalysis: bool = False):
+        self.loadingGameId = gameId
+        detailView = self.gamesView.gameDetailView
         # if cfg.get(cfg.showTierInGameInfo):
-        if True:
-            self.gamesView.gameDetailView.setLoadingPageEnabled(True)
+        detailView.setLoadingPageEnabled(True)
 
         # NOTE self.detailViewLoadTask 用于标记详情正在加载, self.loadGame会为其让行 -- By Hpero4
         self.detailViewLoadTask = asyncio.create_task(
             connector.getGameDetailByGameId(gameId))
         game = await self.detailViewLoadTask
 
+        if not self._isCurrentDetailRequest(gameId, puuid):
+            return
+
         # LCU 未就绪时 @retry 统一拦截 ReferenceError 并返回 None
         # (已通过 signalBus.lcuNotConnected 发射统一提示)
         if game is None:
             # 尝试从缓存读取
             cached = await connector.getGameDetailCached(gameId)
+            if not self._isCurrentDetailRequest(gameId, puuid):
+                return
             if cached:
                 game = cached
-                self.gamesView.gameDetailView.setLoadingPageEnabled(False)
+                detailView.setLoadingPageEnabled(False)
                 # 直接从缓存显示
-                self.gamesView.gameDetailView.updateGame(cached)
+                detailView.updateGame(cached, subjectPuuid=puuid)
+                if showAnalysis:
+                    detailView.showAnalysis(preserveTab=True)
                 return
-            if True:
-                self.gamesView.gameDetailView.setLoadingPageEnabled(False)
+            detailView.setLoadingPageEnabled(False)
             return
 
         # 加载GameDetail的过程中, 切换了搜索对象(self.puuid变更), 将后续任务pass -- By Hpero4
@@ -1629,6 +1745,9 @@ class SearchInterface(SeraphineInterface):
             self.detailViewLoadTask = asyncio.create_task(
                 parseGameDetailData(puuid, game))
             game = await self.detailViewLoadTask
+
+            if not self._isCurrentDetailRequest(gameId, puuid):
+                return
 
             # 全队 5 档评级: 点进战绩详情时自动诊断 (不依赖插件运行)
             # 缓存未命中, 或缺少 winnerRating/loserRating 字段 (旧版本写入) 时重新诊断
@@ -1645,11 +1764,15 @@ class SearchInterface(SeraphineInterface):
                         game, puuid, gameId,
                         ratingStyle=ratingStyle)
 
-            self.gamesView.gameDetailView.updateGame(game)
+            if not self._isCurrentDetailRequest(gameId, puuid):
+                return
 
-        # if cfg.get(cfg.showTierInGameInfo):
-        if True:
-            self.gamesView.gameDetailView.setLoadingPageEnabled(False)
+            detailView.updateGame(game, subjectPuuid=puuid)
+            if showAnalysis:
+                detailView.showAnalysis(preserveTab=True)
+
+        if self._isCurrentDetailRequest(gameId, puuid):
+            detailView.setLoadingPageEnabled(False)
 
     @asyncSlot(int)
     async def __onFilterComboxChanged(self, index):

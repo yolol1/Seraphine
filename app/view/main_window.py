@@ -43,6 +43,7 @@ from app.common.signals import signalBus
 from app.components.message_box import (UpdateMessageBox, NoticeMessageBox,
                                         WaitingForLolMessageBox, ExceptionMessageBox,
                                         ChangeDpiMessageBox)
+from app.components.encounter_history_dialog import EncounterHistoryDialog
 from app.lol.exceptions import (SummonerGamesNotFound, RetryMaximumAttempts,
                                 SummonerNotFound, SummonerNotInGame, SummonerRankInfoNotFound)
 from app.lol.listener import (LolProcessExistenceListener, StoppableThread)
@@ -162,6 +163,7 @@ class MainWindow(FluentWindow):
         self._accept_task = None
         self._accepted_this_ready_check = False
         self._user_declined_this_session = False
+        self._clientRestartInProgress = False
 
         # 海克斯辅助: 游戏内 3 秒轮询 Live Client API 采集已选强化
         self.hextechAssistTimer = QTimer(self)
@@ -231,6 +233,8 @@ class MainWindow(FluentWindow):
             # 战绩/段位数据因 LCU 不可用而为空, parseSummonerData 已有容错)
             try:
                 self.careerInterface.setLoginSummonerPuuid(
+                    self.currentSummoner.get('puuid'))
+                self.gameInfoInterface.setViewerPuuid(
                     self.currentSummoner.get('puuid'))
                 # 同步设置 loading 状态以立即 UI 反馈
                 self.careerInterface.setLoadingPageEnabled(True)
@@ -330,6 +334,16 @@ class MainWindow(FluentWindow):
         )
 
         self.navigationInterface.addItem(
+            routeKey='RestartClient',
+            icon=Icon.ARROWREPEAT,
+            text=self.tr("重启客户端"),
+            onClick=self.__onRestartClientButtonClicked,
+            selectable=False,
+            position=pos,
+            tooltip=self.tr("对局结束后仍卡在游戏界面时，一键热重启客户端"),
+        )
+
+        self.navigationInterface.addItem(
             routeKey='Notice',
             icon=Icon.ALERT,
             text=self.tr("Notice"),
@@ -392,6 +406,8 @@ class MainWindow(FluentWindow):
         # From search_interface and gameinfo_interface
         signalBus.toSearchInterface.connect(self.__switchToSearchInterface)
         signalBus.toCareerInterface.connect(self.__switchToCareerInterface)
+        signalBus.encounterHistoryRequested.connect(
+            self.__onEncounterHistoryRequested)
         self.gameInfoInterface.manualSendHorseReport.connect(
             self.__onManualSendHorseReport)
         # 对局信息页"刷新"按钮: 战绩服务故障恢复后手动重拉
@@ -631,6 +647,8 @@ class MainWindow(FluentWindow):
         careerAction = Action(Icon.PERSON, self.tr("Career"), self)
         searchAction = Action(Icon.SEARCH, self.tr("Search 👀"), self)
         gameInfoAction = Action(Icon.GAME, self.tr("Game Information"), self)
+        restartClientAction = Action(
+            Icon.ARROWREPEAT, self.tr("重启客户端"), self)
         settingsAction = Action(Icon.SETTING, self.tr("Settings"), self)
         quitAction = Action(Icon.EXIT, self.tr('Quit'), self)
 
@@ -648,6 +666,9 @@ class MainWindow(FluentWindow):
             lambda: showAndSwitch(self.searchInterface))
         gameInfoAction.triggered.connect(
             lambda: showAndSwitch(self.gameInfoInterface))
+        restartClientAction.triggered.connect(
+            lambda: asyncio.ensure_future(
+                self.__onRestartClientButtonClicked()))
         settingsAction.triggered.connect(
             lambda: showAndSwitch(self.settingInterface))
         quitAction.triggered.connect(quit)
@@ -658,6 +679,7 @@ class MainWindow(FluentWindow):
         self.trayMenu.addAction(searchAction)
         self.trayMenu.addAction(gameInfoAction)
         self.trayMenu.addSeparator()
+        self.trayMenu.addAction(restartClientAction)
         self.trayMenu.addAction(settingsAction)
         self.trayMenu.addAction(quitAction)
 
@@ -689,6 +711,7 @@ class MainWindow(FluentWindow):
         self.currentSummoner = summoner
         name = summoner.get("gameName") or summoner['displayName']
         self.careerInterface.setLoginSummonerPuuid(summoner['puuid'])
+        self.gameInfoInterface.setViewerPuuid(summoner.get('puuid'))
 
         # 同步设置 loading 状态以立即 UI 反馈
         self.careerInterface.setLoadingPageEnabled(True)
@@ -909,6 +932,7 @@ class MainWindow(FluentWindow):
     async def __onCurrentSummonerProfileChanged(self, data: dict):
         self.currentSummoner = data
         self.__cacheCurrentSummoner(data)
+        self.gameInfoInterface.setViewerPuuid(data.get('puuid'))
 
         await asyncio.gather(self.__updateAvatarIconName(),
                              self.careerInterface.updateNameIconExp(data))
@@ -1069,6 +1093,39 @@ class MainWindow(FluentWindow):
         # 同步设置 loading 状态以立即 UI 反馈
         self.careerInterface.setLoadingPageEnabled(True)
         await self.careerInterface.updateInterface(puuid=puuid)
+
+    @asyncSlot(str, str, str)
+    async def __onEncounterHistoryRequested(self, subject_puuid,
+                                            player_puuid, player_name):
+        if not subject_puuid or not player_puuid:
+            return
+        dialog = EncounterHistoryDialog(
+            subject_puuid, player_puuid, player_name,
+            parent=self.window())
+        if not dialog.exec() or not dialog.selectedGameId:
+            return
+        await self.__openEncounterGame(
+            dialog.selectedGameId, subject_puuid)
+
+    async def __openEncounterGame(self, game_id, subject_puuid):
+        """Open a shared match while keeping the encounter subject."""
+        summoner_name = ""
+        try:
+            summoner = await connector.getSummonerByPuuid(subject_puuid)
+        except Exception as e:
+            logger.warning(
+                f"open encounter game summoner lookup failed: {e}", TAG)
+            summoner = None
+        if summoner:
+            name = summoner.get("gameName") or summoner.get("displayName")
+            tag_line = summoner.get("tagLine")
+            if name:
+                summoner_name = (
+                    f"{name}#{tag_line}" if tag_line else str(name))
+
+        self.checkAndSwitchTo(self.searchInterface)
+        await self.searchInterface.openGameDetailForPuuid(
+            game_id, subject_puuid, summoner_name)
 
     @asyncSlot(str)
     async def __onGameStatusChanged(self, status):
@@ -2394,6 +2451,57 @@ class MainWindow(FluentWindow):
     async def __onFixLCUButtonClicked(self):
         if self.isClientProcessRunning:
             await connector.playAgain()
+
+    @asyncSlot()
+    async def __onRestartClientButtonClicked(self):
+        """主界面/托盘快捷重启: 无需进入辅助功能页。"""
+        if self._clientRestartInProgress:
+            return
+        if not self.isClientProcessRunning or connector.lcuSess is None:
+            InfoBar.warning(
+                "",
+                self.tr("客户端未连接，无法发送重启请求"),
+                duration=3000,
+                parent=self,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+            )
+            return
+
+        self._clientRestartInProgress = True
+        try:
+            # LCU 卡死时该请求也可能长期无响应，不能让它无限挂住按钮。
+            response = await asyncio.wait_for(
+                connector.restartClient(), timeout=8)
+            if response.status >= 400:
+                raise RuntimeError(f"HTTP {response.status}")
+            logger.info("Client hot restart requested from quick action", TAG)
+            InfoBar.success(
+                "",
+                self.tr("重启请求已发送，客户端将在几秒后恢复"),
+                duration=4000,
+                parent=self,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Client hot restart request timed out", TAG)
+            InfoBar.error(
+                "",
+                self.tr("重启请求超时，请稍后重试或在工具页手动重启"),
+                duration=5000,
+                parent=self,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+            )
+        except Exception as e:
+            logger.warning(f"Client hot restart failed: {e}", TAG)
+            InfoBar.error(
+                "",
+                self.tr("重启失败，请稍后重试"),
+                duration=5000,
+                parent=self,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+            )
+        finally:
+            self._clientRestartInProgress = False
 
     def exceptHook(self, ty, value, tb):
         tracebackFormat = traceback.format_exception(ty, value, tb)
