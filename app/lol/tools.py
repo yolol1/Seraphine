@@ -439,6 +439,9 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
 
     cherryResult = None
     win = None
+    remake = False
+    fallbackWin = None
+    fallbackRemake = False
 
     for team in game.get('teams') or []:
         teamId = team['teamId']
@@ -488,6 +491,9 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
 
                     if queueId == 1700:
                         cherryResult = subteamPlacement
+                elif fallbackWin is None:
+                    fallbackWin = stats['win']
+                    fallbackRemake = stats['gameEndedInEarlySurrender']
 
                 championId = summoner['championId']
                 championIcon = await connector.getChampionIcon(championId)
@@ -643,6 +649,17 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
                 break
 
     mapIcon = connector.manager.getMapIconByMapId(mapId, win)
+
+    if win is None:
+        # Encounter history can open a match for a PUUID that is no longer
+        # present in the detail payload. The match itself is still usable;
+        # fall back to the first participant's result instead of blanking
+        # the whole detail view.
+        logger.error(
+            f"game detail {game.get('gameId')} does not contain the selected "
+            "player; using first participant result", "tools")
+        win = fallbackWin
+        remake = fallbackRemake
 
     if win is None:
         return None
