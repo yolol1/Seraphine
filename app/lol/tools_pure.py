@@ -53,6 +53,28 @@ def secsToStr(secs):
     return time.strftime("%M:%S", time.gmtime(secs))
 
 
+_GAME_MODE_QUEUE_IDS = {
+    "ARAM": 450,
+    "CHERRY": 1700,
+    "KIWI": 2400,
+}
+
+
+def resolveGameQueueId(game: dict) -> int:
+    """Resolve a queue id from complete or partial match-detail payloads."""
+    for key in ("queueId", "gameQueueConfigId"):
+        value = game.get(key)
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+
+    game_mode = str(game.get("gameMode") or "").strip().upper()
+    return _GAME_MODE_QUEUE_IDS.get(game_mode, 0)
+
+
 def separateTeams(data, currentSummonerId):
     # 防御: gameData 可能缺失 teamOne/teamTwo (LCU 竞态), 缺失视为空队伍
     team1 = data.get('teamOne') or []

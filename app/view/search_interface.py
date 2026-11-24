@@ -1749,6 +1749,10 @@ class SearchInterface(SeraphineInterface):
             if not self._isCurrentDetailRequest(gameId, puuid):
                 return
 
+            if game is None:
+                detailView.setLoadingPageEnabled(False)
+                return
+
             # 全队 5 档评级: 点进战绩详情时自动诊断 (不依赖插件运行)
             # 缓存未命中, 或缺少 winnerRating/loserRating 字段 (旧版本写入) 时重新诊断
             if cfg.get(cfg.enableTeamRating):

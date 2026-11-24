@@ -18,6 +18,7 @@ from .tools_pure import (
     timeStampToStr,
     timeStampToShortStr,
     secsToStr,
+    resolveGameQueueId,
     separateTeams,
     sortedSummonersByGameRole,
     parseGames,
@@ -387,15 +388,21 @@ async def parseGameData(game, puuid=None) -> GameSummary:
 
 
 async def parseGameDetailData(puuid, game) -> GameDetail:
-    queueId = game['queueId']
-    mapId = game['mapId']
+    queueId = resolveGameQueueId(game)
+    mapId = game.get('mapId')
 
     names = connector.manager.getNameMapByQueueId(queueId)
     modeName = names['name']
     if queueId != 0:
-        mapName = names['map']
+        mapName = names.get('map') or \
+            connector.manager.getMapNameById(mapId)
     else:
         mapName = connector.manager.getMapNameById(mapId)
+        if game.get('queueId') is None:
+            modeName = game.get('gameMode') or modeName
+            logger.warning(
+                f"game detail {game.get('gameId')} has no queueId; "
+                f"using queue 0 ({modeName})", "tools")
 
     def origTeam(teamId):
         return {
@@ -433,7 +440,7 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
     cherryResult = None
     win = None
 
-    for team in game['teams']:
+    for team in game.get('teams') or []:
         teamId = team['teamId']
 
         if teamId == 0:
@@ -451,7 +458,7 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
         teams[teamId]['towerKills'] = team['towerKills']
         teams[teamId]['inhibitorKills'] = team['inhibitorKills']
 
-    for participant in game['participantIdentities']:
+    for participant in game.get('participantIdentities') or []:
         participantId = participant['participantId']
         summonerName = participant['player'].get(
             'gameName') or participant['player'].get('summonerName')  # 兼容外服
@@ -464,7 +471,7 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
             t = await connector.getSummonerByPuuid(summonerPuuid)
             isPublic = t.get("privacy") == "PUBLIC"
 
-        for summoner in game['participants']:
+        for summoner in game.get('participants') or []:
             if summoner['participantId'] == participantId:
                 stats = summoner['stats']
 
