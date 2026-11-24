@@ -384,6 +384,8 @@ class GameDetailView(QFrame):
 
     def updateGame(self, game, subjectPuuid=None):
         if not game:
+            logger.error(
+                "GameDetailView.updateGame received an empty detail", TAG)
             InfoBar.error(self.tr("Get game infomation failed"),
                           self.tr("The server returned abnormal content."),
                           orient=Qt.Vertical,
@@ -1745,8 +1747,11 @@ class SearchInterface(SeraphineInterface):
             return
 
         if not isGameDetailPayload(game):
-            logger.warning(
-                f"game detail {gameId} returned no usable match payload", TAG)
+            payload_keys = (sorted(game.keys())
+                            if isinstance(game, dict) else None)
+            logger.error(
+                f"game detail {gameId} returned no usable match payload "
+                f"(type={type(game).__name__}, keys={payload_keys})", TAG)
             if cached_detail:
                 if showAnalysis:
                     detailView.showAnalysis(preserveTab=True)
@@ -1771,7 +1776,7 @@ class SearchInterface(SeraphineInterface):
                 return
 
             if game is None:
-                logger.warning(
+                logger.error(
                     f"game detail {gameId} could not be parsed for {puuid}",
                     TAG)
                 if cached_detail:

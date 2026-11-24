@@ -3,6 +3,7 @@ import sqlite3
 
 from app.lol.encounters import (
     encounter_game_from_raw,
+    game_id_signal_value,
 )
 from app.lol.persistent_cache import PersistentCache
 
@@ -76,6 +77,19 @@ def test_raw_game_normalization_recognizes_ally_and_enemy():
         "Alpha", "Beta", "Gamma"]
     assert game["participants"][1]["teamId"] == 100
     assert game["participants"][2]["teamId"] == 200
+
+
+def test_encounter_row_game_id_round_trip_does_not_truncate():
+    game_id = 901144181699
+    low_32 = game_id & 0xFFFFFFFF
+    signed_32 = low_32 - (1 << 32) if low_32 >= (1 << 31) else low_32
+
+    signal_value = game_id_signal_value(game_id)
+
+    assert signal_value == "901144181699"
+    assert int(signal_value) == game_id
+    assert signed_32 == -798950461
+    assert signal_value != str(signed_32)
 
 
 def test_cache_marks_both_teammates_and_opponents(tmp_path):

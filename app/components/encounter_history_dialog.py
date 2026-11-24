@@ -7,11 +7,14 @@ from PyQt5.QtWidgets import (
 from app.common.qfluentwidgets import (
     MessageBoxBase, TitleLabel, isDarkTheme,
 )
+from app.lol.encounters import game_id_signal_value, normalize_game_id
 from app.lol.persistent_cache import cache
 
 
 class _EncounterGameRow(QFrame):
-    selected = pyqtSignal(int)
+    # LoL game IDs exceed 32-bit range. Emitting them as `int` lets Qt
+    # truncate the value (e.g. 901144181699 -> -798950461).
+    selected = pyqtSignal(str)
 
     def __init__(self, item: dict, parent=None):
         super().__init__(parent)
@@ -89,7 +92,7 @@ class _EncounterGameRow(QFrame):
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.selected.emit(self._game_id)
+            self.selected.emit(game_id_signal_value(self._game_id))
         super().mouseReleaseEvent(event)
 
 
@@ -227,8 +230,8 @@ class EncounterHistoryDialog(MessageBoxBase):
         scroll.setWidget(content)
         self.viewLayout.addWidget(scroll, 1)
 
-    def _select_game(self, game_id: int):
-        self.selectedGameId = int(game_id)
+    def _select_game(self, game_id: str):
+        self.selectedGameId = normalize_game_id(game_id)
         self.accept()
 
 

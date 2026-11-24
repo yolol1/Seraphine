@@ -18,6 +18,11 @@ def normalize_game_id(value):
         return value
 
 
+def game_id_signal_value(value) -> str:
+    """Encode large match IDs so Qt cannot truncate them to 32-bit ints."""
+    return str(normalize_game_id(value))
+
+
 def _format_duration(seconds) -> str:
     try:
         seconds = max(0, int(seconds or 0))
