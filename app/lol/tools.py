@@ -1494,6 +1494,7 @@ class ChampionSelection:
         self.isSummonerSpellSetted = False
         self.isChampionShowed = False
         self.isChampionBanned = False
+        self.autoBanLock = asyncio.Lock()
         self.isChampionPicked = False
         self.isChampionPickedCompleted = False
         self.isSkinPicked = False
@@ -1939,6 +1940,58 @@ async def autoComplete(data, selection: ChampionSelection):
     return True
 
 
+def _findInProgressBanAction(data, localPlayerCellId):
+    for actionGroup in data.get('actions') or []:
+        for action in actionGroup or []:
+            if (action.get('actorCellId') == localPlayerCellId
+                    and action.get('type') == 'ban'
+                    and action.get('isInProgress')):
+                return action
+    return None
+
+
+def _getAvailableAutoBanCandidates(data):
+    localPlayerCellId = data.get('localPlayerCellId')
+    myTeam = data.get('myTeam') or []
+    player = next(
+        (x for x in myTeam if x.get('cellId') == localPlayerCellId), None)
+    pos = player.get('assignedPosition') if player else None
+
+    if pos == 'top':
+        candidates = deepcopy(cfg.get(cfg.autoBanChampionTop))
+    elif pos == 'jungle':
+        candidates = deepcopy(cfg.get(cfg.autoBanChampionJug))
+    elif pos == 'middle':
+        candidates = deepcopy(cfg.get(cfg.autoBanChampionMid))
+    elif pos == 'bottom':
+        candidates = deepcopy(cfg.get(cfg.autoBanChampionBot))
+    elif pos == 'utility':
+        candidates = deepcopy(cfg.get(cfg.autoBanChampionSup))
+    else:
+        candidates = []
+
+    candidates.extend(cfg.get(cfg.autoBanChampion) or [])
+
+    # 双方 ban 每次都重新从最新会话计算; set 也能避免一次性迭代器
+    # 在过滤多个候选时被提前耗尽.
+    banData = data.get('bans') or {}
+    unavailable = set(banData.get('myTeamBans') or [])
+    unavailable.update(banData.get('theirTeamBans') or [])
+
+    if cfg.get(cfg.pretentBan):
+        # 同一帧里队友可能仍在预选, 除 pickIntent 外也把已经拿到的
+        # championId 视为不可 ban.
+        for teammate in myTeam:
+            unavailable.add(teammate.get('championPickIntent') or 0)
+            unavailable.add(teammate.get('championId') or 0)
+
+    available = []
+    for championId in candidates:
+        if championId and championId not in unavailable and championId not in available:
+            available.append(championId)
+    return available
+
+
 async def autoBan(data, selection: ChampionSelection):
     """
     自动禁用英雄
@@ -1948,58 +2001,50 @@ async def autoBan(data, selection: ChampionSelection):
     if not isAutoBan or selection.isChampionBanned:
         return
 
-    localPlayerCellId = data['localPlayerCellId']
-    for actionGroup in data['actions']:
-        for action in actionGroup:
-            if (action["actorCellId"] == localPlayerCellId
-                    and action['type'] == 'ban'
-                    and action["isInProgress"]):
+    # ChampSelect WS 每帧都会启动一个 asyncSlot; 串行化后, 排队中的
+    # 后续任务只需看到 isChampionBanned 即可退出, 不会重复 PATCH.
+    async with selection.autoBanLock:
+        if (not cfg.get(cfg.enableAutoBanChampion)
+                or selection.isChampionBanned):
+            return
 
-                pos = next(
-                    filter(lambda x: x['cellId'] == localPlayerCellId, data['myTeam']), None)
-                pos = pos.get('assignedPosition')
+        localPlayerCellId = data.get('localPlayerCellId')
+        if _findInProgressBanAction(data, localPlayerCellId) is None:
+            return
 
-                if pos == 'top':
-                    candidates = deepcopy(cfg.get(cfg.autoBanChampionTop))
-                elif pos == 'jungle':
-                    candidates = deepcopy(cfg.get(cfg.autoBanChampionJug))
-                elif pos == 'middle':
-                    candidates = deepcopy(cfg.get(cfg.autoBanChampionMid))
-                elif pos == 'bottom':
-                    candidates = deepcopy(cfg.get(cfg.autoBanChampionBot))
-                elif pos == 'utility':
-                    candidates = deepcopy(cfg.get(cfg.autoBanChampionSup))
-                else:
-                    candidates = []
+        # 给队友一点预选的时间
+        await asyncio.sleep(cfg.get(cfg.autoBanDelay))
 
-                candidates.extend(cfg.get(cfg.autoBanChampion))
+        rejected = set()
+        while not selection.isChampionBanned:
+            # 等待期间队友可能已经 ban 掉首选, 必须基于最新会话重新选.
+            data = await connector.getChampSelectSession()
+            if not data:
+                return False
 
-                bans = itertools.chain(data["bans"]['myTeamBans'],
-                                       data["bans"]['theirTeamBans'])
-                candidates = [x for x in candidates if x not in bans]
+            localPlayerCellId = data.get('localPlayerCellId')
+            action = _findInProgressBanAction(data, localPlayerCellId)
+            if action is None:
+                return False
 
-                # 给队友一点预选的时间
-                await asyncio.sleep(cfg.get(cfg.autoBanDelay))
+            candidates = [
+                championId
+                for championId in _getAvailableAutoBanCandidates(data)
+                if championId not in rejected
+            ]
+            if not candidates:
+                return False
 
-                isFriendly = cfg.get(cfg.pretentBan)
-                if isFriendly:
-                    myTeam = (await connector.getChampSelectSession()).get("myTeam")
-
-                    if not myTeam:
-                        return
-
-                    intents = [player["championPickIntent"]
-                               for player in myTeam]
-                    candidates = [x for x in candidates if x not in intents]
-
-                if not candidates:
-                    return
-
-                championId = candidates[0]
-                await connector.banChampion(action['id'], championId, True)
+            championId = candidates[0]
+            if await connector.banChampion(action['id'], championId, True):
                 selection.isChampionBanned = True
-
                 return True
+
+            # LCU 拒绝通常来自队友抢先 ban 或动作状态变化. 将该候选
+            # 排除后重新拉取会话, 继续尝试下一个可用英雄.
+            rejected.add(championId)
+
+        return False
 
 
 async def autoSetSummonerSpell(data, selection: ChampionSelection):

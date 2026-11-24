@@ -1329,7 +1329,7 @@ class LolClientConnector(QObject):
 
     # 禁用英雄
     @retry()
-    async def banChampion(self, actionsId, championId, completed=None) -> bytes:
+    async def banChampion(self, actionsId, championId, completed=None) -> bool:
         data = {
             "championId": championId,
             'type': 'ban',
@@ -1341,7 +1341,18 @@ class LolClientConnector(QObject):
         res = await self.__patch(
             f"/lol-champ-select/v1/session/actions/{actionsId}", data=data)
 
-        return await res.read()
+        if 200 <= res.status < 300:
+            await res.read()
+            return True
+
+        try:
+            body = (await res.text())[:200]
+        except Exception:
+            body = ""
+        logger.warning(
+            f"banChampion {championId} rejected: status={res.status} body={body}",
+            TAG)
+        return False
 
     @retry()
     async def getSummonerById(self, summonerId) -> dict:
