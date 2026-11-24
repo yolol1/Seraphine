@@ -7,28 +7,27 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import (QPixmap, QPainter, QPainterPath, QColor, QFont,
                          QLinearGradient, QPen)
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout,
-                             QLabel, QFrame, QWidget, QSizePolicy,
-                             QSpacerItem, QPushButton)
+                             QLabel, QFrame, QWidget, QSizePolicy)
 
-from app.common.qfluentwidgets import (isDarkTheme, SmoothScrollArea)
+from app.common.qfluentwidgets import (
+    PushButton, SegmentedWidget, SmoothScrollArea, isDarkTheme,
+)
 from app.components.encounter_badge import makeEncounterBadge
+from app.components.grade_badge import GradeBadge
 from app.lol.connector import connector
 from app.lol.persistent_cache import cache as sqlite_cache
 from app.lol.war_criminal_cache import getVerdict
 from app.lol.war_criminal_ui import METRIC_NAMES
 
 
-# ── Design Tokens ──────────────────────────────────────────
+# ── Semantic Colors ────────────────────────────────────────
 
-_DARK_BG = '#07111D'
-_PANEL_BG = '#101D2C'
-_CARD_BG = '#162739'
+# Team/result colors stay semantic. Surface, border and typography colors are
+# owned by the SearchInterface QSS so the analysis page follows the app theme.
 _BLUE = '#2EA7FF'
 _RED = '#E6525B'
 _GOLD = '#F5C35B'
-_TEXTP = '#FFFFFF'
-_TEXTS = '#B0B8C4'
-_BORDER = 'rgba(255,255,255,0.08)'
+_MUTED_ACCENT = '#8B97A5'
 
 _SCORE_COLORS = [
     (1.0, _GOLD),   # z≥1.0 gold (grade 1)
@@ -135,9 +134,15 @@ def _buildInsights(bluePlayers: list, redPlayers: list) -> list:
             continue
         seen.add(key)
         if z >= 1.5:
-            insights.append(f"🟢 {name}({team_label}) {metric} z={z:+.1f}")
+            insights.append({
+                "tone": "positive",
+                "text": f"{name} · {team_label}队 · {metric} z={z:+.1f}",
+            })
         elif z <= -1.5:
-            insights.append(f"🔴 {name}({team_label}) {metric} z={z:+.1f}")
+            insights.append({
+                "tone": "negative",
+                "text": f"{name} · {team_label}队 · {metric} z={z:+.1f}",
+            })
     return insights
 
 
@@ -173,19 +178,7 @@ def _teamRadarVals(players: list, pool: list = None) -> list:
 
 _TEAM_RADAR_LABELS = ['输出', '承伤', '经济', '控制', '视野', '参团']
 
-# ── Tab Utilities ──────────────────────────────────────────
-
 _TAB_NAMES = ['总览', '数据', '经济', '符文', '装备', '时间线']
-
-def _tabStyle(dark: bool, active: bool) -> str:
-    font = "'Segoe UI', 'Microsoft YaHei'"
-    color = '#2EA7FF' if active else ('#8B95A5' if dark else '#888')
-    bg = 'rgba(46, 167, 255, 0.12)' if (active and dark) else \
-         'rgba(46, 167, 255, 0.10)' if active else 'transparent'
-    return (
-        f"font-family: {font}; font-size: 12px; font-weight: bold; "
-        f"color: {color}; background: {bg}; "
-        f"border-radius: 4px; padding: 2px 10px;")
 
 
 def _smallIcon(path: str, size: int = 18) -> QLabel:
@@ -213,6 +206,15 @@ def _formatTimestamp(timestampMs) -> str:
     except (TypeError, ValueError):
         return "--:--"
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def _event_tone(accent: str) -> str:
+    return {
+        _BLUE: "blue",
+        _RED: "red",
+        _GOLD: "gold",
+        '#00D4AA': "positive",
+    }.get(accent, "neutral")
 
 
 def _asInt(value, default=0) -> int:
@@ -355,7 +357,7 @@ def _timelineEvents(timeline: dict, gameData: dict) -> list:
         for event in frame.get('events', []) or []:
             eventType = event.get('type')
             text = ""
-            accent = _TEXTS
+            accent = _MUTED_ACCENT
             if eventType == 'CHAMPION_KILL':
                 killer = name(event.get('killerId'))
                 victim = name(event.get('victimId'))
@@ -394,16 +396,13 @@ def _timelineEvents(timeline: dict, gameData: dict) -> list:
     return result
 
 
-def _statLabel(text, width=None, color=None, bold=False):
-    dark = isDarkTheme()
+def _statLabel(text, width=None, bold=False):
     label = QLabel(str(text))
     if width is not None:
         label.setFixedWidth(width)
     label.setAlignment(Qt.AlignCenter)
-    label.setStyleSheet(
-        f"color: {color or (_TEXTP if dark else '#222')};"
-        f"font: {'bold ' if bold else ''}12px 'Microsoft YaHei UI', 'Segoe UI';"
-        "background: transparent;")
+    label.setProperty(
+        "analysisRole", "tableHeader" if bold else "tableCell")
     return label
 
 
@@ -413,63 +412,49 @@ class AnalysisStatTable(QFrame):
     def __init__(self, title: str, groups: list, columns: list,
                  subtitle: str = "", parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        panel = _PANEL_BG if dark else '#F0F2F5'
-        border = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(
-            f"AnalysisStatTable {{ background: {panel}; "
-            f"border: 1px solid {border}; border-radius: 10px; }}")
+        self.setProperty("analysisCard", True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 12)
         layout.setSpacing(6)
 
         titleLabel = QLabel(title)
-        titleLabel.setStyleSheet(
-            f"color: {_TEXTP if dark else '#222'}; background: transparent;"
-            "font: bold 17px 'Microsoft YaHei UI', 'Segoe UI';")
+        titleLabel.setProperty("analysisRole", "sectionTitle")
         layout.addWidget(titleLabel)
         if subtitle:
             subtitleLabel = QLabel(subtitle)
-            subtitleLabel.setStyleSheet(
-                f"color: {_TEXTS if dark else '#777'}; background: transparent;"
-                "font: 12px 'Microsoft YaHei UI', 'Segoe UI';")
+            subtitleLabel.setWordWrap(True)
+            subtitleLabel.setProperty("analysisRole", "secondary")
             layout.addWidget(subtitleLabel)
 
         header = QFrame()
         headerLayout = QHBoxLayout(header)
         headerLayout.setContentsMargins(8, 0, 8, 4)
         headerLayout.setSpacing(4)
-        playerHeader = _statLabel("玩家", color=_TEXTS, bold=True)
+        playerHeader = _statLabel("玩家", bold=True)
         playerHeader.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         headerLayout.addWidget(playerHeader, 1)
         for name, width, _ in columns:
-            headerLayout.addWidget(
-                _statLabel(name, width, _TEXTS, bold=True))
+            headerLayout.addWidget(_statLabel(name, width, bold=True))
         layout.addWidget(header)
 
         divider = QFrame()
+        divider.setObjectName("analysisDivider")
         divider.setFixedHeight(1)
-        divider.setStyleSheet(
-            f"background: {border}; border: none;")
         layout.addWidget(divider)
 
         for groupName, players, accent in groups:
+            teamKey = "blue" if accent == _BLUE else "red"
             groupLabel = QLabel(
                 f"{groupName}  ·  {sum(p.get('gold', 0) for p in players):,} 金币")
-            groupLabel.setStyleSheet(
-                f"color: {accent}; background: transparent; padding: 5px 4px 2px 4px;"
-                "font: bold 12px 'Microsoft YaHei UI', 'Segoe UI';")
+            groupLabel.setProperty("analysisRole", "teamLabel")
+            groupLabel.setProperty("analysisTeam", teamKey)
             layout.addWidget(groupLabel)
 
             for index, player in enumerate(players):
                 row = QFrame()
-                rowBg = (
-                    'rgba(255,255,255,0.035)' if dark and index % 2 == 0
-                    else 'rgba(0,0,0,0.025)' if not dark and index % 2 == 0
-                    else 'transparent')
-                row.setStyleSheet(
-                    f"QFrame {{ background: {rowBg}; border-radius: 6px; }}")
+                row.setProperty("analysisTableRow", True)
+                row.setProperty("analysisAlternate", index % 2 == 0)
                 rowLayout = QHBoxLayout(row)
                 rowLayout.setContentsMargins(8, 3, 8, 3)
                 rowLayout.setSpacing(4)
@@ -486,9 +471,7 @@ class AnalysisStatTable(QFrame):
                         24, 24, Qt.KeepAspectRatio, Qt.SmoothTransformation))
                 playerLayout.addWidget(iconLabel)
                 nameLabel = QLabel(player.get('summonerName', '?'))
-                nameLabel.setStyleSheet(
-                    f"color: {_TEXTP if dark else '#222'}; background: transparent;"
-                    "font: bold 12px 'Microsoft YaHei UI', 'Segoe UI';")
+                nameLabel.setProperty("analysisRole", "bodyStrong")
                 playerLayout.addWidget(nameLabel)
                 encounter_badge = makeEncounterBadge(
                     player, player.get("encounterSubjectPuuid"))
@@ -511,47 +494,34 @@ class AnalysisStatTable(QFrame):
 class TimelineEventsView(QFrame):
     def __init__(self, events: list, status: str = "", parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        panel = _PANEL_BG if dark else '#F0F2F5'
-        border = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(
-            f"TimelineEventsView {{ background: {panel}; "
-            f"border: 1px solid {border}; border-radius: 10px; }}")
+        self.setProperty("analysisCard", True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 14)
         layout.setSpacing(6)
         title = QLabel("对局时间线")
-        title.setStyleSheet(
-            f"color: {_TEXTP if dark else '#222'}; background: transparent;"
-            "font: bold 17px 'Microsoft YaHei UI', 'Segoe UI';")
+        title.setProperty("analysisRole", "sectionTitle")
         layout.addWidget(title)
 
         if status:
             statusLabel = QLabel(status)
             statusLabel.setWordWrap(True)
-            statusLabel.setStyleSheet(
-                f"color: {_TEXTS if dark else '#777'}; background: transparent;"
-                "font: 12px 'Microsoft YaHei UI', 'Segoe UI'; padding: 8px 0;")
+            statusLabel.setProperty("analysisRole", "secondary")
             layout.addWidget(statusLabel)
 
         for event in events:
             row = QFrame()
-            row.setStyleSheet(
-                f"QFrame {{ background: {'rgba(255,255,255,0.03)' if dark else 'rgba(0,0,0,0.025)'};"
-                "border-radius: 6px; }}")
+            row.setProperty("analysisEventRow", True)
             rowLayout = QHBoxLayout(row)
             rowLayout.setContentsMargins(8, 4, 8, 4)
             rowLayout.setSpacing(10)
             timeLabel = QLabel(event['time'])
             timeLabel.setFixedWidth(48)
-            timeLabel.setStyleSheet(
-                f"color: {_TEXTS if dark else '#777'}; background: transparent;"
-                "font: bold 12px Consolas, monospace;")
+            timeLabel.setProperty("analysisRole", "time")
             textLabel = QLabel(event['text'])
-            textLabel.setStyleSheet(
-                f"color: {event['accent'] if dark else '#31566f'};"
-                "background: transparent; font: 12px 'Microsoft YaHei UI';")
+            textLabel.setProperty("analysisRole", "eventText")
+            textLabel.setProperty(
+                "analysisEventTone", _event_tone(event.get('accent')))
             rowLayout.addWidget(timeLabel)
             rowLayout.addWidget(textLabel, 1)
             layout.addWidget(row)
@@ -619,72 +589,58 @@ class HexagonScore(QWidget):
 # ── PlayerCard ─────────────────────────────────────────────
 
 class PlayerCard(QFrame):
-    """Player card with spells, rune, items, and score hexagon."""
+    """Compact player row matching the existing match-detail hierarchy."""
+
     def __init__(self, data: dict, teamTotals: dict, parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        font = "'Segoe UI', 'Microsoft YaHei'"
-        bg = _CARD_BG if dark else '#E8ECF0'
-        border = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(f"""
-            PlayerCard {{
-                background: {bg}; border: 1px solid {border};
-                border-radius: 8px;
-            }}
-        """)
+        self.setProperty("analysisRow", True)
+        self.setMinimumHeight(54)
 
         hl = QHBoxLayout(self)
-        hl.setContentsMargins(6, 4, 6, 4)
-        hl.setSpacing(6)
+        hl.setContentsMargins(8, 5, 8, 5)
+        hl.setSpacing(8)
 
-        # ── Champion icon + level + spells + rune ──
+        # Champion, spells and rune follow the same reading order as GameDetailView.
         iconCol = QVBoxLayout()
-        iconCol.setSpacing(2)
+        iconCol.setSpacing(3)
         iconCol.setAlignment(Qt.AlignCenter)
 
-        # Champion icon with level overlay
         iconC = QWidget()
-        iconC.setFixedSize(48, 48)
+        iconC.setFixedSize(34, 34)
         ci = QLabel(iconC)
-        ci.setFixedSize(48, 48)
+        ci.setFixedSize(34, 34)
         ci.move(0, 0)
         champ_icon = data.get('championIcon', '')
         pix = QPixmap(champ_icon) if champ_icon else QPixmap()
         if not pix.isNull():
-            ci.setPixmap(pix.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        ci.setStyleSheet("border-radius: 4px;")
+            ci.setPixmap(pix.scaled(
+                34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        ci.setStyleSheet("border-radius: 3px;")
 
         lv = QLabel(str(data.get('champLevel', 1)))
-        lv.setFixedSize(18, 15)
-        lv.move(0, 33)
+        lv.setFixedSize(16, 13)
+        lv.move(0, 21)
         lv.setAlignment(Qt.AlignCenter)
         lv.setStyleSheet(
             "background: rgba(0,0,0,0.75); color: #fff;"
-            "font-size: 9px; font-weight: bold; border-radius: 2px;")
+            "font-size: 8px; font-weight: bold; border-radius: 2px;")
         iconCol.addWidget(iconC)
 
-        # Spell + rune row
         srRow = QHBoxLayout()
         srRow.setSpacing(2)
         srRow.setAlignment(Qt.AlignCenter)
-
-        srRow.addWidget(_smallIcon(data.get('spell1Icon', '')))
-        srRow.addWidget(_smallIcon(data.get('spell2Icon', '')))
-        srRow.addWidget(_smallIcon(data.get('runeIcon', '')))
+        srRow.addWidget(_smallIcon(data.get('spell1Icon', ''), 14))
+        srRow.addWidget(_smallIcon(data.get('spell2Icon', ''), 14))
+        srRow.addWidget(_smallIcon(data.get('runeIcon', ''), 14))
         iconCol.addLayout(srRow)
 
         hl.addLayout(iconCol)
 
-        # ── Middle info column ──
         vi = QVBoxLayout()
-        vi.setSpacing(1)
+        vi.setSpacing(2)
 
-        # Name
         nameLabel = QLabel(data.get('summonerName', '?'))
-        nl_color = _TEXTP if dark else '#222'
-        nameLabel.setStyleSheet(
-            f"font-family: {font}; font-size: 11px; font-weight: bold; "
-            f"color: {nl_color}; background: transparent;")
+        nameLabel.setProperty("analysisRole", "bodyStrong")
         name_row = QHBoxLayout()
         name_row.setContentsMargins(0, 0, 0, 0)
         name_row.setSpacing(5)
@@ -693,58 +649,65 @@ class PlayerCard(QFrame):
             data, data.get("encounterSubjectPuuid"))
         if encounter_badge:
             name_row.addWidget(encounter_badge)
+        from app.components.grade_badge import GradeBadge
+        gradeBadge = GradeBadge(
+            int(data.get('grade', 3) or 3),
+            data.get('label', ''),
+            isCurrent=False,
+        )
+        name_row.addWidget(gradeBadge)
         name_row.addStretch(1)
         vi.addLayout(name_row)
 
-        # KDA + CS + Gold
         k = data.get('kills', 0)
         d = data.get('deaths', 0)
         a = data.get('assists', 0)
         cs = data.get('cs', 0)
         gold = _formatGold(data.get('gold', 0))
-        stats_color = _TEXTS if dark else '#777'
-        stats = QLabel(f"{k}/{d}/{a}  {cs}CS  {gold}")
-        stats.setStyleSheet(
-            f"font-family: {font}; font-size: 10px; color: {stats_color}; background: transparent;")
+        stats = QLabel(
+            f"{k}/{d}/{a}  ·  {cs} CS  ·  {gold} 金币")
+        stats.setProperty("analysisRole", "secondary")
         vi.addWidget(stats)
+        hl.addLayout(vi, 1)
 
-        # Damage%, Gold%, KP%, Vision
         dmg = _pct(data.get('damage', 0), teamTotals.get('totalDamage', 0))
         gld = _pct(data.get('gold', 0), teamTotals.get('totalGold', 0))
         kp_val = None
         for e in (data.get('evidence') or []):
             if e.get('metric') == 'kill_participation':
                 kp_val = f"{e.get('value', 0)*100:.0f}%" if e.get('value') is not None else None
-        vis = data.get('visionScore', 0)
-        subs = f"{dmg}  {gld}  {kp_val or '--'}  {int(vis)}"
-        pct_color = '#8899aa' if dark else '#888'
-        pctLabel = QLabel(subs)
-        pctLabel.setStyleSheet(
-            f"font-family: {font}; font-size: 9px; color: {pct_color}; background: transparent;")
-        vi.addWidget(pctLabel)
+        score = float(data.get('score', 0) or 0)
 
-        # Items row
-        items = data.get('itemIcons', [])
-        itemsRow = QHBoxLayout()
-        itemsRow.setSpacing(2)
-        itemsRow.setAlignment(Qt.AlignLeft)
-        for itemPath in items[:7]:
-            il = QLabel()
-            il.setFixedSize(20, 20)
-            if itemPath:
-                p = QPixmap(itemPath)
-                if not p.isNull():
-                    il.setPixmap(p.scaled(20, 20, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            il.setStyleSheet("border-radius: 2px; background: rgba(0,0,0,0.2);")
-            itemsRow.addWidget(il)
-        vi.addLayout(itemsRow)
+        def metricColumn(caption, value, width):
+            widget = QWidget()
+            widget.setFixedWidth(width)
+            box = QVBoxLayout(widget)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(0)
+            captionLabel = QLabel(caption)
+            captionLabel.setAlignment(Qt.AlignCenter)
+            captionLabel.setProperty("analysisRole", "caption")
+            valueLabel = QLabel(str(value))
+            valueLabel.setAlignment(Qt.AlignCenter)
+            valueLabel.setProperty("analysisRole", "metric")
+            box.addWidget(captionLabel)
+            box.addWidget(valueLabel)
+            return widget, valueLabel
 
-        hl.addLayout(vi, 1)
+        for caption, value, width in (
+            ("伤害", dmg, 58),
+            ("经济", gld, 58),
+            ("参团", kp_val or "--", 54),
+            ("视野", int(data.get('visionScore', 0) or 0), 48),
+        ):
+            widget, _ = metricColumn(caption, value, width)
+            hl.addWidget(widget)
 
-        # ── HexagonScore ──
-        score = data.get('score', 0)
-        hs = HexagonScore(score, size=76)
-        hl.addWidget(hs)
+        scoreWidget, scoreLabel = metricColumn(
+            "贡献", f"{score:+.1f}", 62)
+        scoreLabel.setStyleSheet(
+            f"color: {_scoreColor(score)};")
+        hl.addWidget(scoreWidget)
 
 
 # ── TeamRadar (Compare Center) ─────────────────────────────
@@ -755,15 +718,19 @@ class TeamRadar(QWidget):
         self._blueVals = blueVals
         self._redVals = redVals
         self._n = len(blueVals)
-        self.setFixedSize(172, 180)
+        self.setFixedSize(190, 176)
 
     def paintEvent(self, event):
         _renderBuf(self, self._draw)
 
     def _draw(self, p, w, h):
+        dark = isDarkTheme()
         n = self._n
-        r = min(w, h) / 2 - 24
+        r = min(w, h) / 2 - 26
         cx, cy = w / 2, h / 2
+        gridColor = QColor(255, 255, 255, 30 if dark else 20)
+        centerColor = QColor(255, 255, 255, 22 if dark else 16)
+        labelColor = QColor('#A4AFBD' if dark else '#687482')
 
         for ring in (0.25, 0.5, 0.75):
             path = QPainterPath()
@@ -775,20 +742,20 @@ class TeamRadar(QWidget):
                     path.moveTo(x, y)
                 else:
                     path.lineTo(x, y)
-            p.setBrush(QColor('#1A2D44'))
-            p.setPen(QPen(QColor('rgba(255,255,255,0.15)'), 0.5))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(gridColor, 1))
             p.drawPath(path)
 
         for i in range(n):
             angle = -math.pi / 2 + i * 2 * math.pi / n
             x = cx + r * math.cos(angle)
             y = cy + r * math.sin(angle)
-            p.setPen(QPen(QColor('rgba(255,255,255,0.12)'), 0.5))
+            p.setPen(QPen(centerColor, 1))
             p.drawLine(int(cx), int(cy), int(x), int(y))
 
             label_x = cx + (r + 14) * math.cos(angle)
             label_y = cy + (r + 14) * math.sin(angle)
-            p.setPen(QColor('#A0AAB8'))
+            p.setPen(labelColor)
             p.setFont(QFont('Segoe UI', 8))
             fm = p.fontMetrics()
             text = _TEAM_RADAR_LABELS[i]
@@ -811,22 +778,22 @@ class TeamRadar(QWidget):
             c = QColor(color)
             c.setAlpha(200)
             fill = QColor(color)
-            fill.setAlpha(100)
+            fill.setAlpha(42 if dark else 30)
             p.setBrush(fill)
-            p.setPen(QPen(c, 2.5))
+            p.setPen(QPen(c, 2))
             p.drawPath(path)
 
         if hasData:
             _drawTeam(self._blueVals, _BLUE)
             _drawTeam(self._redVals, _RED)
 
-        p.setPen(QColor('#8B95A5'))
+        p.setPen(labelColor)
         p.setFont(QFont('Segoe UI', 9))
         p.drawText(4, 14, "● 蓝队")
         p.drawText(w - 50, 14, "● 红队")
 
         if not hasData:
-            p.setPen(QColor('#5A6A7A'))
+            p.setPen(labelColor)
             p.setFont(QFont('Segoe UI', 10))
             p.drawText(int(cx - 45), int(cy + 4), "暂无评级数据")
 
@@ -836,109 +803,141 @@ class TeamRadar(QWidget):
 class InsightsSummary(QFrame):
     def __init__(self, insights: list, parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        font = "'Segoe UI', 'Microsoft YaHei'"
-        bg = _CARD_BG if dark else '#E8ECF0'
-        self.setStyleSheet(f"background: {bg}; border: none; border-radius: 8px;")
+        self.setProperty("analysisSubpanel", True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(3)
+        layout.setContentsMargins(10, 7, 10, 7)
+        layout.setSpacing(4)
 
-        for ins in (insights or []):
-            row = QLabel(ins)
-            row.setStyleSheet(
-                f"font-family: {font}; font-size: 10px; color: {'#ccc' if dark else '#444'};"
-                f"background: transparent;")
+        title = QLabel("关键表现")
+        title.setProperty("analysisRole", "captionStrong")
+        layout.addWidget(title)
+
+        for insight in (insights or []):
+            row = QLabel(insight["text"])
+            row.setWordWrap(True)
+            row.setProperty("analysisRole", "secondary")
+            row.setProperty("analysisTone", insight["tone"])
             layout.addWidget(row)
 
         if not insights:
             empty = QLabel("暂无突出数据")
-            empty.setStyleSheet(
-                f"font-family: {font}; font-size: 10px; color: {'#666' if dark else '#aaa'};"
-                f"background: transparent;")
+            empty.setProperty("analysisRole", "hint")
             layout.addWidget(empty)
 
 
 # ── CenterCompare ──────────────────────────────────────────
+
+def _teamScoreBlock(name: str, score: float, isWin: bool,
+                    color: str) -> QWidget:
+    block = QWidget()
+    layout = QHBoxLayout(block)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+
+    scoreLabel = QLabel(f"{score:+.1f}")
+    scoreLabel.setStyleSheet(f"color: {color};")
+    scoreLabel.setProperty("analysisRole", "teamScore")
+    layout.addWidget(scoreLabel)
+
+    detail = QVBoxLayout()
+    detail.setSpacing(0)
+    nameLabel = QLabel(name)
+    nameLabel.setProperty("analysisRole", "bodyStrong")
+    detail.addWidget(nameLabel)
+    resultLabel = QLabel("胜方" if isWin else "败方")
+    resultLabel.setProperty("analysisRole", "hint")
+    detail.addWidget(resultLabel)
+    layout.addLayout(detail)
+    return block
+
 
 class CenterCompare(QFrame):
     def __init__(self, bluePlayers: list, redPlayers: list,
                  blueWin: bool, blueTeam: Optional[dict] = None,
                  redTeam: Optional[dict] = None, parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        font = "'Segoe UI', 'Microsoft YaHei'"
-        bg = _PANEL_BG if dark else '#F0F2F5'
-        border = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(f"""
-            CenterCompare {{
-                background: {bg}; border: 1px solid {border};
-                border-radius: 8px;
-            }}
-        """)
+        self.setProperty("analysisCard", True)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(8)
-        layout.setAlignment(Qt.AlignCenter)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(16)
 
         blueScore = sum(p['score'] for p in bluePlayers) / max(len(bluePlayers), 1)
         redScore = sum(p['score'] for p in redPlayers) / max(len(redPlayers), 1)
 
-        scoreLabel = QLabel(f"{blueScore:+.1f}  vs  {redScore:+.1f}")
-        sc = _BLUE if blueScore >= redScore else _RED
-        scoreLabel.setAlignment(Qt.AlignCenter)
-        scoreLabel.setStyleSheet(
-            f"font-family: {font}; font-size: 14px; font-weight: bold; "
-            f"color: {sc}; background: transparent;")
-        layout.addWidget(scoreLabel)
+        summary = QVBoxLayout()
+        summary.setSpacing(6)
+        title = QLabel("团队摘要")
+        title.setProperty("analysisRole", "sectionTitle")
+        summary.addWidget(title)
+
+        scoreRow = QHBoxLayout()
+        scoreRow.setSpacing(14)
+        scoreRow.addWidget(_teamScoreBlock(
+            "蓝队", blueScore, blueWin, _BLUE))
+
+        versus = QLabel("VS")
+        versus.setAlignment(Qt.AlignCenter)
+        versus.setProperty("analysisRole", "hintStrong")
+        scoreRow.addWidget(versus)
+
+        scoreRow.addWidget(_teamScoreBlock(
+            "红队", redScore, not blueWin, _RED))
+        scoreRow.addStretch(1)
+        summary.addLayout(scoreRow)
 
         pool = bluePlayers + redPlayers
         blueVals = _teamRadarVals(bluePlayers, pool=pool)
         redVals = _teamRadarVals(redPlayers, pool=pool)
-        layout.addWidget(TeamRadar(blueVals, redVals), 0, Qt.AlignCenter)
 
         bKills = sum(p['kills'] for p in bluePlayers)
         rKills = sum(p['kills'] for p in redPlayers)
         bGold = sum(p['gold'] for p in bluePlayers)
         rGold = sum(p['gold'] for p in redPlayers)
-        ts_color = _TEXTS if dark else '#777'
+        bDamage = sum(p['damage'] for p in bluePlayers)
+        rDamage = sum(p['damage'] for p in redPlayers)
         statsText = QLabel(
-            f"击杀: {bKills} vs {rKills}    经济: {_formatGold(bGold)} vs {_formatGold(rGold)}")
-        statsText.setAlignment(Qt.AlignCenter)
-        statsText.setStyleSheet(
-            f"font-family: {font}; font-size: 10px; color: {ts_color}; background: transparent;")
-        layout.addWidget(statsText)
+            f"击杀 {bKills} : {rKills}    "
+            f"经济 {_formatGold(bGold)} : {_formatGold(rGold)}    "
+            f"伤害 {_formatGold(bDamage)} : {_formatGold(rDamage)}")
+        statsText.setWordWrap(True)
+        statsText.setProperty("analysisRole", "secondary")
+        summary.addWidget(statsText)
 
-        # ── Resource Control ──
         bt = blueTeam or {}
         rt = redTeam or {}
         resources = [
-            ('🔫 防御塔', bt.get('towerKills', 0), rt.get('towerKills', 0)),
-            ('🐉 巨龙', bt.get('dragonKills', 0), rt.get('dragonKills', 0)),
-            ('👹 先锋', bt.get('riftHeraldKills', 0), rt.get('riftHeraldKills', 0)),
-            ('🐛 虚空虫', bt.get('hordeKills', 0), rt.get('hordeKills', 0)),
-            ('👑 男爵', bt.get('baronKills', 0), rt.get('baronKills', 0)),
-            ('🏛️ 水晶', bt.get('inhibitorKills', 0), rt.get('inhibitorKills', 0)),
+            ('防御塔', bt.get('towerKills', 0), rt.get('towerKills', 0)),
+            ('巨龙', bt.get('dragonKills', 0), rt.get('dragonKills', 0)),
+            ('先锋', bt.get('riftHeraldKills', 0), rt.get('riftHeraldKills', 0)),
+            ('虚空巢虫', bt.get('hordeKills', 0), rt.get('hordeKills', 0)),
+            ('男爵', bt.get('baronKills', 0), rt.get('baronKills', 0)),
+            ('水晶', bt.get('inhibitorKills', 0), rt.get('inhibitorKills', 0)),
         ]
-        resLabel = QLabel('  '.join(
+        resLabel = QLabel('  ·  '.join(
             f"{name} {b}/{r}" for name, b, r in resources if b or r))
         hasResources = any(b or r for _, b, r in resources)
         if not hasResources:
             resLabel.hide()
         resLabel.setWordWrap(True)
-        resLabel.setAlignment(Qt.AlignCenter)
-        rl_color = _TEXTS if dark else '#777'
-        resLabel.setStyleSheet(
-            f"font-family: {font}; font-size: 9px; color: {rl_color}; background: transparent;")
-        layout.addWidget(resLabel)
+        resLabel.setProperty("analysisRole", "secondary")
+        summary.addWidget(resLabel)
 
         insights = _buildInsights(bluePlayers, redPlayers)
         if insights:
-            layout.addWidget(InsightsSummary(insights))
+            summary.addWidget(InsightsSummary(insights))
+        summary.addStretch(1)
+        layout.addLayout(summary, 1)
 
-        layout.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        radar = QVBoxLayout()
+        radar.setSpacing(2)
+        radarTitle = QLabel("六维对比")
+        radarTitle.setAlignment(Qt.AlignCenter)
+        radarTitle.setProperty("analysisRole", "captionStrong")
+        radar.addWidget(radarTitle)
+        radar.addWidget(TeamRadar(blueVals, redVals), 0, Qt.AlignCenter)
+        layout.addLayout(radar)
 
 
 # ── TeamPanel ──────────────────────────────────────────────
@@ -947,33 +946,58 @@ class TeamPanel(QFrame):
     def __init__(self, teamName: str, players: list, isWin: bool,
                  teamTotals: dict, parent=None):
         super().__init__(parent)
-        dark = isDarkTheme()
-        bg = _PANEL_BG if dark else '#F0F2F5'
-        border = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(f"""
-            TeamPanel {{
-                background: {bg}; border: 1px solid {border};
-                border-radius: 8px;
-            }}
-        """)
+        self.setProperty("analysisCard", True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 9, 10, 10)
+        layout.setSpacing(4)
 
-        font = "'Segoe UI', 'Microsoft YaHei'"
-        hColor = _BLUE if isWin else _RED
+        header = QFrame()
+        header.setProperty("analysisTeamHeader", True)
+        headerLayout = QHBoxLayout(header)
+        headerLayout.setContentsMargins(4, 0, 4, 4)
+        headerLayout.setSpacing(8)
+
+        teamKey = "blue" if teamName == "蓝队" else "red"
+        teamColor = _BLUE if teamKey == "blue" else _RED
         avgScore = sum(p['score'] for p in players) / max(len(players), 1)
-        header = QLabel(f"{teamName}  {avgScore:+.1f}")
-        header.setStyleSheet(
-            f"font-family: {font}; font-size: 12px; font-weight: bold; "
-            f"color: {hColor}; background: transparent;")
+        teamLabel = QLabel(teamName)
+        teamLabel.setProperty("analysisRole", "teamTitle")
+        teamLabel.setProperty("analysisTeam", teamKey)
+        headerLayout.addWidget(teamLabel)
+
+        result = QLabel("胜方" if isWin else "败方")
+        result.setProperty("analysisRole", "resultChip")
+        result.setProperty("analysisResult", "win" if isWin else "lose")
+        headerLayout.addWidget(result)
+
+        avgLabel = QLabel(f"平均贡献 {avgScore:+.1f}")
+        avgLabel.setProperty("analysisRole", "captionStrong")
+        avgLabel.setStyleSheet(f"color: {teamColor};")
+        headerLayout.addWidget(avgLabel)
+        headerLayout.addStretch(1)
+
+        totals = QLabel(
+            f"{teamTotals.get('totalKills', 0)} 击杀  ·  "
+            f"{_formatNumber(teamTotals.get('totalGold', 0))} 经济  ·  "
+            f"{_formatNumber(teamTotals.get('totalDamage', 0))} 伤害")
+        totals.setProperty("analysisRole", "secondary")
+        headerLayout.addWidget(totals)
         layout.addWidget(header)
+
+        divider = QFrame()
+        divider.setObjectName("analysisDivider")
+        divider.setFixedHeight(1)
+        layout.addWidget(divider)
 
         for p in players:
             layout.addWidget(PlayerCard(p, teamTotals))
 
-        layout.addSpacerItem(QSpacerItem(1, 1, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        if not players:
+            empty = QLabel("暂无玩家数据")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setProperty("analysisRole", "hint")
+            layout.addWidget(empty)
 
 
 # ── Bottom Chart Widgets ────────────────────────────────────
@@ -995,19 +1019,6 @@ def _renderBuf(widget, drawFn):
     p2 = QPainter(widget)
     p2.drawPixmap(0, 0, buf)
     p2.end()
-
-
-def _chartToggleStyle(dark: bool, checked: bool) -> str:
-    color = _BLUE if checked else (_TEXTS if dark else '#666')
-    bg = 'rgba(46,167,255,0.16)' if checked else (
-        'rgba(255,255,255,0.04)' if dark else 'rgba(0,0,0,0.035)')
-    border = 'rgba(46,167,255,0.55)' if checked else (
-        'rgba(255,255,255,0.10)' if dark else 'rgba(0,0,0,0.10)')
-    return (
-        f"QPushButton {{ color: {color}; background: {bg}; "
-        f"border: 1px solid {border}; border-radius: 5px; "
-        "padding: 4px 12px; font: bold 11px 'Microsoft YaHei UI'; }"
-    )
 
 
 class EconomyChart(QWidget):
@@ -1088,8 +1099,8 @@ class EconomyChart(QWidget):
 
     def _draw(self, p, w, h):
         dark = isDarkTheme()
-        text = _TEXTP if dark else '#25303B'
-        muted = _TEXTS if dark else '#707B86'
+        text = '#EEF3F7' if dark else '#25303B'
+        muted = '#9AA6B4' if dark else '#707B86'
         grid = QColor('#FFFFFF')
         grid.setAlpha(24 if dark else 20)
         panel = QColor('#FFFFFF')
@@ -1281,7 +1292,7 @@ class EconomyChart(QWidget):
         p.setFont(QFont('Microsoft YaHei UI', 9))
         for index, line in enumerate(lines):
             if index == 0:
-                p.setPen(QColor(_TEXTS if dark else '#6F7A85'))
+                p.setPen(QColor('#9AA6B4' if dark else '#6F7A85'))
             elif index == 1:
                 p.setPen(QColor(_BLUE))
             elif index == 2:
@@ -1294,12 +1305,7 @@ class EconomyChart(QWidget):
 class EconomyChartPanel(QFrame):
     def __init__(self, series: list, status: str = "", parent=None):
         super().__init__(parent)
-        self._dark = isDarkTheme()
-        bg = _PANEL_BG if self._dark else '#F0F2F5'
-        border = _BORDER if self._dark else 'rgba(0,0,0,0.08)'
-        self.setStyleSheet(
-            f"EconomyChartPanel {{ background: {bg}; "
-            f"border: 1px solid {border}; border-radius: 10px; }}")
+        self.setProperty("analysisCard", True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 10)
@@ -1308,41 +1314,31 @@ class EconomyChartPanel(QFrame):
         header = QHBoxLayout()
         header.setSpacing(8)
         title = QLabel("经济走势")
-        title.setStyleSheet(
-            f"color: {_TEXTP if self._dark else '#222'}; background: transparent;"
-            "font: bold 17px 'Microsoft YaHei UI', 'Segoe UI';")
+        title.setProperty("analysisRole", "sectionTitle")
         header.addWidget(title)
         header.addStretch(1)
 
-        self.totalButton = QPushButton("总经济")
-        self.diffButton = QPushButton("经济差")
-        for button in (self.totalButton, self.diffButton):
-            button.setCursor(Qt.PointingHandCursor)
-            button.setFixedHeight(27)
-            header.addWidget(button)
+        self.chartTabs = SegmentedWidget()
+        self.chartTabs.addItem(
+            "total", "总经济", lambda *_: self._setMode("total"))
+        self.chartTabs.addItem(
+            "diff", "经济差", lambda *_: self._setMode("diff"))
+        self.chartTabs.setCurrentItem("total")
+        header.addWidget(self.chartTabs)
         layout.addLayout(header)
 
         note = status or "每帧汇总双方累计总经济；悬停曲线可查看具体数值"
         self.noteLabel = QLabel(note)
         self.noteLabel.setWordWrap(True)
-        self.noteLabel.setStyleSheet(
-            f"color: {_TEXTS if self._dark else '#777'}; background: transparent;"
-            "font: 11px 'Microsoft YaHei UI', 'Segoe UI';")
+        self.noteLabel.setProperty("analysisRole", "secondary")
         layout.addWidget(self.noteLabel)
 
         self.chart = EconomyChart(series, mode="total", parent=self)
         layout.addWidget(self.chart)
 
-        self.totalButton.clicked.connect(lambda: self._setMode("total"))
-        self.diffButton.clicked.connect(lambda: self._setMode("diff"))
-        self._setMode("total")
-
     def _setMode(self, mode: str):
         self.chart.setMode(mode)
-        self.totalButton.setStyleSheet(
-            _chartToggleStyle(self._dark, mode == "total"))
-        self.diffButton.setStyleSheet(
-            _chartToggleStyle(self._dark, mode == "diff"))
+        self.chartTabs.setCurrentItem(mode)
 
 
 # ── AnalysisPage ───────────────────────────────────────────
@@ -1361,73 +1357,59 @@ class AnalysisPage(QFrame):
         self._timelineLoading = False
         self._timelineStatus = ""
         self._activeTab = 0
-        self._tabLabels = []
-        font = "'Segoe UI', 'Microsoft YaHei'"
-        dark = isDarkTheme()
-
-        self.setStyleSheet(f"AnalysisPage {{ background: {_DARK_BG if dark else '#E8ECF0'}; }}")
+        self.setObjectName("analysisPage")
 
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
 
-        # ── Header ──
-        self.headerWidget = QWidget()
-        self.headerWidget.setFixedHeight(80)
-        hb = _PANEL_BG if dark else '#FFFFFF'
-        hborder = _BORDER if dark else 'rgba(0,0,0,0.08)'
-        self.headerWidget.setStyleSheet(
-            f"background: {hb}; border-bottom: 1px solid {hborder};")
+        self.headerWidget = QFrame()
+        self.headerWidget.setObjectName("analysisHeader")
+        self.headerWidget.setFixedHeight(78)
 
         headerRow = QHBoxLayout(self.headerWidget)
-        headerRow.setContentsMargins(16, 6, 16, 6)
-        headerRow.setSpacing(12)
+        headerRow.setContentsMargins(14, 8, 14, 8)
+        headerRow.setSpacing(10)
 
-        # Back button
-        self.backBtn = QLabel("←  赛后复盘")
-        self.backBtn.setCursor(Qt.PointingHandCursor)
-        self.backBtn.setStyleSheet(
-            f"font-family: {font}; font-size: 15px; font-weight: bold; "
-            f"color: {_BLUE}; background: transparent;")
+        self.backBtn = PushButton("返回")
+        self.backBtn.setFixedHeight(32)
+        self.backBtn.setMinimumWidth(68)
+        self.backBtn.clicked.connect(self.backRequested.emit)
         headerRow.addWidget(self.backBtn)
 
-        # Tab bar
-        tabBar = QHBoxLayout()
-        tabBar.setSpacing(2)
-        tabBar.setAlignment(Qt.AlignCenter)
-        for i, name in enumerate(_TAB_NAMES):
-            tab = QLabel(name)
-            tab.setCursor(Qt.PointingHandCursor)
-            tab.setFixedHeight(28)
-            tab.setAlignment(Qt.AlignCenter)
-            tab.setStyleSheet(_tabStyle(dark, i == 0))
-            tab.mousePressEvent = lambda e, idx=i: self._switchTab(idx)
-            tabBar.addWidget(tab)
-            self._tabLabels.append(tab)
-        headerRow.addLayout(tabBar, 1)
+        titleBlock = QVBoxLayout()
+        titleBlock.setSpacing(1)
+        titleLabel = QLabel("赛后复盘")
+        titleLabel.setProperty("analysisRole", "pageTitle")
+        titleBlock.addWidget(titleLabel)
 
-        # Game info
-        self.infoLabel = QLabel("")
-        ic = _TEXTS if dark else '#888'
-        self.infoLabel.setStyleSheet(
-            f"font-family: {font}; font-size: 13px; color: {ic}; background: transparent;")
-        headerRow.addWidget(self.infoLabel)
+        self.infoLabel = QLabel("正在载入对局信息")
+        self.infoLabel.setProperty("analysisRole", "secondary")
+        titleBlock.addWidget(self.infoLabel)
+        headerRow.addLayout(titleBlock)
+        headerRow.addStretch(1)
+
+        self.tabBar = SegmentedWidget()
+        for i, name in enumerate(_TAB_NAMES):
+            self.tabBar.addItem(
+                str(i), name, lambda *_args, idx=i: self._switchTab(idx))
+        self.tabBar.setItemFontSize(13)
+        self.tabBar.setCurrentItem("0")
+        headerRow.addWidget(self.tabBar)
 
         self._layout.addWidget(self.headerWidget)
 
         self.scrollArea = SmoothScrollArea()
+        self.scrollArea.setObjectName("analysisScrollArea")
+        self.scrollArea.viewport().setObjectName("analysisViewport")
         self.scrollArea.setWidgetResizable(True)
-        self.scrollArea.setStyleSheet(
-            "QScrollArea { border: none; background: transparent; }")
         self.contentWidget = QWidget()
-        self.contentWidget.setStyleSheet("background: transparent;")
+        self.contentWidget.setObjectName("analysisContent")
         self.contentLayout = QVBoxLayout(self.contentWidget)
         self.contentLayout.setContentsMargins(0, 0, 0, 0)
-        self.contentLayout.setSpacing(0)
+        self.contentLayout.setSpacing(8)
         self.scrollArea.setWidget(self.contentWidget)
         self._layout.addWidget(self.scrollArea, 1)
-
-        self.backBtn.mousePressEvent = lambda e: self.backRequested.emit()
 
     def _switchTab(self, idx: int):
         if idx == self._activeTab:
@@ -1438,9 +1420,7 @@ class AnalysisPage(QFrame):
         self._renderTab(idx)
 
     def _setActiveTab(self, idx: int):
-        dark = isDarkTheme()
-        for i, tab in enumerate(self._tabLabels):
-            tab.setStyleSheet(_tabStyle(dark, i == idx))
+        self.tabBar.setCurrentItem(str(idx))
         self._activeTab = idx
 
     def _clearTabContent(self):
@@ -1455,8 +1435,9 @@ class AnalysisPage(QFrame):
 
     def _addTabShell(self, widget):
         shell = QWidget()
+        shell.setObjectName("analysisTabShell")
         layout = QVBoxLayout(shell)
-        layout.setContentsMargins(12, 8, 12, 10)
+        layout.setContentsMargins(8, 8, 8, 10)
         layout.setSpacing(8)
         layout.addWidget(widget)
         layout.addStretch(1)
@@ -1542,30 +1523,24 @@ class AnalysisPage(QFrame):
         team200 = self._redTeam
         win100 = _isWin(team100.get('win'))
         self._teamContainer = QWidget()
+        self._teamContainer.setObjectName("analysisOverview")
         cl = QVBoxLayout(self._teamContainer)
-        cl.setContentsMargins(12, 8, 12, 8)
-        cl.setSpacing(0)
-
-        row = QHBoxLayout()
-        row.setSpacing(8)
-        row.setContentsMargins(0, 0, 0, 0)
+        cl.setContentsMargins(8, 8, 8, 10)
+        cl.setSpacing(8)
 
         blueTotals = _teamTotals(bluePlayers)
         redTotals = _teamTotals(redPlayers)
 
-        row.addWidget(TeamPanel(
-            "蓝队",
-            bluePlayers, win100, blueTotals), 8)
-
-        row.addWidget(CenterCompare(
+        cl.addWidget(CenterCompare(
             bluePlayers, redPlayers, win100,
-            blueTeam=team100, redTeam=team200), 9)
-
-        row.addWidget(TeamPanel(
+            blueTeam=team100, redTeam=team200))
+        cl.addWidget(TeamPanel(
+            "蓝队",
+            bluePlayers, win100, blueTotals))
+        cl.addWidget(TeamPanel(
             "红队",
-            redPlayers, not win100, redTotals), 8)
-
-        cl.addLayout(row, 1)
+            redPlayers, not win100, redTotals))
+        cl.addStretch(1)
 
         self.contentLayout.addWidget(self._teamContainer)
 
@@ -1630,16 +1605,12 @@ class AnalysisPage(QFrame):
         return container
 
     def _buildRuneTab(self):
-        dark = isDarkTheme()
-
         def runeNamesCell(player, _):
             names = [n for n in (player.get('runeNames') or []) if n]
             text = " · ".join(names) if names else "本局未提供符文明细"
             label = QLabel(text)
             label.setToolTip("\n".join(names) if names else text)
-            label.setStyleSheet(
-                f"color: {_TEXTS if dark else '#555'}; background: transparent;"
-                "font: 11px 'Microsoft YaHei UI', 'Segoe UI';")
+            label.setProperty("analysisRole", "caption")
             return label
 
         columns = [

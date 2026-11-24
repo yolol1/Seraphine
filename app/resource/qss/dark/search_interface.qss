@@ -221,3 +221,208 @@ SummonerInfoBar#currentSummonerWidget>SummonerName[pressed=true] {
     font: bold;
     color: --ThemeColorDark3;
 }
+
+/* ── Post-game analysis ─────────────────────────────────────
+   Uses the same translucent card language as GameDetailView. */
+
+#analysisPage,
+#analysisContent,
+#analysisViewport,
+#analysisTabShell,
+#analysisOverview,
+QScrollArea#analysisScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QFrame#analysisHeader {
+    background-color: rgba(255, 255, 255, 0.051);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+}
+
+QFrame[analysisCard="true"] {
+    background-color: rgba(255, 255, 255, 0.051);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+}
+
+QFrame[analysisSubpanel="true"] {
+    background-color: rgba(255, 255, 255, 0.035);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: 6px;
+}
+
+QFrame[analysisTeamHeader="true"] {
+    background: transparent;
+    border: none;
+}
+
+QFrame[analysisRow="true"] {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+}
+
+QFrame[analysisRow="true"]:hover {
+    background-color: rgba(255, 255, 255, 0.045);
+    border-color: rgba(255, 255, 255, 0.07);
+}
+
+QFrame[analysisTableRow="true"] {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+}
+
+QFrame[analysisTableRow="true"][analysisAlternate="true"] {
+    background-color: rgba(255, 255, 255, 0.035);
+}
+
+QFrame[analysisEventRow="true"] {
+    background-color: rgba(255, 255, 255, 0.035);
+    border: none;
+    border-radius: 6px;
+}
+
+QFrame#analysisDivider {
+    background-color: rgba(255, 255, 255, 0.10);
+    border: none;
+}
+
+QLabel[analysisRole="pageTitle"] {
+    color: rgba(255, 255, 255, 0.95);
+    font: bold 20px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="sectionTitle"] {
+    color: rgba(255, 255, 255, 0.95);
+    font: bold 16px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="teamTitle"] {
+    font: bold 15px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="teamTitle"][analysisTeam="blue"] {
+    color: #2EA7FF;
+}
+
+QLabel[analysisRole="teamTitle"][analysisTeam="red"] {
+    color: #E6525B;
+}
+
+QLabel[analysisRole="bodyStrong"] {
+    color: rgba(255, 255, 255, 0.95);
+    font: bold 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="secondary"] {
+    color: rgba(255, 255, 255, 0.60);
+    font: 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="caption"] {
+    color: rgba(255, 255, 255, 0.52);
+    font: 11px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="captionStrong"] {
+    color: rgba(255, 255, 255, 0.68);
+    font: bold 11px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="hint"] {
+    color: rgba(255, 255, 255, 0.40);
+    font: 11px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="hintStrong"] {
+    color: rgba(255, 255, 255, 0.36);
+    font: bold 11px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="teamLabel"] {
+    padding: 5px 4px 2px 4px;
+    font: bold 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="teamLabel"][analysisTeam="blue"] {
+    color: #2EA7FF;
+}
+
+QLabel[analysisRole="teamLabel"][analysisTeam="red"] {
+    color: #E6525B;
+}
+
+QLabel[analysisRole="teamScore"] {
+    font: bold 22px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="metric"] {
+    color: rgba(255, 255, 255, 0.88);
+    font: bold 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="resultChip"] {
+    padding: 2px 7px;
+    border-radius: 5px;
+    font: bold 10px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="resultChip"][analysisResult="win"] {
+    color: #67D994;
+    background-color: rgba(46, 170, 91, 0.14);
+}
+
+QLabel[analysisRole="resultChip"][analysisResult="lose"] {
+    color: #F0787F;
+    background-color: rgba(230, 82, 91, 0.14);
+}
+
+QLabel[analysisRole="tableHeader"] {
+    color: rgba(255, 255, 255, 0.52);
+    font: bold 11px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="tableCell"] {
+    color: rgba(255, 255, 255, 0.84);
+    font: 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="time"] {
+    color: rgba(255, 255, 255, 0.56);
+    font: bold 12px Consolas, monospace;
+}
+
+QLabel[analysisRole="eventText"] {
+    font: 12px 'Segoe UI', 'Microsoft YaHei';
+}
+
+QLabel[analysisRole="eventText"][analysisEventTone="neutral"] {
+    color: rgba(255, 255, 255, 0.76);
+}
+
+QLabel[analysisRole="eventText"][analysisEventTone="blue"] {
+    color: #65B8FF;
+}
+
+QLabel[analysisRole="eventText"][analysisEventTone="red"] {
+    color: #F0787F;
+}
+
+QLabel[analysisRole="eventText"][analysisEventTone="gold"] {
+    color: #F5C35B;
+}
+
+QLabel[analysisRole="eventText"][analysisEventTone="positive"] {
+    color: #67D994;
+}
+
+QLabel[analysisRole="secondary"][analysisTone="positive"] {
+    color: #67D994;
+}
+
+QLabel[analysisRole="secondary"][analysisTone="negative"] {
+    color: #F0787F;
+}

@@ -60,6 +60,7 @@ _qfw_top_names = [
     'OptionsConfigItem', 'OptionsValidator', 'ConfigSerializer',
     'RangeConfigItem', 'RangeValidator', 'ColorConfigItem',
     'Theme', 'EnumSerializer', 'isDarkTheme', 'SmoothScrollArea',
+    'PushButton', 'SegmentedWidget', 'ToolTipFilter', 'ToolTipPosition',
 ]
 _make_stub('qfluentwidgets', _qfw_sub, _qfw_sub_attrs, _qfw_top_names)
 
