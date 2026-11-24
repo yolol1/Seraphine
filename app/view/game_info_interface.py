@@ -751,9 +751,17 @@ class Games(QFrame):
 
         self.summonerName.setFixedHeight(44)
         self.setMinimumWidth(140)
+        self.encounterBadge = makeEncounterBadge(
+            summoner, summoner.get("encounterSubjectPuuid"))
 
         # self.vBoxLayout.addSpacing(8)
-        self.vBoxLayout.addWidget(self.summonerName)
+        self.nameRowLayout = QHBoxLayout()
+        self.nameRowLayout.setContentsMargins(0, 0, 0, 0)
+        self.nameRowLayout.setSpacing(4)
+        self.nameRowLayout.addWidget(self.summonerName, 1)
+        if self.encounterBadge:
+            self.nameRowLayout.addWidget(self.encounterBadge)
+        self.vBoxLayout.addLayout(self.nameRowLayout)
         # self.vBoxLayout.addSpacing(11)
 
         self.vBoxLayout.addLayout(self.gamesLayout)

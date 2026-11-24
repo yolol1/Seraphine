@@ -443,6 +443,59 @@ class PersistentCache:
             result.append(item)
         return result
 
+    def get_encounter_players(self, subject_puuid: str,
+                              limit: int = 200) -> list:
+        """Return every player who shares an indexed game with the subject."""
+        if not subject_puuid:
+            return []
+        try:
+            with self._lock:
+                c = self._get_conn().cursor()
+                rows = c.execute("""
+                    SELECT player_puuid, player_name, tag_line,
+                           relationship, game_id, game_time, queue_id, mode_name
+                    FROM encounters
+                    WHERE subject_puuid=?
+                    ORDER BY game_creation DESC, game_id DESC
+                """, (subject_puuid,)).fetchall()
+                c.close()
+        except sqlite3.Error as e:
+            logger.warning(f"get_encounter_players failed: {e}", TAG)
+            return []
+
+        players = {}
+        for row in rows:
+            player_uuid = row["player_puuid"]
+            item = players.get(player_uuid)
+            if item is None:
+                item = {
+                    "puuid": player_uuid,
+                    "name": row["player_name"] or "未知玩家",
+                    "tagLine": row["tag_line"] or "",
+                    "count": 0,
+                    "allyCount": 0,
+                    "enemyCount": 0,
+                    "lastGameId": row["game_id"],
+                    "lastGameTime": row["game_time"],
+                    "lastQueueId": row["queue_id"],
+                    "lastModeName": row["mode_name"],
+                    "lastRelationship": row["relationship"],
+                }
+                players[player_uuid] = item
+            item["count"] += 1
+            if row["relationship"] == "ally":
+                item["allyCount"] += 1
+            else:
+                item["enemyCount"] += 1
+
+        result = sorted(
+            players.values(),
+            key=lambda item: (
+                item["count"], item["lastGameId"] or 0),
+            reverse=True,
+        )
+        return result[:max(1, int(limit))]
+
     # ---- verdicts ----
 
     def set_verdict(self, game_id: int, winner_rating: list, loser_rating: list):

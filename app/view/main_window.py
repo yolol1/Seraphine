@@ -43,7 +43,9 @@ from app.common.signals import signalBus
 from app.components.message_box import (UpdateMessageBox, NoticeMessageBox,
                                         WaitingForLolMessageBox, ExceptionMessageBox,
                                         ChangeDpiMessageBox)
-from app.components.encounter_history_dialog import EncounterHistoryDialog
+from app.components.encounter_history_dialog import (
+    EncounterHistoryDialog, EncounterPlayersDialog,
+)
 from app.lol.exceptions import (SummonerGamesNotFound, RetryMaximumAttempts,
                                 SummonerNotFound, SummonerNotInGame, SummonerRankInfoNotFound)
 from app.lol.listener import (LolProcessExistenceListener, StoppableThread)
@@ -408,6 +410,8 @@ class MainWindow(FluentWindow):
         signalBus.toCareerInterface.connect(self.__switchToCareerInterface)
         signalBus.encounterHistoryRequested.connect(
             self.__onEncounterHistoryRequested)
+        signalBus.encounterPlayersRequested.connect(
+            self.__onEncounterPlayersRequested)
         self.gameInfoInterface.manualSendHorseReport.connect(
             self.__onManualSendHorseReport)
         # 对局信息页"刷新"按钮: 战绩服务故障恢复后手动重拉
@@ -1099,6 +1103,25 @@ class MainWindow(FluentWindow):
                                             player_puuid, player_name):
         if not subject_puuid or not player_puuid:
             return
+        await self.__showEncounterHistory(
+            subject_puuid, player_puuid, player_name)
+
+    @asyncSlot(str)
+    async def __onEncounterPlayersRequested(self, subject_puuid):
+        if not subject_puuid:
+            return
+        dialog = EncounterPlayersDialog(
+            subject_puuid, parent=self.window())
+        if not dialog.exec() or not dialog.selectedPlayerPuuid:
+            return
+        await self.__showEncounterHistory(
+            subject_puuid,
+            dialog.selectedPlayerPuuid,
+            dialog.selectedPlayerName,
+        )
+
+    async def __showEncounterHistory(self, subject_puuid,
+                                     player_puuid, player_name):
         dialog = EncounterHistoryDialog(
             subject_puuid, player_puuid, player_name,
             parent=self.window())

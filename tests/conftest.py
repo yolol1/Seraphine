@@ -2,6 +2,7 @@
 # (project dependencies have a runtime incompatibility in this env)
 import logging
 import sys
+import tempfile
 import types
 from unittest.mock import MagicMock
 
@@ -107,3 +108,5 @@ if 'PyQt5' not in sys.modules:
 # logger.py (imported by connector) doesn't crash on MagicMock return value.
 import app.common.config as _cfg_mod  # noqa: E402
 _cfg_mod.cfg.get = MagicMock(return_value=logging.INFO)
+# Tests must never open or clear the user's real persistent cache.
+_cfg_mod.LOCAL_PATH = tempfile.mkdtemp(prefix="seraphine-tests-")

@@ -110,6 +110,13 @@ def test_cache_marks_both_teammates_and_opponents(tmp_path):
     assert history[0]["player"]["summonerName"] == "Gamma"
     assert history[0]["relationship"] == "ally"
 
+    players = db.get_encounter_players("a")
+    by_uuid = {player["puuid"]: player for player in players}
+    assert set(by_uuid) == {"b", "c"}
+    assert by_uuid["b"]["count"] == 2
+    assert by_uuid["b"]["allyCount"] == 1
+    assert by_uuid["b"]["enemyCount"] == 1
+
 
 def test_cache_skips_current_game_for_badge_counts(tmp_path):
     db = PersistentCache(str(tmp_path / "encounters.db"))

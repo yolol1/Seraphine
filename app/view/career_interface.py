@@ -23,6 +23,7 @@ from app.common.icons import Icon
 from app.common.signals import signalBus
 from app.common.config import cfg
 from app.lol.connector import connector
+from app.lol.persistent_cache import cache as sqlite_cache
 from app.lol.tools import (parseGames, parseSummonerData,
                            getRecentTeammates, parseDetailRankInfo,
                            getNameTagLineFromGame, aramStatsFromGames)
@@ -137,8 +138,10 @@ class CareerInterface(SeraphineInterface):
             self.tr("KDA:") + " None / None / None" + self.tr("(") + "0" + self.tr(")"))
         self.championsCard = ChampionsCard()
         self.recentTeamButton = PushButton(self.tr("Recent teammates"))
+        self.encounterButton = PushButton("相遇记录")
         self.filterComboBox = ComboBox()
         self.recentTeammatesFlyout: Flyout = None
+        self.encounterPlayers = []
 
         self.gameInfoAreaLayout = QHBoxLayout()
         self.gameInfoArea = SmoothScrollArea()
@@ -195,6 +198,8 @@ class CareerInterface(SeraphineInterface):
             button.setMinimumWidth(width)
 
         self.recentTeamButton.setEnabled(True)
+        self.encounterButton.setMinimumWidth(112)
+        self.encounterButton.setEnabled(False)
 
         self.rankTable.setRowCount(3)
         self.rankTable.setColumnCount(9)
@@ -284,12 +289,15 @@ class CareerInterface(SeraphineInterface):
             self.championsCard, alignment=Qt.AlignCenter)
         self.recentInfoHLayout.addWidget(
             self.recentTeamButton, alignment=Qt.AlignCenter)
+        self.recentInfoHLayout.addWidget(
+            self.encounterButton, alignment=Qt.AlignCenter)
         self.recentInfoHLayout.addWidget(self.filterComboBox,
                                          alignment=Qt.AlignCenter)
 
         # 这俩玩意的高度居然不一样，看着难受，手动让它俩一样
         # 33 == self.filterComboBox.height()
         self.recentTeamButton.setFixedHeight(33)
+        self.encounterButton.setFixedHeight(33)
 
         self.IconNameHBoxLayout.addSpacing(
             self.backToMeButton.sizeHint().width())
@@ -342,6 +350,7 @@ class CareerInterface(SeraphineInterface):
         self.filterComboBox.setVisible(not enable)
         self.championsCard.setVisible(not enable)
         self.recentTeamButton.setVisible(not enable)
+        self.encounterButton.setVisible(not enable)
         self.winsLabel.setVisible(not enable)
         self.lossesLabel.setVisible(not enable)
         self.kdaLabel.setVisible(not enable)
@@ -461,6 +470,8 @@ class CareerInterface(SeraphineInterface):
 
         self.recentTeamButton.clicked.connect(
             self.__onRecentTeammatesButtonClicked)
+        self.encounterButton.clicked.connect(
+            self.__onEncounterButtonClicked)
 
         # LCU 冷启动 stale cache 后台恢复成功: 若正在展示该召唤师则自动重刷,
         # 避免生涯页停留在冷启动时拿到的残缺战绩 (如只有 2 条)
@@ -674,6 +685,7 @@ class CareerInterface(SeraphineInterface):
         self.name.setText(name)
 
         self.puuid = puuid
+        self.__refreshEncounterSummary()
 
         # parseDetailRankInfo 只返回 Solo/Flex 两行, 需要补 3 行表 (含大乱斗)
         # ponytail: 大乱斗无排位数据, 该行仅用于展示近 N 场统计
@@ -871,6 +883,29 @@ class CareerInterface(SeraphineInterface):
         self.recentTeammatesFlyout.closed.connect(
             self.__resetRecentTeammatesFlyout)
 
+    def __refreshEncounterSummary(self):
+        self.encounterPlayers = []
+        self.encounterButton.setText("相遇记录")
+        self.encounterButton.setEnabled(False)
+        if not self.puuid:
+            return
+        self.encounterPlayers = sqlite_cache.get_encounter_players(
+            self.puuid)
+        count = len(self.encounterPlayers)
+        if count:
+            self.encounterButton.setText(
+                f"相遇记录 ({count})")
+            self.encounterButton.setToolTip(
+                "查看所有已记录的共同对局玩家")
+        else:
+            self.encounterButton.setToolTip(
+                "打开生涯或对局详情后会自动建立相遇记录")
+        self.encounterButton.setEnabled(True)
+
+    def __onEncounterButtonClicked(self):
+        if self.puuid:
+            signalBus.encounterPlayersRequested.emit(self.puuid)
+
     def __copySummonerName(self):
         name = self.getSummonerName()
         if not name:
@@ -885,6 +920,7 @@ class CareerInterface(SeraphineInterface):
 
     async def __updateRecentTeammates(self):
         self.recentTeammatesInfo = await getRecentTeammates(self.games['games'], self.puuid)
+        self.__refreshEncounterSummary()
 
         if self.recentTeammatesFlyout:
             self.recentTeammatesFlyout.close()
