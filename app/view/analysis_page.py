@@ -528,64 +528,6 @@ class TimelineEventsView(QFrame):
 
         layout.addStretch(1)
 
-# ── HexagonScore ───────────────────────────────────────────
-
-class HexagonScore(QWidget):
-    """Compact score badge: colored hexagon with score number in center."""
-    def __init__(self, score: float, size=76, parent=None):
-        super().__init__(parent)
-        self._score = score
-        self._color_str = _scoreColor(score)
-        self._color = QColor(self._color_str)
-        self.setFixedSize(size, size)
-        self._size = size
-
-    def paintEvent(self, event):
-        _renderBuf(self, self._draw)
-
-    def _draw(self, p, w, h):
-        r = self._size / 2 - 2
-        cx, cy = w / 2, h / 2
-        n = 6
-
-        path = QPainterPath()
-        for i in range(n + 1):
-            angle = -math.pi / 2 + i * 2 * math.pi / n
-            x = cx + r * math.cos(angle)
-            y = cy + r * math.sin(angle)
-            if i == 0:
-                path.moveTo(x, y)
-            else:
-                path.lineTo(x, y)
-
-        p.setBrush(self._color)
-        p.setPen(Qt.NoPen)
-        p.drawPath(path)
-
-        inner = QPainterPath()
-        ir = r * 0.7
-        for i in range(n + 1):
-            angle = -math.pi / 2 + i * 2 * math.pi / n
-            x = cx + ir * math.cos(angle)
-            y = cy + ir * math.sin(angle)
-            if i == 0:
-                inner.moveTo(x, y)
-            else:
-                inner.lineTo(x, y)
-        bg = QColor(self._color_str)
-        bg.setAlpha(40)
-        p.setBrush(bg)
-        p.drawPath(inner)
-
-        p.setFont(QFont('Consolas', int(self._size / 4.5), QFont.Bold))
-        p.setPen(QColor('#FFFFFF'))
-        text = f"{self._score:.1f}"
-        fm = p.fontMetrics()
-        tw = fm.horizontalAdvance(text)
-        th = fm.height()
-        p.drawText(int(cx - tw / 2), int(cy + th / 4), text)
-
-
 # ── PlayerCard ─────────────────────────────────────────────
 
 class PlayerCard(QFrame):
@@ -649,13 +591,15 @@ class PlayerCard(QFrame):
             data, data.get("encounterSubjectPuuid"))
         if encounter_badge:
             name_row.addWidget(encounter_badge)
-        from app.components.grade_badge import GradeBadge
-        gradeBadge = GradeBadge(
-            int(data.get('grade', 3) or 3),
-            data.get('label', ''),
-            isCurrent=False,
-        )
-        name_row.addWidget(gradeBadge)
+        ratingLabel = data.get('label', '')
+        hasRating = bool(ratingLabel or data.get('evidence'))
+        if hasRating:
+            name_row.addWidget(GradeBadge(
+                int(data.get('grade', 3) or 3),
+                ratingLabel,
+                isCurrent=False,
+                evidence=data.get('evidence'),
+            ))
         name_row.addStretch(1)
         vi.addLayout(name_row)
 
@@ -703,10 +647,10 @@ class PlayerCard(QFrame):
             widget, _ = metricColumn(caption, value, width)
             hl.addWidget(widget)
 
-        scoreWidget, scoreLabel = metricColumn(
-            "贡献", f"{score:+.1f}", 62)
+        scoreText = f"{score:+.1f}" if hasRating else "--"
+        scoreWidget, scoreLabel = metricColumn("贡献", scoreText, 62)
         scoreLabel.setStyleSheet(
-            f"color: {_scoreColor(score)};")
+            f"color: {_scoreColor(score) if hasRating else _MUTED_ACCENT};")
         hl.addWidget(scoreWidget)
 
 
@@ -787,9 +731,10 @@ class TeamRadar(QWidget):
             _drawTeam(self._blueVals, _BLUE)
             _drawTeam(self._redVals, _RED)
 
-        p.setPen(labelColor)
         p.setFont(QFont('Segoe UI', 9))
+        p.setPen(QColor(_BLUE))
         p.drawText(4, 14, "● 蓝队")
+        p.setPen(QColor(_RED))
         p.drawText(w - 50, 14, "● 红队")
 
         if not hasData:
@@ -829,14 +774,15 @@ class InsightsSummary(QFrame):
 # ── CenterCompare ──────────────────────────────────────────
 
 def _teamScoreBlock(name: str, score: float, isWin: bool,
-                    color: str) -> QWidget:
+                    color: str, available: bool = True) -> QWidget:
     block = QWidget()
     layout = QHBoxLayout(block)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(6)
 
-    scoreLabel = QLabel(f"{score:+.1f}")
-    scoreLabel.setStyleSheet(f"color: {color};")
+    scoreLabel = QLabel(f"{score:+.1f}" if available else "--")
+    scoreLabel.setStyleSheet(
+        f"color: {color if available else _MUTED_ACCENT};")
     scoreLabel.setProperty("analysisRole", "teamScore")
     layout.addWidget(scoreLabel)
 
@@ -865,6 +811,10 @@ class CenterCompare(QFrame):
 
         blueScore = sum(p['score'] for p in bluePlayers) / max(len(bluePlayers), 1)
         redScore = sum(p['score'] for p in redPlayers) / max(len(redPlayers), 1)
+        blueHasRating = any(
+            p.get('label') or p.get('evidence') for p in bluePlayers)
+        redHasRating = any(
+            p.get('label') or p.get('evidence') for p in redPlayers)
 
         summary = QVBoxLayout()
         summary.setSpacing(6)
@@ -875,7 +825,7 @@ class CenterCompare(QFrame):
         scoreRow = QHBoxLayout()
         scoreRow.setSpacing(14)
         scoreRow.addWidget(_teamScoreBlock(
-            "蓝队", blueScore, blueWin, _BLUE))
+            "蓝队", blueScore, blueWin, _BLUE, blueHasRating))
 
         versus = QLabel("VS")
         versus.setAlignment(Qt.AlignCenter)
@@ -883,7 +833,7 @@ class CenterCompare(QFrame):
         scoreRow.addWidget(versus)
 
         scoreRow.addWidget(_teamScoreBlock(
-            "红队", redScore, not blueWin, _RED))
+            "红队", redScore, not blueWin, _RED, redHasRating))
         scoreRow.addStretch(1)
         summary.addLayout(scoreRow)
 
@@ -960,7 +910,11 @@ class TeamPanel(QFrame):
 
         teamKey = "blue" if teamName == "蓝队" else "red"
         teamColor = _BLUE if teamKey == "blue" else _RED
-        avgScore = sum(p['score'] for p in players) / max(len(players), 1)
+        ratedPlayers = [
+            p for p in players if p.get('label') or p.get('evidence')]
+        avgScore = (
+            sum(p['score'] for p in ratedPlayers) / len(ratedPlayers)
+            if ratedPlayers else 0)
         teamLabel = QLabel(teamName)
         teamLabel.setProperty("analysisRole", "teamTitle")
         teamLabel.setProperty("analysisTeam", teamKey)
@@ -971,7 +925,8 @@ class TeamPanel(QFrame):
         result.setProperty("analysisResult", "win" if isWin else "lose")
         headerLayout.addWidget(result)
 
-        avgLabel = QLabel(f"平均贡献 {avgScore:+.1f}")
+        avgLabel = QLabel(
+            f"平均贡献 {avgScore:+.1f}" if ratedPlayers else "平均贡献 --")
         avgLabel.setProperty("analysisRole", "captionStrong")
         avgLabel.setStyleSheet(f"color: {teamColor};")
         headerLayout.addWidget(avgLabel)

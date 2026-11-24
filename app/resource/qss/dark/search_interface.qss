@@ -241,45 +241,45 @@ QFrame#analysisHeader {
     border-radius: 8px;
 }
 
-QFrame[analysisCard="true"] {
+QFrame[analysisCard=true] {
     background-color: rgba(255, 255, 255, 0.051);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 8px;
 }
 
-QFrame[analysisSubpanel="true"] {
+QFrame[analysisSubpanel=true] {
     background-color: rgba(255, 255, 255, 0.035);
     border: 1px solid rgba(255, 255, 255, 0.07);
     border-radius: 6px;
 }
 
-QFrame[analysisTeamHeader="true"] {
+QFrame[analysisTeamHeader=true] {
     background: transparent;
     border: none;
 }
 
-QFrame[analysisRow="true"] {
+QFrame[analysisRow=true] {
     background: transparent;
     border: 1px solid transparent;
     border-radius: 6px;
 }
 
-QFrame[analysisRow="true"]:hover {
+QFrame[analysisRow=true]:hover {
     background-color: rgba(255, 255, 255, 0.045);
     border-color: rgba(255, 255, 255, 0.07);
 }
 
-QFrame[analysisTableRow="true"] {
+QFrame[analysisTableRow=true] {
     background: transparent;
     border: none;
     border-radius: 6px;
 }
 
-QFrame[analysisTableRow="true"][analysisAlternate="true"] {
+QFrame[analysisTableRow=true][analysisAlternate=true] {
     background-color: rgba(255, 255, 255, 0.035);
 }
 
-QFrame[analysisEventRow="true"] {
+QFrame[analysisEventRow=true] {
     background-color: rgba(255, 255, 255, 0.035);
     border: none;
     border-radius: 6px;

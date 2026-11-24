@@ -1,5 +1,13 @@
 # LOL 战后复盘（Post Game Review）UI Design Specification v1.0
 
+> **落地说明（Seraphine 桌面端）**
+>
+> 本文是早期概念稿，不属于 Seraphine 运行时的界面规范。实际实现位于
+> `app/view/analysis_page.py`，使用 PyQt5 + PyQt-Fluent-Widgets，并嵌入
+> `GameDetailView` 的右侧详情区域。页面必须继承 `SearchInterface` 的明暗主题、
+> 卡片边界、圆角、字号和间距；固定的 1920×1080 Dashboard、React、Tailwind
+> 与 ECharts 要求仅适用于概念原型，不得作为桌面端实现约束。
+
 ## 设计目标
 
 -   参考 Riot Games 官方赛事（LPL / Worlds）数据分析面板。
