@@ -16,6 +16,7 @@ from app.lol.tools_pure import (
     timeStampToStr,
     timeStampToShortStr,
     secsToStr,
+    resolveGameQueueId,
     separateTeams,
     parseSummonerOrder,
     sortedSummonersByGameRole,
@@ -49,6 +50,21 @@ class TestTranslateTier:
     def test_case_insensitive(self):
         assert translateTier("gold") == "荣耀黄金"
         assert translateTier("GOLD") == "荣耀黄金"
+
+
+def test_resolve_game_queue_id_uses_detail_field():
+    assert resolveGameQueueId({"queueId": 420}) == 420
+    assert resolveGameQueueId({"queueId": "440"}) == 440
+
+
+def test_resolve_game_queue_id_falls_back_to_known_game_mode():
+    assert resolveGameQueueId({"gameMode": "KIWI"}) == 2400
+    assert resolveGameQueueId({"gameMode": "cherry"}) == 1700
+
+
+def test_resolve_game_queue_id_defaults_to_custom_game():
+    assert resolveGameQueueId({"gameMode": "CLASSIC"}) == 0
+    assert resolveGameQueueId({}) == 0
 
 
 class TestTimeStampToStr:
