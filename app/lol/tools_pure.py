@@ -75,6 +75,40 @@ def resolveGameQueueId(game: dict) -> int:
     return _GAME_MODE_QUEUE_IDS.get(game_mode, 0)
 
 
+def isGameDetailPayload(game) -> bool:
+    """Return whether a raw LCU payload contains a usable match detail."""
+    if not isinstance(game, dict):
+        return False
+    return (
+        bool(game.get("participants"))
+        and bool(game.get("participantIdentities"))
+        and isinstance(game.get("teams"), list)
+        and bool(game.get("teams"))
+    )
+
+
+def selectGameDetailSubject(game: dict, puuid: str) -> bool:
+    """Mark the selected player in a cached detail and align its result."""
+    if not game or not puuid:
+        return False
+
+    teams = game.get("teams") or {}
+    team_values = teams.values() if isinstance(teams, dict) else teams
+    found = False
+    for team in team_values:
+        if not isinstance(team, dict):
+            continue
+        for player in team.get("summoners") or []:
+            if not isinstance(player, dict):
+                continue
+            is_current = player.get("puuid") == puuid
+            player["isCurrent"] = is_current
+            if is_current:
+                game["win"] = team.get("win")
+                found = True
+    return found
+
+
 def separateTeams(data, currentSummonerId):
     # 防御: gameData 可能缺失 teamOne/teamTwo (LCU 竞态), 缺失视为空队伍
     team1 = data.get('teamOne') or []

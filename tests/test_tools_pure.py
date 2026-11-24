@@ -17,6 +17,8 @@ from app.lol.tools_pure import (
     timeStampToShortStr,
     secsToStr,
     resolveGameQueueId,
+    isGameDetailPayload,
+    selectGameDetailSubject,
     separateTeams,
     parseSummonerOrder,
     sortedSummonersByGameRole,
@@ -65,6 +67,39 @@ def test_resolve_game_queue_id_falls_back_to_known_game_mode():
 def test_resolve_game_queue_id_defaults_to_custom_game():
     assert resolveGameQueueId({"gameMode": "CLASSIC"}) == 0
     assert resolveGameQueueId({}) == 0
+
+
+def test_game_detail_payload_validation():
+    valid = {
+        "participants": [{"participantId": 1}],
+        "participantIdentities": [{"participantId": 1}],
+        "teams": [{"teamId": 100}],
+    }
+    assert isGameDetailPayload(valid)
+    assert not isGameDetailPayload(None)
+    assert not isGameDetailPayload({"errorCode": "NOT_FOUND"})
+    assert not isGameDetailPayload({**valid, "participants": []})
+
+
+def test_select_game_detail_subject_updates_current_player_and_result():
+    detail = {
+        "win": None,
+        "teams": {
+            100: {
+                "win": True,
+                "summoners": [{"puuid": "player-a", "isCurrent": False}],
+            },
+            200: {
+                "win": False,
+                "summoners": [{"puuid": "player-b", "isCurrent": True}],
+            },
+        },
+    }
+
+    assert selectGameDetailSubject(detail, "player-a")
+    assert detail["win"] is True
+    assert detail["teams"][100]["summoners"][0]["isCurrent"] is True
+    assert detail["teams"][200]["summoners"][0]["isCurrent"] is False
 
 
 class TestTimeStampToStr:

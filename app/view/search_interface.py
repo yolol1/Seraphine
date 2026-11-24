@@ -36,6 +36,10 @@ from app.lol.tools import (
     parseGameDetailData,
     parseGamesDataConcurrently,
 )
+from app.lol.tools_pure import (
+    isGameDetailPayload,
+    selectGameDetailSubject,
+)
 from ..components.seraphine_interface import SeraphineInterface
 from .analysis_page import AnalysisPage
 from .detail_request import isCurrentDetailRequest
@@ -1412,9 +1416,11 @@ class SearchInterface(SeraphineInterface):
     @asyncSlot(str)
     async def __onMatchHistoryRecovered(self, puuid: str):
         if puuid and self.puuid == puuid:
+            selected_game_id = self.loadingGameId
             logger.info(
                 "match history recovered, refresh search page", TAG)
-            await self.searchAndShowFirstPage(force=True)
+            if await self.searchAndShowFirstPage(force=True) and selected_game_id:
+                self.waitingForDrawSelect(selected_game_id)
 
     def __showSummonerNotFoundMsg(self):
         InfoBar.error(
@@ -1457,12 +1463,14 @@ class SearchInterface(SeraphineInterface):
             self.__showSummonerNotFoundMsg()
             return False
 
+        same_target = bool(self.puuid) and summoner['puuid'] == self.puuid
+        if not same_target:
+            self.gamesView.gameDetailView.clear()
+
         self.gamesView.setLoadingPageEnable(True)
 
         self.careerButton.setEnabled(True)
         self.filterComboBox.setEnabled(True)
-
-        self.gamesView.gameDetailView.clear()
 
         try:
             # NOTE 如果是生涯和搜索反复横跳, 就不重新启 loadgames 任务了
@@ -1714,6 +1722,20 @@ class SearchInterface(SeraphineInterface):
         # if cfg.get(cfg.showTierInGameInfo):
         detailView.setLoadingPageEnabled(True)
 
+        cached_detail = await connector.getGameDetailCached(gameId)
+        if not self._isCurrentDetailRequest(gameId, puuid):
+            return
+        if cached_detail:
+            try:
+                selectGameDetailSubject(cached_detail, puuid)
+                detailView.updateGame(cached_detail, subjectPuuid=puuid)
+                detailView.setLoadingPageEnabled(False)
+            except Exception as e:
+                logger.warning(
+                    f"cached game detail {gameId} could not be rendered: "
+                    f"{type(e).__name__}: {e}", TAG)
+                cached_detail = None
+
         # NOTE self.detailViewLoadTask 用于标记详情正在加载, self.loadGame会为其让行 -- By Hpero4
         self.detailViewLoadTask = asyncio.create_task(
             connector.getGameDetailByGameId(gameId))
@@ -1722,22 +1744,21 @@ class SearchInterface(SeraphineInterface):
         if not self._isCurrentDetailRequest(gameId, puuid):
             return
 
-        # LCU 未就绪时 @retry 统一拦截 ReferenceError 并返回 None
-        # (已通过 signalBus.lcuNotConnected 发射统一提示)
-        if game is None:
-            # 尝试从缓存读取
-            cached = await connector.getGameDetailCached(gameId)
-            if not self._isCurrentDetailRequest(gameId, puuid):
-                return
-            if cached:
-                game = cached
-                detailView.setLoadingPageEnabled(False)
-                # 直接从缓存显示
-                detailView.updateGame(cached, subjectPuuid=puuid)
+        if not isGameDetailPayload(game):
+            logger.warning(
+                f"game detail {gameId} returned no usable match payload", TAG)
+            if cached_detail:
                 if showAnalysis:
                     detailView.showAnalysis(preserveTab=True)
                 return
             detailView.setLoadingPageEnabled(False)
+            InfoBar.error(
+                self.tr("Get game infomation failed"),
+                self.tr("The server returned abnormal content."),
+                orient=Qt.Vertical,
+                duration=5000,
+                position=InfoBarPosition.BOTTOM_RIGHT,
+                parent=self.window())
             return
 
         # 加载GameDetail的过程中, 切换了搜索对象(self.puuid变更), 将后续任务pass -- By Hpero4
@@ -1750,7 +1771,21 @@ class SearchInterface(SeraphineInterface):
                 return
 
             if game is None:
+                logger.warning(
+                    f"game detail {gameId} could not be parsed for {puuid}",
+                    TAG)
+                if cached_detail:
+                    if showAnalysis:
+                        detailView.showAnalysis(preserveTab=True)
+                    return
                 detailView.setLoadingPageEnabled(False)
+                InfoBar.error(
+                    self.tr("Get game infomation failed"),
+                    self.tr("The server returned abnormal content."),
+                    orient=Qt.Vertical,
+                    duration=5000,
+                    position=InfoBarPosition.BOTTOM_RIGHT,
+                    parent=self.window())
                 return
 
             # 全队 5 档评级: 点进战绩详情时自动诊断 (不依赖插件运行)
@@ -1771,6 +1806,7 @@ class SearchInterface(SeraphineInterface):
             if not self._isCurrentDetailRequest(gameId, puuid):
                 return
 
+            selectGameDetailSubject(game, puuid)
             detailView.updateGame(game, subjectPuuid=puuid)
             if showAnalysis:
                 detailView.showAnalysis(preserveTab=True)
