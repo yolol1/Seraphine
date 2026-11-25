@@ -24,6 +24,7 @@ from .tools_pure import (
     parseGames,
     aramStatsFromGames,  # noqa: F401  re-export
     parseSummonerOrder,  # noqa: F401  re-export for app.view.game_info_interface
+    summonerDisplayName,
 )
 from .tools_pure import (
     SummonerParsedData,
@@ -273,7 +274,7 @@ async def parseSummonerData(summoner, rankTask, gameTask) -> SummonerParsedData:
             rankInfo = {}
 
     return {
-        'name': summoner.get("gameName") or summoner['displayName'],
+        'name': summonerDisplayName(summoner),
         'icon': icon,
         'level': level,
         'xpSinceLastLevel': xpSinceLastLevel,
@@ -463,8 +464,7 @@ async def parseGameDetailData(puuid, game) -> GameDetail:
 
     for participant in game.get('participantIdentities') or []:
         participantId = participant['participantId']
-        summonerName = participant['player'].get(
-            'gameName') or participant['player'].get('summonerName')  # 兼容外服
+        summonerName = summonerDisplayName(participant['player'])
         summonerPuuid = participant['player']['puuid']
         isCurrent = (summonerPuuid == puuid)
 
@@ -731,9 +731,7 @@ def getTeammates(game, targetPuuid):
 
         p = player['participantId']
         s = game['participantIdentities'][p - 1]['player']
-        playerName = (
-            s.get('gameName') or s.get('summonerName')
-            or s.get('displayName') or "未知玩家")
+        playerName = summonerDisplayName(s)
         tagLine = s.get('tagLine', '')
 
         if cmp == tid:
@@ -857,6 +855,66 @@ def parseRankInfoFromSGP(info):
     }
 
 
+def _hiddenPlayerName() -> str:
+    return "Name hidden" if cfg.language.value == Language.ENGLISH \
+        else "名称已隐藏"
+
+
+def _isHiddenPlayer(item: dict) -> bool:
+    visibility = str(item.get("nameVisibilityType") or "").upper()
+    return visibility == "HIDDEN"
+
+
+def _mergeSessionIdentity(summoner: Optional[dict], item: dict) -> None:
+    """Prefer the live champ-select identity over a sparse SGP profile."""
+    if not isinstance(summoner, dict) or _isHiddenPlayer(item):
+        return
+
+    sessionName = summonerDisplayName(item, default="")
+    if not sessionName:
+        return
+
+    summoner["name"] = sessionName
+    summoner["nameHidden"] = False
+    if not summoner.get("gamesInfo"):
+        summoner["historyUnavailable"] = not summoner.get("isPublic", True)
+    sessionTagLine = item.get("tagLine")
+    if sessionTagLine:
+        summoner["tagLine"] = sessionTagLine
+
+
+async def _makeUnavailableParticipant(item: dict) -> Optional[TeamParticipant]:
+    """Keep a complete team slot when LCU hides a player's identity/history."""
+    summoner_id = item.get("summonerId") or item.get("obfuscatedSummonerId")
+    if not summoner_id:
+        return None
+
+    champion_id = item.get("championId") or 0
+    puuid = item.get("puuid") or item.get("obfuscatedPuuid") \
+        or f"hidden-player:{summoner_id}"
+    return {
+        "name": _hiddenPlayerName(),
+        "nameHidden": True,
+        "tagLine": item.get("tagLine") or "",
+        "icon": await connector.getChampionIcon(champion_id),
+        "championId": champion_id,
+        "level": 0,
+        "rankInfo": parseRankInfo(None),
+        "gamesInfo": [],
+        "xpSinceLastLevel": 0,
+        "xpUntilNextLevel": 0,
+        "puuid": puuid,
+        "summonerId": summoner_id,
+        "kda": [0, 0, 0],
+        "cellId": item.get("cellId"),
+        "selectedPosition": item.get("selectedPosition"),
+        "fateFlag": None,
+        "isPublic": False,
+        "historyUnavailable": True,
+        "recentlyChampionName": "",
+    }
+
+
 def parseDetailRankInfo(rankInfo):
     pt = ToolsTranslator()
     is_english = cfg.language.value == Language.ENGLISH
@@ -908,6 +966,9 @@ async def parseAllyGameInfo(session, currentSummonerId, queueID, useSGP=False) -
                  for item in myTeam]
         summoners = await asyncio.gather(*tasks)
 
+    for item, summoner in zip(myTeam, summoners):
+        _mergeSessionIdentity(summoner, item)
+
     summoners = [summoner for summoner in summoners if summoner]
 
     # 按照楼层排序
@@ -946,7 +1007,7 @@ async def parseGameInfoByGameflowSession(session, currentSummonerId, side, useSG
     valid = []
     seen = set()
     for p in team:
-        sid = p.get('summonerId', 0)
+        sid = p.get('summonerId') or p.get('obfuscatedSummonerId')
         if sid == 0 or sid is None or sid in seen:
             continue
         seen.add(sid)
@@ -982,6 +1043,10 @@ async def parseGameInfoByGameflowSession(session, currentSummonerId, side, useSG
             logger.warning(
                 f"parseGameInfoByGameflowSession: player parse failed "
                 f"({type(s).__name__}: {s}), skipped", "tools")
+
+    for item, summoner in zip(team, summoners):
+        _mergeSessionIdentity(summoner, item)
+
     summoners = [summoner for summoner in summoners
                  if summoner and not isinstance(summoner, BaseException)]
 
@@ -1080,13 +1145,18 @@ async def parseGamesDataConcurrently(games, puuid: str = ""):
 async def parseSummonerGameInfo(item, queueId, currentSummonerId) -> Optional[TeamParticipant]:
     summonerId = item.get('summonerId', None)
 
-    if item.get('nameVisibilityType') == 'HIDDEN':
-        return None
+    if _isHiddenPlayer(item):
+        return await _makeUnavailableParticipant(item)
 
     if summonerId == 0 or summonerId is None:
         return None
 
     summoner = await connector.getSummonerById(summonerId)
+    sessionName = summonerDisplayName(item, default="")
+    profileName = summonerDisplayName(summoner, default="")
+    summonerName = sessionName or profileName
+    nameHidden = not bool(summonerName)
+    privacy = summoner.get("privacy")
 
     championId = item.get('championId') or 0
     icon = await connector.getChampionIcon(championId)
@@ -1166,8 +1236,9 @@ async def parseSummonerGameInfo(item, queueId, currentSummonerId) -> Optional[Te
             recentlyChampionId)
 
     return {
-        "name": summoner.get("gameName") or summoner.get("internalName"),
-        'tagLine': summoner.get("tagLine"),
+        "name": summonerName or _hiddenPlayerName(),
+        "nameHidden": nameHidden,
+        'tagLine': item.get("tagLine") or summoner.get("tagLine"),
         "icon": icon,
         'championId': championId,
         "level": summoner["summonerLevel"],
@@ -1181,7 +1252,9 @@ async def parseSummonerGameInfo(item, queueId, currentSummonerId) -> Optional[Te
         "cellId": item.get("cellId"),
         "selectedPosition": item.get("selectedPosition"),
         "fateFlag": fateFlag,
-        "isPublic": summoner["privacy"] == "PUBLIC",
+        "isPublic": privacy == "PUBLIC",
+        "historyUnavailable": not gamesInfo and (
+            nameHidden or privacy != "PUBLIC"),
         # 最近游戏的英雄 (用于上一局与与同一召唤师游玩之后显示)
         "recentlyChampionName": recentlyChampionName
     }
@@ -1193,8 +1266,8 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
     '''
     puuid = item.get('puuid')
 
-    if item.get('nameVisibilityType') == 'HIDDEN':
-        return None
+    if _isHiddenPlayer(item):
+        return await _makeUnavailableParticipant(item)
 
     if puuid == "00000000-0000-0000-0000-000000000000" or not puuid:
         return None
@@ -1202,6 +1275,9 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
     championId = item.get('championId') or 0
     icon = await connector.getChampionIcon(championId)
     summoner = await connector.getSummonerByPuuidViaSGP(puuid)
+    sessionName = summonerDisplayName(item, default="")
+    profileName = summonerDisplayName(summoner, default="")
+    privacy = summoner.get("privacy")
 
     try:
         origRankInfo = await connector.getRankedStatsByPuuidViaSGP(puuid)
@@ -1236,17 +1312,21 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
         # 收尾 (海克斯换英雄窗口不消失). 战绩服务 503 故障期间此异常必现
         gamesInfo = []
         origGamesInfo = None
-        summonerName = summoner.get("gameName") or ""
-        tagLine = summoner.get("tagLine")
+        summonerName = sessionName or profileName
+        tagLine = item.get("tagLine") or summoner.get("tagLine")
     else:
         sgpRawGames = origGamesInfo.get("games") or []
         if sgpRawGames:
-            summonerName, tagLine = getNameTagLineFromGame(
-                sgpRawGames[0], puuid)
+            gameName, gameTagLine = getNameTagLineFromGame(
+                sgpRawGames[0], puuid) or ("", "")
+            summonerName = str(gameName or "").strip() \
+                or sessionName or profileName
+            tagLine = gameTagLine or item.get("tagLine") \
+                or summoner.get("tagLine")
         else:
             # SGP 返回空列表时与拉取失败同样降级, 不能裸取 [0]
-            summonerName = summoner.get("gameName") or ""
-            tagLine = summoner.get("tagLine")
+            summonerName = sessionName or profileName
+            tagLine = item.get("tagLine") or summoner.get("tagLine")
 
         tasks = [parseGamesDataFromSGP(game, puuid)
                  for game in sgpRawGames[:20]]
@@ -1307,7 +1387,8 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
 
     # 适用于 SGP API 返回值
     return {
-        "name": summonerName,
+        "name": summonerName or _hiddenPlayerName(),
+        "nameHidden": not bool(summonerName),
         'tagLine': tagLine,
         "icon": icon,
         'championId': championId,
@@ -1322,7 +1403,9 @@ async def getSummonerGamesInfoViaSGP(item, queueID, currentSummonerId) -> Option
         "cellId": item.get("cellId"),
         "selectedPosition": item.get("selectedPosition"),
         "fateFlag": fateFlag,
-        "isPublic": summoner["privacy"] == "PUBLIC",
+        "isPublic": privacy == "PUBLIC",
+        "historyUnavailable": not gamesInfo and (
+            not summonerName or privacy != "PUBLIC"),
         # 最近游戏的英雄 (用于上一局与与同一召唤师游玩之后显示)
         "recentlyChampionName": recentlyChampionName
     }
@@ -1360,9 +1443,7 @@ def getTeammatesFromSGPGame(game, puuid):
 
         if cmp == tid:
             if player['puuid'] != puuid:
-                playerName = (
-                    player.get('riotIdGameName') or player.get('gameName')
-                    or player.get('summonerName') or "未知玩家")
+                playerName = summonerDisplayName(player)
                 tagLine = (
                     player.get('riotIdTagline') or player.get('tagLine') or '')
                 res['summoners'].append({
@@ -1376,9 +1457,7 @@ def getTeammatesFromSGPGame(game, puuid):
                 # 当前召唤师在该对局使用的英雄, 自定义对局没有该字段
                 res["championId"] = player.get('championId', -1)
         else:
-            playerName = (
-                player.get('riotIdGameName') or player.get('gameName')
-                or player.get('summonerName') or "未知玩家")
+            playerName = summonerDisplayName(player)
             tagLine = (
                 player.get('riotIdTagline') or player.get('tagLine') or '')
             res['enemies'].append({

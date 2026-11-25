@@ -23,8 +23,25 @@ TIER_MAP = {
 
 DEFAULT_UNRANKED = "未定级"
 DEFAULT_UNKNOWN = "未知"
+DEFAULT_UNKNOWN_PLAYER = "未知玩家"
 DEFAULT_RANKED_SOLO = '单双排'
 DEFAULT_RANKED_FLEX = "灵活组排"
+
+
+def summonerDisplayName(summoner: dict, default: str = DEFAULT_UNKNOWN_PLAYER) -> str:
+    """Return a non-empty display name across current and legacy Riot schemas."""
+    if not isinstance(summoner, dict):
+        return default
+
+    for key in ("gameName", "displayName", "riotIdGameName",
+                "summonerName", "internalName"):
+        value = summoner.get(key)
+        if value is None:
+            continue
+        value = str(value).strip()
+        if value:
+            return value
+    return default
 
 
 def translateTier(orig: str, short=False, is_english=False) -> str:

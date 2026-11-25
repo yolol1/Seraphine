@@ -491,6 +491,61 @@ def test_parse_ally_sgp_sparse_falls_back_to_lcu():
     assert sorted(parse_calls) == [1, 2, 3]
 
 
+def test_parse_ally_uses_live_session_name_when_sgp_name_is_sparse():
+    """SGP profile 缺名称时, 用 myTeam 中已确认可见的 Riot ID 覆盖空值."""
+    from unittest.mock import patch as _patch
+    from app.lol.tools import parseAllyGameInfo
+
+    session = {
+        'myTeam': [
+            {
+                'cellId': 1,
+                'summonerId': 1,
+                'championId': 10,
+                'puuid': 'p-1',
+                'gameName': 'ASDF小行',
+                'tagLine': '44580',
+                'nameVisibilityType': 'VISIBLE',
+            },
+            {
+                'cellId': 2,
+                'summonerId': 2,
+                'championId': 20,
+                'puuid': 'p-2',
+                'gameName': '425j',
+                'tagLine': '66950',
+                'nameVisibilityType': 'VISIBLE',
+            },
+        ]
+    }
+
+    async def mock_sgp(item, qid, csid):
+        return {
+            'summonerId': item['summonerId'],
+            'championId': item['championId'],
+            'selectedPosition': item.get('selectedPosition'),
+            'cellId': item.get('cellId'),
+            'name': '',
+            'nameHidden': True,
+            'tagLine': '',
+            'gamesInfo': [],
+        }
+
+    with _patch("app.lol.tools.getSummonerGamesInfoViaSGP", new=mock_sgp), \
+            _patch("app.lol.tools.connector.isInTencent",
+                   return_value=True):
+        result = _run(parseAllyGameInfo(
+            session, 1, 420, useSGP=True))
+
+    assert result is not None
+    assert [s['name'] for s in result['summoners']] == [
+        'ASDF小行', '425j']
+    assert all(s['nameHidden'] is False for s in result['summoners'])
+    assert all(s['historyUnavailable'] is False
+               for s in result['summoners'])
+    assert result['summoners'][0]['tagLine'] == '44580'
+
+
 def test_parse_ally_sgp_complete_keeps_sgp():
     """SGP 完整 (>=2) 时不回退, 不再额外调用 LCU parse."""
     from unittest.mock import patch as _patch
@@ -591,14 +646,16 @@ class TestMissingFieldDefensive:
 # ---------------------------------------------------------------------------
 
 class TestGameInfoResilience:
-    def _patch_sgp_connector(self, games_side_effect=None, games_return=None):
+    def _patch_sgp_connector(self, games_side_effect=None, games_return=None,
+                             summoner=None):
         """mock getSummonerGamesInfoViaSGP 依赖的 connector SGP 接口."""
         from unittest.mock import AsyncMock, MagicMock
         from app.lol.tools import connector
 
-        summoner = {"gameName": "Tester", "tagLine": "1234", "level": 30,
-                    "expPoints": 10, "expToNextLevel": 100,
-                    "id": 2, "privacy": "PUBLIC"}
+        summoner = summoner or {
+            "gameName": "Tester", "tagLine": "1234", "level": 30,
+            "expPoints": 10, "expToNextLevel": 100,
+            "id": 2, "privacy": "PUBLIC"}
         return [
             patch("app.lol.tools.connector.getChampionIcon",
                   new=AsyncMock(return_value="icon.png")),
@@ -649,6 +706,72 @@ class TestGameInfoResilience:
         assert result is not None
         assert result['gamesInfo'] == []
         assert result['name'] == "Tester"
+
+    def test_sgp_empty_games_uses_display_name_when_game_name_missing(self):
+        """新版/匿名账号 payload 可能没有 gameName, 不能用空标题占一列."""
+        from app.lol.tools import getSummonerGamesInfoViaSGP
+
+        item = _player(2, champion_id=20)
+        item['puuid'] = 'p-2'
+        patches = self._patch_sgp_connector(
+            games_return={"games": [], "totalGames": 0},
+            summoner={
+                "displayName": "DisplayName", "tagLine": "1234",
+                "level": 30, "expPoints": 10, "expToNextLevel": 100,
+                "id": 2, "privacy": "PUBLIC"})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5]:
+            result = _run(getSummonerGamesInfoViaSGP(item, 420, 1))
+
+        assert result is not None
+        assert result['name'] == "DisplayName"
+
+    def test_sgp_empty_games_marks_missing_name_as_hidden(self):
+        """姓名字段全缺失时标记为隐私隐藏, 不误报成未知玩家."""
+        from app.lol.tools import getSummonerGamesInfoViaSGP
+
+        item = _player(2, champion_id=20)
+        item['puuid'] = 'p-2'
+        patches = self._patch_sgp_connector(
+            games_return={"games": [], "totalGames": 0},
+            summoner={
+                "tagLine": None, "level": 30, "expPoints": 10,
+                "expToNextLevel": 100, "id": 2, "privacy": "PUBLIC"})
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5]:
+            result = _run(getSummonerGamesInfoViaSGP(item, 420, 1))
+
+        assert result is not None
+        assert result['name'] == "名称已隐藏"
+        assert result['nameHidden'] is True
+        assert result['historyUnavailable'] is True
+
+    def test_hidden_champ_select_player_keeps_complete_slot(self):
+        """主播/隐私模式返回 HIDDEN 时仍保留队伍槽位和英雄信息."""
+        from unittest.mock import AsyncMock, MagicMock
+        from app.lol.tools import _makeUnavailableParticipant
+
+        item = _player(2, champion_id=20)
+        item.update({
+            "nameVisibilityType": "HIDDEN",
+            "puuid": "",
+            "obfuscatedPuuid": "obfuscated-puuid",
+            "cellId": 3,
+            "selectedPosition": "MIDDLE",
+        })
+        with patch("app.lol.tools.connector.getChampionIcon",
+                   new=AsyncMock(return_value="icon.png")), \
+                patch("app.lol.tools.ToolsTranslator", MagicMock()):
+            result = _run(_makeUnavailableParticipant(item))
+
+        assert result is not None
+        assert result["summonerId"] == 2
+        assert result["puuid"] == "obfuscated-puuid"
+        assert result["name"] == "名称已隐藏"
+        assert result["nameHidden"] is True
+        assert result["historyUnavailable"] is True
+        assert result["gamesInfo"] == []
+        assert result["cellId"] == 3
 
     def test_single_player_failure_does_not_break_team(self):
         """LCU 路径单个玩家解析抛异常时, 其余玩家正常返回, 不向

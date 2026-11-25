@@ -24,6 +24,7 @@ from app.lol.tools_pure import (
     sortedSummonersByGameRole,
     parseGames,
     aramStatsFromGames,
+    summonerDisplayName,
     parseRankInfo,
     parseDetailRankInfo,
 )
@@ -67,6 +68,20 @@ def test_resolve_game_queue_id_falls_back_to_known_game_mode():
 def test_resolve_game_queue_id_defaults_to_custom_game():
     assert resolveGameQueueId({"gameMode": "CLASSIC"}) == 0
     assert resolveGameQueueId({}) == 0
+
+
+@pytest.mark.parametrize("summoner,expected", [
+    ({"gameName": "CurrentName", "displayName": "OldName"}, "CurrentName"),
+    ({"displayName": "DisplayName", "internalName": "Internal"}, "DisplayName"),
+    ({"internalName": "Internal"}, "Internal"),
+    ({"riotIdGameName": "RiotName"}, "RiotName"),
+    ({"summonerName": "LegacyName"}, "LegacyName"),
+    ({"gameName": "   "}, "未知玩家"),
+    ({}, "未知玩家"),
+])
+def test_summoner_display_name_handles_riot_schema_variants(
+        summoner, expected):
+    assert summonerDisplayName(summoner) == expected
 
 
 def test_game_detail_payload_validation():
