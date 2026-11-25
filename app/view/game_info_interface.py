@@ -12,7 +12,7 @@ from ..common.qfluentwidgets import (TransparentTogglePushButton,
                                      PushButton, Flyout)
 
 from app.common.style_sheet import StyleSheet
-from app.common.config import cfg
+from app.common.config import cfg, Language
 from app.common.signals import signalBus
 from app.lol.horse_rating import (GRADE_HORSE, grade_from_score, grade_label)
 from app.components.grade_badge import GradeBadge
@@ -435,15 +435,19 @@ class SummonerInfoView(ColorAnimationFrame):
 
         self.infoVBoxLayout = QVBoxLayout()
 
-        name = info['name']
+        name = str(info.get('name') or "").strip() or "名称已隐藏"
         fateFlag = info["fateFlag"]
         nameColor = None
         if fateFlag:
             nameColor = "#bf242a" if fateFlag == "enemy" else "#057748"
         self.summonerName = SummonerName(
-            name, isPublic=info["isPublic"], color=nameColor, tagLine=info['tagLine'], tips=info["recentlyChampionName"])
+            name, isPublic=info.get("isPublic", True), color=nameColor,
+            tagLine=info.get('tagLine'),
+            tips=info.get("recentlyChampionName", ""))
         self.summonerName.clicked.connect(
             lambda: signalBus.toCareerInterface.emit(info['puuid']))
+        if info.get("nameHidden"):
+            self.summonerName.setEnabled(False)
         self.encounterBadge = makeEncounterBadge(
             info, info.get("encounterSubjectPuuid"))
 
@@ -736,18 +740,22 @@ class Games(QFrame):
         # self.setSizePolicy(QSizePolicy.Policy.Expanding,
         #                    QSizePolicy.Policy.Fixed)
 
-        name: str = summoner['name']
+        name = str(summoner.get('name') or "").strip() or "名称已隐藏"
         fateFlag = summoner["fateFlag"]
         nameColor = None
         if fateFlag:
             nameColor = "#bf242a" if fateFlag == "enemy" else "#057748"
         self.summonerPuuid = summoner['puuid']
+        self.historyUnavailable = bool(summoner.get("historyUnavailable"))
         self.summonerName = SummonerName(
-            name, isPublic=summoner["isPublic"], color=nameColor, tagLine=summoner['tagLine'],
-            tips=summoner["recentlyChampionName"])
+            name, isPublic=summoner.get("isPublic", True), color=nameColor,
+            tagLine=summoner.get('tagLine'),
+            tips=summoner.get("recentlyChampionName", ""))
         self.summonerName.setObjectName("summonerName")
 
         self.summonerName.clicked.connect(self.__onSummonerNameClicked)
+        if summoner.get("nameHidden"):
+            self.summonerName.setEnabled(False)
 
         self.summonerName.setFixedHeight(44)
         self.setMinimumWidth(140)
@@ -767,7 +775,7 @@ class Games(QFrame):
         self.vBoxLayout.addLayout(self.gamesLayout)
         self.gamesLayout.setContentsMargins(0, 0, 0, 0)
 
-        self.allGames = summoner['gamesInfo']
+        self.allGames = summoner.get('gamesInfo') or []
         self.applyFilter(set())
 
     def applyFilter(self, queueIds: set):
@@ -783,6 +791,23 @@ class Games(QFrame):
             games = [g for g in games if g.get('queueId') in queueIds]
 
         games = games[:10]
+
+        if not games:
+            if self.historyUnavailable:
+                emptyText = ("Match history unavailable"
+                             if cfg.language.value == Language.ENGLISH
+                             else "战绩不可见")
+            else:
+                emptyText = ("No recent games"
+                             if cfg.language.value == Language.ENGLISH
+                             else "暂无近期对局")
+            emptyLabel = QLabel(emptyText)
+            emptyLabel.setObjectName("emptyGamesLabel")
+            emptyLabel.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            self.gamesLayout.addWidget(emptyLabel)
+            self.gamesLayout.addStretch(9)
+            self.gamesLayout.addSpacing(self.gamesLayout.spacing() * 9)
+            return
 
         for game in games:
             tab = GameTab(game)

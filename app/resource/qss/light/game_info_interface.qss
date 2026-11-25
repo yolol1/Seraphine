@@ -153,6 +153,12 @@ Games>#summonerName {
     color: rgba(0, 0, 0, 0.85);
 }
 
+Games>#emptyGamesLabel {
+    color: rgba(0, 0, 0, 0.48);
+    font: 12px 'Microsoft YaHei UI', 'Segoe UI';
+    padding-top: 8px;
+}
+
 Games:hover {
     background-color: rgba(0, 0, 0, 0.06);
 }

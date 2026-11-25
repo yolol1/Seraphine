@@ -9,7 +9,8 @@ class SummonerName(QLabel):
     def __init__(self, text, isPublic=True, color=None, tagLine=None, tips="", parent=None):
         super().__init__(parent)
         self.setCursor(Qt.PointingHandCursor)
-        self._displayName = text if isPublic else f"{text}🔒"
+        name = str(text or "").strip() or "名称已隐藏"
+        self._displayName = name if isPublic else f"{name}🔒"
         self.tagLine = tagLine
         self._tips = tips
 
